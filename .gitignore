@@ -1,0 +1,37 @@
+# Build
+/build/
+/out/
+/cmake-build-*/
+/.vs/
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+
+# Qt
+*.pro.user
+*.pro.user.*
+*.qmake.stash
+moc_*.cpp
+moc_*.h
+ui_*.h
+qrc_*.cpp
+
+# IDE
+.vscode/
+.idea/
+*.sln
+*.vcxproj*
+
+# Data / logs
+/logs/
+*.log
+settings.json
+connections.json
+favorites.json
+recent.json
+
+# OS
+.DS_Store
+Thumbs.db

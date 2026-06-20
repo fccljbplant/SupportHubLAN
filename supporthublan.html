@@ -1643,7 +1643,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v1.4.8';
+  const APP_VERSION = 'v1.4.9';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -8651,19 +8651,20 @@
               <div className="hidden lg:block">
                 <Sidebar collapsed={sidebarCollapsed} />
               </div>
-              {/* Mobile nav drawer — slides in from the left, stops above the terminal panel.
-                  Backdrop closes on click. Width is narrower (w-52 = 208px) so it doesn't
-                  cover too much of the screen on narrow phones.
+              {/* Mobile nav drawer — slides in from the LEFT, stops above the terminal panel.
+                  Sidebar is the FIRST flex child (flush with left edge), backdrop fills the rest.
                   Bottom offset = terminal height + status bar (28px) so the terminal stays visible. */}
               {mobileNavOpen && (() => {
                 let th = 80;
                 try { th = parseInt(localStorage.getItem('supporthublan:terminal-height') || '80', 10); if (isNaN(th) || th < 60) th = 80; } catch {}
                 return (
                   <div className="lg:hidden fixed left-0 right-0 top-0 flex" style={{ bottom: (th + 28) + 'px', zIndex: 50 }}>
-                    <div className="flex-1 bg-black/60" onClick={() => setMobileNavOpen(false)} />
-                    <div className="w-52 max-w-[80vw] bg-surface border-l border-border flex flex-col">
+                    {/* Sidebar FIRST — flush with the left edge of the screen */}
+                    <div className="w-52 max-w-[80vw] bg-surface border-r border-border flex flex-col flex-shrink-0">
                       <Sidebar collapsed={false} fullWidth={true} onNavigate={() => setMobileNavOpen(false)} />
                     </div>
+                    {/* Backdrop fills the remaining space to the right — click to close */}
+                    <div className="flex-1 bg-black/60 min-w-0" onClick={() => setMobileNavOpen(false)} />
                   </div>
                 );
               })()}

@@ -1,5 +1,5 @@
 /* ==========================================================================
-   SupportHubLAN Backend Server v1.2
+   SupportHubLAN Backend Server v1.4.7
    ==========================================================================
    This server runs on a Windows machine with admin privileges and performs
    REAL Windows administration tasks on remote hosts via:
@@ -177,7 +177,7 @@ app.get('/api/health', (req, res) => {
     success: true,
     data: {
       server: 'SupportHubLAN Backend',
-      version: '1.2.0',
+      version: '1.4.7',
       platform: os.platform(),
       hostname: os.hostname(),
       port: PORT,
@@ -1299,7 +1299,7 @@ server.listen(PORT, BIND_ADDRESS, () => {
   const displayIp = BIND_ADDRESS === '0.0.0.0' ? 'localhost' : BIND_ADDRESS;
   console.log(`
 ╔══════════════════════════════════════════════════════════════════╗
-║  SupportHubLAN Backend Server v1.2.0                             ║
+║  SupportHubLAN Backend Server v1.4.7                             ║
 ║  Listening on http://${displayIp}:${PORT}                            ║
 ║                                                                  ║
 ║  ✓ Serving frontend at /                                         ║

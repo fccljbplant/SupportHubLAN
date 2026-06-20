@@ -1,6 +1,6 @@
 {
   "name": "supporthublan-server",
-  "version": "1.3.0",
+  "version": "1.4.7",
   "description": "SupportHubLAN Backend — Real Windows endpoint management via PsTools, AD/LAPS, SQLite-backed multi-inventory",
   "main": "server.js",
   "scripts": {

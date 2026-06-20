@@ -1641,6 +1641,11 @@
      APP SHELL — Header + Sidebar + Drawer + Status Bar
      ====================================================================== */
 
+  // Single source of truth for the app version — update this when bumping versions.
+  // Used by the sidebar footer and the status bar so they always match.
+  const APP_VERSION = 'v1.4.7';
+  const APP_BUILD_DATE = '2026.06.20';
+
   const NAV_ITEMS = [
     { id: 'dashboard',   label: 'Dashboard',           icon: 'LayoutDashboard' },
     { id: 'inventory',   label: 'Computer Inventory',  icon: 'Server' },
@@ -1871,8 +1876,8 @@
         {!collapsed && (
           <div className="p-3 border-t border-border">
             <div className="text-meta text-text-dim uppercase mb-1">Version</div>
-            <div className="text-xs text-text">supporthublan v1.0</div>
-            <div className="text-[10px] text-text-dim">Build 2026.06.20</div>
+            <div className="text-xs text-text">SupportHubLAN {APP_VERSION}</div>
+            <div className="text-[10px] text-text-dim">Build {APP_BUILD_DATE}</div>
           </div>
         )}
       </aside>
@@ -2460,7 +2465,7 @@
           <span className="text-border">·</span>
           <span><Icon name="Globe" size={11} className="inline mr-1" />{Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"}</span>
           <span className="text-border">·</span>
-          <span>v1.2.0</span>
+          <span>{APP_VERSION}</span>
         </div>
       </footer>
     );

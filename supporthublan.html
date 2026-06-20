@@ -8871,6 +8871,13 @@
     const inputRef = useRef(null);
     const linesRef = useRef([]);
 
+    // Append a line — declared FIRST because it's referenced by useEffects below
+    // (must be defined before use to avoid temporal dead zone ReferenceError)
+    const appendLine = useCallback((line, stream = 'info') => {
+      const ts = new Date().toLocaleTimeString();
+      setLines(prev => [...prev.slice(-500), { ts, line: String(line), stream }]); // cap at 500 lines
+    }, []);
+
     // Persist collapsed state
     useEffect(() => { try { localStorage.setItem('supporthublan:terminal-collapsed', collapsed ? '1' : '0'); } catch {} }, [collapsed]);
 
@@ -8936,12 +8943,6 @@
 
     // Keep linesRef in sync
     useEffect(() => { linesRef.current = lines; }, [lines]);
-
-    // Append a line
-    const appendLine = useCallback((line, stream = 'info') => {
-      const ts = new Date().toLocaleTimeString();
-      setLines(prev => [...prev.slice(-500), { ts, line: String(line), stream }]); // cap at 500 lines
-    }, []);
 
     // Watch active jobs and append their step changes to the terminal
     const lastJobStepRef = useRef({});

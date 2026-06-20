@@ -1,7 +1,7 @@
 {
   "name": "supporthublan-server",
-  "version": "1.0.0",
-  "description": "SupportHubLAN Backend — Real Windows endpoint management via PowerShell/WMI",
+  "version": "1.2.0",
+  "description": "SupportHubLAN Backend — Real Windows endpoint management via PsTools, PowerShell, AD/LAPS, and Windows Updates",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -14,6 +14,6 @@
     "ws": "^8.14.2"
   },
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=18.0.0"
   }
 }

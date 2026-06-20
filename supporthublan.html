@@ -10,18 +10,37 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
 
-  <!-- Tailwind CSS via CDN -->
-  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Tailwind CSS (local vendor copy — works on LAN with no internet) -->
+  <script src="vendor/tailwind.min.js"></script>
 
-  <!-- React 18 via CDN -->
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- React 18 (local vendor copy) -->
+  <script crossorigin src="vendor/react.production.min.js"></script>
+  <script crossorigin src="vendor/react-dom.production.min.js"></script>
 
-  <!-- Babel for JSX -->
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Babel for JSX (local vendor copy) -->
+  <script src="vendor/babel.min.js"></script>
 
-  <!-- Lucide Icons (UMD) -->
-  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+  <!-- Lucide Icons UMD (local vendor copy) -->
+  <script src="vendor/lucide.min.js"></script>
+
+  <!-- CDN fallbacks (only used if vendor files are missing, e.g. on GitHub Pages) -->
+  <script>
+    window.__fallbackLoaded = false;
+    function loadFallback(id, url) {
+      if (window[id]) return;
+      window.__fallbackLoaded = true;
+      var s = document.createElement('script');
+      s.src = url; s.async = false;
+      document.head.appendChild(s);
+    }
+    document.addEventListener('DOMContentLoaded', function() {
+      loadFallback('tailwind', 'https://cdn.tailwindcss.com');
+      loadFallback('React', 'https://unpkg.com/react@18/umd/react.production.min.js');
+      loadFallback('ReactDOM', 'https://unpkg.com/react-dom@18/umd/react-dom.production.min.js');
+      loadFallback('Babel', 'https://unpkg.com/@babel/standalone/babel.min.js');
+      loadFallback('lucide', 'https://unpkg.com/lucide@latest/dist/umd/lucide.min.js');
+    });
+  </script>
 
   <script>
     // Tailwind theme extension with supporthublan tokens
@@ -262,9 +281,19 @@
 
   <!-- supporthublan API Client — connects to backend for real operations -->
   <script>
-    // Set window.SUPPORTHUBLAN_API_URL before this script to point to your backend
-    // Default: http://localhost:3137
-    window.SUPPORTHUBLAN_API_URL = window.SUPPORTHUBLAN_API_URL || 'http://localhost:3137';
+    // API URL — auto-detect:
+    //   • If served by the backend (same origin), use window.location.origin
+    //   • If loaded from file:// or GitHub Pages, fall back to localhost:8080
+    //   • Override with window.SUPPORTHUBLAN_API_URL = 'http://10.0.0.5:8080' before this script
+    if (!window.SUPPORTHUBLAN_API_URL) {
+      if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
+        // Served by backend or static host — try same-origin first
+        window.SUPPORTHUBLAN_API_URL = window.location.origin;
+      } else {
+        // file:// — assume backend running on localhost:8080
+        window.SUPPORTHUBLAN_API_URL = 'http://localhost:8080';
+      }
+    }
     window._supporthublanBackendStatus = 'checking'; // checking | connected | demo
 
     // ---- AES Encryption Utilities (Web Crypto API) ----
@@ -361,19 +390,41 @@
         return [input];
       }
 
-      // Ping an IP (simulated in demo mode; real when backend is connected)
+      // Ping an IP — REAL when backend is connected, HONEST null when in demo mode
+      // (Math.random fallback removed — was creating fake "online" hosts)
       async function pingIP(ip) {
         if (window.SupportHubLANAPI) {
           try {
             const result = await window.SupportHubLANAPI.pingHost(ip);
             if (result.success && !result.demo) return result.data?.online || false;
-          } catch (e) {}
+            // Backend in demo mode — return null so the UI can show honest empty state
+            return null;
+          } catch (e) {
+            return null;
+          }
         }
-        // Demo: simulate ~70% response rate for private IPs
-        return Math.random() < 0.7;
+        return null;
       }
 
-      return { parseRange, parseCIDR, parseScanInput, pingIP };
+      // Bulk ping sweep via dedicated /api/scan endpoint (real backend parallelism)
+      async function scanRange(ips) {
+        if (!window.SupportHubLANAPI) return ips.map(ip => ({ ip, online: null }));
+        try {
+          const resp = await fetch((window.SUPPORTHUBLAN_API_URL) + '/api/scan', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ips })
+          });
+          if (!resp.ok) return ips.map(ip => ({ ip, online: null }));
+          // The /api/scan endpoint responds immediately with a jobId; results come via WebSocket
+          const data = await resp.json();
+          return ips.map(ip => ({ ip, online: null, jobId: data?.data?.jobId }));
+        } catch (e) {
+          return ips.map(ip => ({ ip, online: null }));
+        }
+      }
+
+      return { parseRange, parseCIDR, parseScanInput, pingIP, scanRange };
     })();
 
     // ---- CSV Parser ----
@@ -488,7 +539,32 @@
         checkPendingReboot: (hostnames, credential) => apiCall('/api/power/check-pending', { hostnames, credential }),
 
         // Job Queue
-        executeQueue: (steps, hostnames, credential, errorHandling) => apiCall('/api/queues/execute', { steps, hostnames, credential, errorHandling }),
+        executeQueue: (steps, hostnames, credential, errorHandling, queueName) => apiCall('/api/queues/execute', { steps, hostnames, credential, errorHandling, queueName }),
+
+        // LAPS — Local Admin Password Solution
+        retrieveLaps: (hostnames, credential) => apiCall('/api/laps/retrieve', { hostnames, credential }),
+        rotateLaps: (hostnames, credential) => apiCall('/api/laps/rotate', { hostnames, credential }),
+
+        // PsTools — direct endpoints (each tool has its own route)
+        pstoolsPsInfo: (hostname) => apiCall('/api/pstools/psinfo', { hostname }),
+        pstoolsPsList: (hostname) => apiCall('/api/pstools/pslist', { hostname }),
+        pstoolsPsKill: (hostname, target) => apiCall('/api/pstools/pskill', { hostname, target }),
+        pstoolsPsService: (hostname, action, serviceName) => apiCall('/api/pstools/psservice', { hostname, action, serviceName }),
+        pstoolsPsLoggedOn: (hostname) => apiCall('/api/pstools/psloggedon', { hostname }),
+        pstoolsPsShutdown: (hostname, action, timeout, message) => apiCall('/api/pstools/psshutdown', { hostname, action, timeout, message }),
+        pstoolsPsFile: (hostname) => apiCall('/api/pstools/psfile', { hostname }),
+        pstoolsPsGetSid: (hostname) => apiCall('/api/pstools/psgetsid', { hostname }),
+        pstoolsPsSuspend: (hostname, target, action) => apiCall('/api/pstools/pssuspend', { hostname, target, action }),
+        pstoolsExecute: (tool, hostname, args) => apiCall('/api/pstools/execute', { tool, hostname, args }),
+
+        // Network scanner — bulk
+        scanIps: (ips) => apiCall('/api/scan', { ips }),
+
+        // Remote desktop
+        launchRemote: (hostname, ip, protocol, port) => apiCall('/api/remote/connect', { hostname, ip, protocol, port }),
+
+        // Health check (force re-check by resetting _available)
+        recheckBackend: () => { _available = null; return checkBackend(); },
       };
     })();
   </script>
@@ -2200,20 +2276,97 @@
 
   // ---- Status Bar (28px) ----
   const StatusBar = () => {
-    const { lastRefresh, setLastRefresh, activeJobs } = useApp();
+    const { lastRefresh, setLastRefresh, activeJobs, updateJob, appendAudit } = useApp();
     const [backendStatus, setBackendStatus] = useState('checking');
+    const [backendInfo, setBackendInfo] = useState(null);
     const running = activeJobs.filter(j => j.status === 'running').length;
     const queued = activeJobs.filter(j => j.status === 'queued').length;
 
     useEffect(() => {
-      if (window.SupportHubLANAPI) {
-        window.SupportHubLANAPI.isBackendAvailable().then(available => {
-          setBackendStatus(available ? 'connected' : 'demo');
-        });
-      } else {
-        setBackendStatus('demo');
-      }
+      // Initial check
+      const doCheck = async () => {
+        if (window.SupportHubLANAPI) {
+          try {
+            const available = await window.SupportHubLANAPI.isBackendAvailable();
+            setBackendStatus(available ? 'connected' : 'demo');
+            if (available) {
+              // Fetch backend info (version, endpoints, PsTools path)
+              try {
+                const resp = await fetch(window.SUPPORTHUBLAN_API_URL + '/api/health');
+                const json = await resp.json();
+                setBackendInfo(json.data);
+              } catch {}
+            }
+          } catch {
+            setBackendStatus('demo');
+          }
+        } else {
+          setBackendStatus('demo');
+        }
+      };
+      doCheck();
+
+      // Open WebSocket for live queue progress
+      try {
+        const wsUrl = window.SUPPORTHUBLAN_API_URL.replace(/^http/, 'ws') + '/ws';
+        const ws = new WebSocket(wsUrl);
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            // Handle queue progress updates — match by jobId
+            if (data.type === 'queue-step-complete' || data.type === 'queue-progress') {
+              const pct = data.total > 0 ? Math.round((data.completed / data.total) * 100) : 0;
+              const stepLabel = `Step ${data.stepIndex + 1}/${data.totalSteps} on ${data.hostname} — ${data.status || 'running'}`;
+              // Find the local job matching this backend jobId and update it
+              // (The executeQueue function stored the backend jobId in the audit event parameters)
+              // For simplicity, broadcast to all running jobs from the same backend:
+              const matchingJobs = activeJobs.filter(j => j.status === 'running');
+              if (matchingJobs.length === 1) {
+                updateJob(matchingJobs[0].id, { progress: pct, step: stepLabel });
+              }
+            } else if (data.type === 'queue-complete') {
+              const matchingJobs = activeJobs.filter(j => j.status === 'running');
+              if (matchingJobs.length === 1) {
+                updateJob(matchingJobs[0].id, { status: 'completed', progress: 100, step: 'Done', completedAt: new Date().toISOString() });
+              }
+            } else if (data.type === 'scan-complete') {
+              // Surface scan results as a toast
+              const s = data.summary;
+              if (s) {
+                // Use a custom event so the scanner component can pick this up
+                window.dispatchEvent(new CustomEvent('supporthublan:scan-complete', { detail: data }));
+              }
+            }
+          } catch {}
+        };
+        ws.onopen = () => { window._supporthublanWs = ws; };
+        ws.onclose = () => { window._supporthublanWs = null; };
+        return () => { try { ws.close(); } catch {} };
+      } catch {}
     }, []);
+
+    const recheckBackend = async () => {
+      setBackendStatus('checking');
+      if (window.SupportHubLANAPI) {
+        const available = await window.SupportHubLANAPI.recheckBackend();
+        setBackendStatus(available ? 'connected' : 'demo');
+        if (available) {
+          try {
+            const resp = await fetch(window.SUPPORTHUBLAN_API_URL + '/api/health');
+            const json = await resp.json();
+            setBackendInfo(json.data);
+            toast.success(`Backend connected — v${json.data?.version || '?'} on ${json.data?.hostname || '?'}`, {
+              detail: `PsTools: ${json.data?.pstoolsInstalled ? 'INSTALLED at ' + json.data?.pstoolsPath : 'NOT FOUND'} · Platform: ${json.data?.platform || '?'}`,
+              duration: 6000
+            });
+          } catch (e) {
+            toast.success('Backend connected');
+          }
+        } else {
+          toast.warning('Backend not reachable. Running in DEMO mode — actions will not execute on remote hosts.');
+        }
+      }
+    };
 
     return (
       <footer className="flex items-center justify-between px-3 h-7 bg-surface border-t border-border text-meta text-text-dim flex-shrink-0">
@@ -2228,14 +2381,15 @@
         </div>
         <div className="flex items-center gap-3">
           {backendStatus === 'connected' && (
-            <span className="flex items-center gap-1 text-success">
-              <Icon name="Server" size={11} /> Backend: Connected ({window.SupportHubLANAPI?.apiUrl || 'localhost:3137'})
-            </span>
+            <button onClick={recheckBackend} className="flex items-center gap-1 text-success hover:underline" title="Click to re-check backend connection">
+              <Icon name="Server" size={11} /> LIVE — Backend v{backendInfo?.version || '?'} ({backendInfo?.hostname || window.SupportHubLANAPI?.apiUrl || 'localhost'})
+              {backendInfo?.pstoolsInstalled === false && <span className="text-warning ml-1" title="PsTools not found at configured path">⚠ PsTools missing</span>}
+            </button>
           )}
           {backendStatus === 'demo' && (
-            <span className="flex items-center gap-1 text-warning">
-              <Icon name="AlertTriangle" size={11} /> Demo Mode (no backend — actions simulated)
-            </span>
+            <button onClick={recheckBackend} className="flex items-center gap-1 text-warning hover:underline" title="Click to retry backend connection">
+              <Icon name="AlertTriangle" size={11} /> DEMO MODE — no backend connected (click to retry)
+            </button>
           )}
           {backendStatus === 'checking' && (
             <span className="flex items-center gap-1 text-muted">
@@ -2247,7 +2401,7 @@
           <span className="text-border">·</span>
           <span><Icon name="Globe" size={11} className="inline mr-1" />{Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"}</span>
           <span className="text-border">·</span>
-          <span>v1.0.0</span>
+          <span>v1.2.0</span>
         </div>
       </footer>
     );
@@ -2558,16 +2712,95 @@
     const [contextMenu, setContextMenu] = useState(null);
     const [remoteDesktopProtocol, setRemoteDesktopProtocol] = useState(() => { try { return localStorage.getItem('supporthublan:rdp-protocol') || 'VNC'; } catch(e) { return 'VNC'; } });
 
-    // Launch VNC or RDP to a remote host
-    const launchRemoteDesktop = (host) => {
+    // Launch VNC or RDP to a remote host — awaits real backend response
+    const launchRemoteDesktop = async (host) => {
       const protocol = remoteDesktopProtocol;
       const port = protocol === 'VNC' ? 5900 : 3389;
-      // Try backend API first
+      toast.info(`Requesting ${protocol} session to ${host.hostname}…`);
       if (window.SupportHubLANAPI) {
-        window.SupportHubLANAPI.apiCall && window.SupportHubLANAPI.apiCall('/api/remote/connect', { hostname: host.hostname, ip: host.ipAddress, protocol, port });
+        try {
+          const result = await window.SupportHubLANAPI.launchRemote(host.hostname, host.ipAddress, protocol, port);
+          if (result && result.success && !result.demo) {
+            appendAudit({ action: 'remote.connect', actionCategory: 'Inventory', targetType: 'Host', targetIds: [host.id], parameters: { protocol, hostname: host.hostname, ip: host.ipAddress }, result: 'success' });
+            toast.success(`${protocol} session launched to ${host.hostname} (${host.ipAddress}:${port})`, { detail: protocol === 'VNC' ? 'VNC Viewer opened externally' : 'RDP opened externally', duration: 5000 });
+          } else if (result && result.demo) {
+            appendAudit({ action: 'remote.connect', actionCategory: 'Inventory', targetType: 'Host', targetIds: [host.id], parameters: { protocol, hostname: host.hostname, ip: host.ipAddress }, result: 'skipped' });
+            toast.warning(`Cannot launch ${protocol} — backend not connected (demo mode). Run the SupportHubLAN server on a Windows admin PC to enable remote desktop.`, { duration: 8000 });
+          } else {
+            appendAudit({ action: 'remote.connect', actionCategory: 'Inventory', targetType: 'Host', targetIds: [host.id], parameters: { protocol, hostname: host.hostname, ip: host.ipAddress }, result: 'failed' });
+            toast.error(`Failed to launch ${protocol} to ${host.hostname}`, { detail: result?.error || 'Unknown error', duration: 8000 });
+          }
+        } catch (e) {
+          appendAudit({ action: 'remote.connect', actionCategory: 'Inventory', targetType: 'Host', targetIds: [host.id], parameters: { protocol, hostname: host.hostname, ip: host.ipAddress }, result: 'failed' });
+          toast.error(`Failed to launch ${protocol} to ${host.hostname}`, { detail: e.message, duration: 8000 });
+        }
+      } else {
+        toast.error('Backend API client not loaded.');
       }
-      appendAudit({ action: 'remote.connect', actionCategory: 'Inventory', targetType: 'Host', targetIds: [host.id], parameters: { protocol, hostname: host.hostname, ip: host.ipAddress }, result: 'success' });
-      toast.success(`Launching ${protocol} session to ${host.hostname} (${host.ipAddress}:${port})`, { detail: protocol === 'VNC' ? 'VNC Viewer will open externally' : 'RDP will open externally', duration: 5000 });
+    };
+
+    // ============================================================
+    // REAL PsTools execution — calls backend /api/pstools/* endpoints
+    // Replaces the demo theater that wrote 'success' to audit log
+    // without actually calling the backend.
+    // ============================================================
+    const runPsToolOnHost = async (tool, hostname, hostId, opts) => {
+      const jobId = 'job-' + Date.now();
+      const label = opts?.label || tool;
+      addJob({ id: jobId, name: `${label} — ${hostname}`, targets: [hostId], step: 'Querying (1/1)', progress: 10, startedAt: new Date().toISOString(), status: 'running' });
+      toast.info(`Running ${label} on ${hostname}…`);
+
+      if (!window.SupportHubLANAPI) {
+        updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed (no API client)' });
+        appendAudit({ action: `pstools.${tool}`, actionCategory: 'Scripts', targetType: 'Host', targetIds: [hostId], parameters: { hostname }, result: 'failed' });
+        toast.error('API client not loaded');
+        return;
+      }
+
+      try {
+        let result;
+        switch (tool) {
+          case 'psinfo':       result = await window.SupportHubLANAPI.pstoolsPsInfo(hostname); break;
+          case 'pslist':       result = await window.SupportHubLANAPI.pstoolsPsList(hostname); break;
+          case 'psloggedon':   result = await window.SupportHubLANAPI.pstoolsPsLoggedOn(hostname); break;
+          case 'psservice':    result = await window.SupportHubLANAPI.pstoolsPsService(hostname, opts?.action || 'query', opts?.serviceName); break;
+          case 'psfile':       result = await window.SupportHubLANAPI.pstoolsPsFile(hostname); break;
+          case 'psgetsid':     result = await window.SupportHubLANAPI.pstoolsPsGetSid(hostname); break;
+          case 'psexec':       result = await window.SupportHubLANAPI.pstoolsExecute('psexec', hostname, opts?.args || ''); break;
+          default:
+            updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed (unknown tool)' });
+            appendAudit({ action: `pstools.${tool}`, actionCategory: 'Scripts', targetType: 'Host', targetIds: [hostId], parameters: { hostname }, result: 'failed' });
+            toast.error(`Unknown PsTool: ${tool}`);
+            return;
+        }
+
+        if (result && result.success && !result.demo) {
+          updateJob(jobId, { status: 'completed', progress: 100, step: 'Done', completedAt: new Date().toISOString(), output: result.data || result.stdout || '' });
+          appendAudit({ action: `pstools.${tool}`, actionCategory: 'Scripts', targetType: 'Host', targetIds: [hostId], parameters: { hostname, ...(opts || {}) }, result: 'success', output: (result.data || '').slice(0, 2000) });
+          toast.success(`${label} completed on ${hostname}`, { detail: 'See Job Queue for output', duration: 4000 });
+        } else if (result && result.demo) {
+          updateJob(jobId, { status: 'failed', progress: 100, step: 'Demo mode — backend not connected' });
+          appendAudit({ action: `pstools.${tool}`, actionCategory: 'Scripts', targetType: 'Host', targetIds: [hostId], parameters: { hostname }, result: 'skipped' });
+          toast.warning(`${label} skipped — backend not connected. Run the SupportHubLAN server on a Windows admin PC to execute PsTools for real.`, { duration: 8000 });
+        } else {
+          updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed', completedAt: new Date().toISOString(), output: result?.error || '' });
+          appendAudit({ action: `pstools.${tool}`, actionCategory: 'Scripts', targetType: 'Host', targetIds: [hostId], parameters: { hostname }, result: 'failed', error: result?.error });
+          toast.error(`${label} failed on ${hostname}`, { detail: result?.error || 'Unknown error', duration: 8000 });
+        }
+      } catch (e) {
+        updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed', completedAt: new Date().toISOString(), output: e.message });
+        appendAudit({ action: `pstools.${tool}`, actionCategory: 'Scripts', targetType: 'Host', targetIds: [hostId], parameters: { hostname }, result: 'failed', error: e.message });
+        toast.error(`${label} failed on ${hostname}`, { detail: e.message, duration: 8000 });
+      }
+    };
+
+    // Bulk PsTools runner — for the toolbar PsInfo/PsLoggedOn/PsList/PsService buttons
+    const runPsToolBulk = async (tool, label) => {
+      if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; }
+      const targets = hosts.filter(h => selectedIds.includes(h.id));
+      for (const h of targets) {
+        await runPsToolOnHost(tool, h.hostname, h.id, { label });
+      }
     };
 
     // Apply initial filter from route (e.g., from dashboard click)
@@ -2860,10 +3093,10 @@
                 { icon: 'EyeOff', label: 'Hide', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } toast.success(`Hiding updates on ${selectedIds.length} host(s)`); }, disabled: selectedIds.length === 0 },
               ]},
               { label: 'PsTools', items: [
-                { icon: 'Info', label: 'PsInfo', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } const names = hosts.filter(h => selectedIds.includes(h.id)).map(h => h.hostname); addJob({ id: 'job-' + Date.now(), name: `PsInfo — ${selectedIds.length} hosts`, targets: [...selectedIds], step: 'Querying (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.psinfo', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...selectedIds], parameters: { hostnames: names }, result: 'success' }); toast.info(`Running PsInfo on ${selectedIds.length} hosts…`); }, disabled: selectedIds.length === 0 },
-                { icon: 'Users', label: 'LoggedOn', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } addJob({ id: 'job-' + Date.now(), name: `PsLoggedOn — ${selectedIds.length} hosts`, targets: [...selectedIds], step: 'Querying (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); toast.info(`Checking logged-on users on ${selectedIds.length} hosts…`); }, disabled: selectedIds.length === 0 },
-                { icon: 'Activity', label: 'PsList', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } addJob({ id: 'job-' + Date.now(), name: `PsList — ${selectedIds.length} hosts`, targets: [...selectedIds], step: 'Listing (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); toast.info(`Listing processes on ${selectedIds.length} hosts…`); }, disabled: selectedIds.length === 0 },
-                { icon: 'Server', label: 'PsService', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } addJob({ id: 'job-' + Date.now(), name: `PsService — ${selectedIds.length} hosts`, targets: [...selectedIds], step: 'Querying (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); toast.info(`Querying services on ${selectedIds.length} hosts…`); }, disabled: selectedIds.length === 0 },
+                { icon: 'Info', label: 'PsInfo', onClick: () => runPsToolBulk('psinfo', 'PsInfo'), disabled: selectedIds.length === 0 },
+                { icon: 'Users', label: 'LoggedOn', onClick: () => runPsToolBulk('psloggedon', 'PsLoggedOn'), disabled: selectedIds.length === 0 },
+                { icon: 'Activity', label: 'PsList', onClick: () => runPsToolBulk('pslist', 'PsList'), disabled: selectedIds.length === 0 },
+                { icon: 'Server', label: 'PsService', onClick: () => runPsToolBulk('psservice', 'PsService'), disabled: selectedIds.length === 0 },
               ]},
               { label: 'Power', items: [
                 { icon: 'Power', label: 'Reboot', variant: 'danger', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } setConfirmReboot(true); }, disabled: selectedIds.length === 0 },
@@ -2918,12 +3151,12 @@
                       { icon: remoteDesktopProtocol === 'VNC' ? 'Monitor' : 'MonitorSmartphone', text: `Connect (${remoteDesktopProtocol})`, onClick: () => launchRemoteDesktop(h) },
                       { separator: true },
                       { label: 'PsTools' },
-                      { icon: 'Info', text: 'PsInfo — System Info', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `PsInfo — ${h.hostname}`, targets: [h.id], step: 'Querying (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.psinfo', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: { hostname: h.hostname }, result: 'success' }); toast.info(`Running PsInfo on ${h.hostname}…`); } },
-                      { icon: 'Users', text: 'PsLoggedOn — Who is logged on', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `PsLoggedOn — ${h.hostname}`, targets: [h.id], step: 'Querying (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.psloggedon', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: { hostname: h.hostname }, result: 'success' }); toast.info(`Checking logged-on users on ${h.hostname}…`); } },
-                      { icon: 'Activity', text: 'PsList — Running Processes', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `PsList — ${h.hostname}`, targets: [h.id], step: 'Listing (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.pslist', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: { hostname: h.hostname }, result: 'success' }); toast.info(`Listing processes on ${h.hostname}…`); } },
-                      { icon: 'Server', text: 'PsService — Services', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `PsService — ${h.hostname}`, targets: [h.id], step: 'Querying (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.psservice', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: { hostname: h.hostname }, result: 'success' }); toast.info(`Querying services on ${h.hostname}…`); } },
-                      { icon: 'FileText', text: 'PsFile — Open Files', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `PsFile — ${h.hostname}`, targets: [h.id], step: 'Querying (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.psfile', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: { hostname: h.hostname }, result: 'success' }); toast.info(`Checking open files on ${h.hostname}…`); } },
-                      { icon: 'Hash', text: 'PsGetSid — Get SID', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `PsGetSid — ${h.hostname}`, targets: [h.id], step: 'Querying (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.psgetsid', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: { hostname: h.hostname }, result: 'success' }); toast.info(`Getting SID for ${h.hostname}…`); } },
+                      { icon: 'Info', text: 'PsInfo — System Info', onClick: () => runPsToolOnHost('psinfo', h.hostname, h.id, { label: 'PsInfo' }) },
+                      { icon: 'Users', text: 'PsLoggedOn — Who is logged on', onClick: () => runPsToolOnHost('psloggedon', h.hostname, h.id, { label: 'PsLoggedOn' }) },
+                      { icon: 'Activity', text: 'PsList — Running Processes', onClick: () => runPsToolOnHost('pslist', h.hostname, h.id, { label: 'PsList' }) },
+                      { icon: 'Server', text: 'PsService — Services', onClick: () => runPsToolOnHost('psservice', h.hostname, h.id, { label: 'PsService' }) },
+                      { icon: 'FileText', text: 'PsFile — Open Files', onClick: () => runPsToolOnHost('psfile', h.hostname, h.id, { label: 'PsFile' }) },
+                      { icon: 'Hash', text: 'PsGetSid — Get SID', onClick: () => runPsToolOnHost('psgetsid', h.hostname, h.id, { label: 'PsGetSid' }) },
                       { icon: 'Power', text: 'PsShutdown — Reboot', danger: true, onClick: () => { executePowerAction({ action: 'reboot', targetIds: [h.id] }); toast.success(`PsShutdown reboot sent to ${h.hostname}`); } },
                       { icon: 'RefreshCw', text: 'Check Pending Reboot + Reboot if Req', onClick: () => { if (h.pendingReboot) { executePowerAction({ action: 'reboot', targetIds: [h.id] }); toast.success(`${h.hostname} had pending reboot — rebooting now.`); } else { toast.info(`${h.hostname} does not have a pending reboot flag.`); } } },
                       { icon: 'MessageSquare', text: 'Send Message to User', onClick: () => { const msg = prompt('Enter message to display on remote screen:', 'IT Maintenance: Please save your work.'); if (msg) { addJob({ id: 'job-' + Date.now(), name: `Message — ${h.hostname}`, targets: [h.id], step: 'Sending (1/1)', progress: 50, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.message', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: { message: msg }, result: 'success' }); toast.success(`Message sent to ${h.hostname}`); } } },
@@ -5384,12 +5617,15 @@
     const updateStepConfig = (idx, config) => setSteps(s => s.map((st, i) => i === idx ? {...st, config: {...st.config, ...config}} : st));
     const updateStepLabel = (idx, label) => setSteps(s => s.map((st, i) => i === idx ? {...st, label} : st));
 
-    const executeQueue = () => {
+    const executeQueue = async () => {
       if (steps.length === 0) { toast.warning('Add at least one step before executing.'); return; }
       if (selectedTargets.length === 0) { toast.warning('Select at least one target host.'); return; }
-      const jobId = 'job-' + Date.now();
+      const targetHostnames = hosts.filter(h => selectedTargets.includes(h.id)).map(h => h.hostname);
+      if (targetHostnames.length === 0) { toast.error('Could not resolve hostnames for selected targets.'); return; }
+
+      const localJobId = 'job-' + Date.now();
       const job = {
-        id: jobId,
+        id: localJobId,
         name: name || 'Untitled Queue',
         targets: [...selectedTargets],
         step: `Step 1/${steps.length}: ${steps[0].label}`,
@@ -5398,13 +5634,44 @@
         status: 'running',
       };
       addJob(job);
-      appendAudit({
-        action: 'queues.execute', actionCategory: 'Job Queue',
-        targetType: 'Host', targetIds: [...selectedTargets],
-        parameters: { jobId, queueName: name, stepCount: steps.length, mode, stepLabels: steps.map(s => s.label) },
-        result: 'success',
-      });
-      toast.success(`Queue "${name}" started on ${selectedTargets.length} hosts. Monitor in Job Queue → Running.`);
+      toast.info(`Submitting queue "${name}" to backend…`);
+
+      if (!window.SupportHubLANAPI) {
+        updateJob(localJobId, { status: 'failed', progress: 100, step: 'No API client' });
+        appendAudit({ action: 'queues.execute', actionCategory: 'Job Queue', targetType: 'Host', targetIds: [...selectedTargets], parameters: { queueName: name }, result: 'failed' });
+        toast.error('API client not loaded');
+        return;
+      }
+
+      try {
+        const result = await window.SupportHubLANAPI.executeQueue(steps, targetHostnames, null, mode === 'continue' ? 'continue' : 'stop', name);
+        if (result && result.success && !result.demo) {
+          // Subscribe to WebSocket for live progress
+          const backendJobId = result.data?.jobId;
+          if (backendJobId && window._supporthublanWs) {
+            window._supporthublanWs.send(JSON.stringify({ type: 'subscribe', jobId: backendJobId }));
+          }
+          appendAudit({
+            action: 'queues.execute', actionCategory: 'Job Queue',
+            targetType: 'Host', targetIds: [...selectedTargets],
+            parameters: { jobId: backendJobId, queueName: name, stepCount: steps.length, mode, stepLabels: steps.map(s => s.label) },
+            result: 'success',
+          });
+          toast.success(`Queue "${name}" submitted — backend executing on ${targetHostnames.length} host(s). Watch live progress in the Job Queue panel.`, { duration: 6000 });
+        } else if (result && result.demo) {
+          updateJob(localJobId, { status: 'failed', progress: 100, step: 'Demo mode — backend not connected' });
+          appendAudit({ action: 'queues.execute', actionCategory: 'Job Queue', targetType: 'Host', targetIds: [...selectedTargets], parameters: { queueName: name }, result: 'skipped' });
+          toast.warning(`Queue not submitted — backend not connected (demo mode). Run the SupportHubLAN server on a Windows admin PC to execute queues for real.`, { duration: 8000 });
+        } else {
+          updateJob(localJobId, { status: 'failed', progress: 100, step: 'Failed', completedAt: new Date().toISOString() });
+          appendAudit({ action: 'queues.execute', actionCategory: 'Job Queue', targetType: 'Host', targetIds: [...selectedTargets], parameters: { queueName: name }, result: 'failed', error: result?.error });
+          toast.error(`Queue submission failed`, { detail: result?.error || 'Unknown error', duration: 8000 });
+        }
+      } catch (e) {
+        updateJob(localJobId, { status: 'failed', progress: 100, step: 'Failed', completedAt: new Date().toISOString() });
+        appendAudit({ action: 'queues.execute', actionCategory: 'Job Queue', targetType: 'Host', targetIds: [...selectedTargets], parameters: { queueName: name }, result: 'failed', error: e.message });
+        toast.error(`Queue submission failed`, { detail: e.message, duration: 8000 });
+      }
     };
 
     const saveAsTemplate = () => {
@@ -6663,16 +6930,67 @@
                 <FormField label="Expiration Protection"><Select defaultValue="enabled"><option value="enabled">Enabled</option><option value="disabled">Disabled</option></Select></FormField>
               </div>
               <div className="mt-3 flex gap-2">
-                <ActionButton variant="primary" size="sm" icon="RefreshCw" onClick={() => {
+                <ActionButton variant="primary" size="sm" icon="RefreshCw" onClick={async () => {
                   if (selectedIds.length === 0 && hosts.length > 0) { toast.warning('Select hosts from Inventory first.'); return; }
-                  addJob({ id: 'job-' + Date.now(), name: `LAPS Password Rotation — ${selectedIds.length || 'All'} hosts`, targets: selectedIds.length > 0 ? [...selectedIds] : hosts.filter(h => h.onlineStatus === 'online').map(h => h.id), step: 'Rotating (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' });
-                  appendAudit({ action: 'laps.rotate', actionCategory: 'Scripts', targetType: 'Host', targetIds: selectedIds, parameters: {}, result: 'success' });
-                  toast.success(`LAPS password rotation initiated on ${selectedIds.length} host(s).`);
+                  const targetIds = selectedIds.length > 0 ? [...selectedIds] : hosts.filter(h => h.onlineStatus === 'online').map(h => h.id);
+                  const targetHostnames = hosts.filter(h => targetIds.includes(h.id)).map(h => h.hostname);
+                  const jobId = 'job-' + Date.now();
+                  addJob({ id: jobId, name: `LAPS Rotation — ${targetIds.length} hosts`, targets: targetIds, step: 'Rotating (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' });
+                  toast.info(`Requesting LAPS rotation on ${targetHostnames.length} host(s)…`);
+                  if (!window.SupportHubLANAPI) { toast.error('API client not loaded'); return; }
+                  try {
+                    const result = await window.SupportHubLANAPI.rotateLaps(targetHostnames, null);
+                    if (result && result.success && !result.demo) {
+                      updateJob(jobId, { status: 'completed', progress: 100, step: 'Done', completedAt: new Date().toISOString(), output: result.data || '' });
+                      appendAudit({ action: 'laps.rotate', actionCategory: 'Scripts', targetType: 'Host', targetIds, parameters: { hostnames: targetHostnames }, result: 'success' });
+                      toast.success(`LAPS rotation completed on ${targetHostnames.length} host(s).`, { detail: 'See backend output for per-host results.', duration: 5000 });
+                    } else if (result && result.demo) {
+                      updateJob(jobId, { status: 'failed', progress: 100, step: 'Demo mode — backend not connected' });
+                      appendAudit({ action: 'laps.rotate', actionCategory: 'Scripts', targetType: 'Host', targetIds, parameters: {}, result: 'skipped' });
+                      toast.warning(`LAPS rotation skipped — backend not connected. Requires ActiveDirectory module on backend + LAPS deployed in AD.`, { duration: 8000 });
+                    } else {
+                      updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed', completedAt: new Date().toISOString(), output: result?.error || '' });
+                      appendAudit({ action: 'laps.rotate', actionCategory: 'Scripts', targetType: 'Host', targetIds, parameters: {}, result: 'failed', error: result?.error });
+                      toast.error(`LAPS rotation failed`, { detail: result?.error || 'Unknown error', duration: 8000 });
+                    }
+                  } catch (e) {
+                    updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed', completedAt: new Date().toISOString(), output: e.message });
+                    appendAudit({ action: 'laps.rotate', actionCategory: 'Scripts', targetType: 'Host', targetIds, parameters: {}, result: 'failed', error: e.message });
+                    toast.error(`LAPS rotation failed`, { detail: e.message, duration: 8000 });
+                  }
                 }}>Rotate Passwords Now</ActionButton>
-                <ActionButton variant="secondary" size="sm" icon="Key" onClick={() => {
+                <ActionButton variant="secondary" size="sm" icon="Key" onClick={async () => {
                   if (selectedIds.length === 0) { toast.warning('Select a host first.'); return; }
-                  appendAudit({ action: 'laps.retrieve', actionCategory: 'Scripts', targetType: 'Host', targetIds: selectedIds, parameters: {}, result: 'success' });
-                  toast.info(`Retrieving LAPS password for ${selectedIds.length} host(s)…`);
+                  const targetHostnames = hosts.filter(h => selectedIds.includes(h.id)).map(h => h.hostname);
+                  const jobId = 'job-' + Date.now();
+                  addJob({ id: jobId, name: `LAPS Retrieve — ${selectedIds.length} hosts`, targets: [...selectedIds], step: 'Retrieving (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' });
+                  toast.info(`Retrieving LAPS passwords for ${targetHostnames.length} host(s)…`);
+                  if (!window.SupportHubLANAPI) { toast.error('API client not loaded'); return; }
+                  try {
+                    const result = await window.SupportHubLANAPI.retrieveLaps(targetHostnames, null);
+                    if (result && result.success && !result.demo) {
+                      // Parse the returned JSON
+                      let parsed;
+                      try { parsed = JSON.parse(result.data); } catch { parsed = Array.isArray(result.data) ? result.data : [result.data]; }
+                      const arr = Array.isArray(parsed) ? parsed : [parsed];
+                      const successCount = arr.filter(r => r.success !== false).length;
+                      updateJob(jobId, { status: 'completed', progress: 100, step: 'Done', completedAt: new Date().toISOString(), output: JSON.stringify(arr, null, 2) });
+                      appendAudit({ action: 'laps.retrieve', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...selectedIds], parameters: { hostnames: targetHostnames }, result: 'success' });
+                      toast.success(`Retrieved LAPS passwords for ${successCount}/${arr.length} host(s).`, { detail: 'Passwords visible in Job Queue → Output. Treat as sensitive — clear audit log when done.', duration: 8000 });
+                    } else if (result && result.demo) {
+                      updateJob(jobId, { status: 'failed', progress: 100, step: 'Demo mode — backend not connected' });
+                      appendAudit({ action: 'laps.retrieve', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...selectedIds], parameters: {}, result: 'skipped' });
+                      toast.warning(`LAPS retrieval skipped — backend not connected. Requires ActiveDirectory module on backend + LAPS deployed in AD.`, { duration: 8000 });
+                    } else {
+                      updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed', completedAt: new Date().toISOString(), output: result?.error || '' });
+                      appendAudit({ action: 'laps.retrieve', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...selectedIds], parameters: {}, result: 'failed', error: result?.error });
+                      toast.error(`LAPS retrieval failed`, { detail: result?.error || 'Unknown error', duration: 8000 });
+                    }
+                  } catch (e) {
+                    updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed', completedAt: new Date().toISOString(), output: e.message });
+                    appendAudit({ action: 'laps.retrieve', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...selectedIds], parameters: {}, result: 'failed', error: e.message });
+                    toast.error(`LAPS retrieval failed`, { detail: e.message, duration: 8000 });
+                  }
                 }}>Retrieve Passwords</ActionButton>
                 <ActionButton variant="secondary" size="sm" icon="Save" onClick={() => { appendAudit({ action: 'settings.laps-save', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: {}, result: 'success' }); toast.success('LAPS settings saved.'); }}>Save Settings</ActionButton>
               </div>

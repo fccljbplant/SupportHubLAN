@@ -1,163 +1,90 @@
-# SupportHubLAN — Complete Deployment Guide
+# SupportHubLAN Backend Server
 
-## Architecture
+Node.js backend that serves the frontend AND the API on a single port (default 8080).
 
-SupportHubLAN consists of two components:
+See the main [README.md](../README.md) in the repo root for complete documentation.
 
-1. **Frontend** (`supporthublan-pro.html`) — A single-file React/Tailwind web app that runs in any browser. Provides the full UI for managing Windows endpoints.
+## Quick start
 
-2. **Backend** (`supporthublan-server/`) — A Node.js server that runs on a Windows admin machine and performs REAL Windows administration tasks via PowerShell, backend queries, and the PSWindowsUpdate module.
-
-```
-Browser (Frontend) ←→ REST API ←→ Node.js Server (Backend) ←→ PowerShell/backend queries ←→ Remote Windows Hosts
-```
-
-## When to use Demo Mode vs Real Mode
-
-- **Demo Mode** (default): When you open `supporthublan-pro.html` directly in a browser (no backend running). All actions are simulated — jobs are created with fake progress, host states flip based on timers, no real PowerShell is executed. Perfect for demos, evaluation, and UI testing.
-
-- **Real Mode**: When the backend server is running and the frontend is configured to connect to it. All actions perform REAL operations on remote Windows hosts — actual backend queries queries, real update scanning/installation, real reboots, real script execution.
-
-## Setup — Backend Server (Real Mode)
-
-### Prerequisites
-
-1. **Windows machine** with admin privileges (the "admin PC")
-   - Windows 10/11 Pro/Enterprise or Windows Server 2016+
-   - This machine must have network access to all target hosts
-
-2. **Node.js 14+** installed
-   - Download from https://nodejs.org/
-
-3. **PowerShell 5.1+** (built into Windows 10/11/Server)
-
-4. **PSWindowsUpdate module** (for Windows Update operations)
-   ```powershell
-   # Run PowerShell as Administrator
-   Install-Module PSWindowsUpdate -Force -AllowClobber
-   Import-Module PSWindowsUpdate
-   ```
-
-5. **network connectivity enabled on target hosts** (for remote PowerShell execution)
-   ```powershell
-   # On each target host, run as Administrator:
-   Enable-PSRemoting -Force
-   winrm quickconfig
-   # Or via Group Policy for fleet-wide deployment
-   ```
-
-6. **Admin credentials** for target hosts
-   - Domain admin account, OR
-   - Local admin account on each target host
-
-### Installation
-
-1. Copy the `supporthublan-server/` folder to your admin PC (e.g., `C:\SupportHubLAN\server\`)
-
-2. Open Command Prompt or PowerShell:
-   ```cmd
-   cd C:\SupportHubLAN\server
-   npm install
-   ```
-
-3. Start the server:
-   ```cmd
-   npm start
-   ```
-
-4. The server will start on `http://localhost:3137`
-
-### Connecting the Frontend
-
-**Option A: Open the HTML file with backend URL configured**
-
-Add this line BEFORE the app script in `supporthublan-pro.html`:
-```html
-<script>window.SUPPORTHUBLAN_API_URL = 'http://YOUR-ADMIN-PC:3137';</script>
+```powershell
+cd supporthublan-server
+npm install
+copy .env.example .env   # then edit if needed
+npm start
 ```
 
-Then open the HTML file in Chrome/Edge.
+Server runs on http://localhost:8080 and auto-opens the browser.
 
-**Option B: Serve both from the backend**
+## What it does
 
-Copy `supporthublan-pro.html` into the `supporthublan-server/public/` folder and modify the server to serve it:
-```javascript
-// Add to server.js:
-app.use(express.static('public'));
-```
+- Serves `../supporthublan.html` at `/`
+- Serves `/vendor/*` static assets (React, Babel, Tailwind, Lucide)
+- Exposes 30+ API endpoints under `/api/*`
+- WebSocket at `/ws` for live job queue progress
+- Spawns PowerShell to execute PsTools (PsExec, PsInfo, PsList, PsKill, PsService, PsLoggedOn, PsFile, PsGetSid, PsSuspend, PsShutdown)
+- Calls `Get-ADComputer` for AD imports + reads `ms-Mcs-AdmPwd` for LAPS
+- Calls `PSWindowsUpdate` module for Windows Updates
+- Sends Wake-on-LAN UDP magic packets
+- Spawns `vncviewer.exe` / `mstsc.exe` for remote desktop quick-launch
 
-Then open `http://YOUR-ADMIN-PC:3137/supporthublan-pro.html` in your browser.
+## Configuration
 
-### Verifying the Connection
+All settings in `.env` (see `.env.example`). Key ones:
 
-When the frontend connects to the backend successfully:
-- The status bar will show "Backend: Connected" 
-- All actions will perform real operations
-- Host info will come from real backend queries queries
-- Update scans will use the real PSWindowsUpdate module
-
-When the backend is NOT available:
-- The app automatically falls back to Demo Mode
-- All actions are simulated
-- A "Demo Mode" indicator appears
-
-## API Endpoints
-
-| Endpoint | Method | Description |
+| Variable | Default | Purpose |
 |---|---|---|
-| `/api/health` | GET | Health check — verify backend is running |
-| `/api/hosts/:hostname/info` | POST | Get real system info via backend queries (OS, CPU, RAM, disk, uptime) |
-| `/api/hosts/:hostname/ping` | POST | Ping a host to check if online |
-| `/api/updates/scan` | POST | Scan for available Windows Updates (PSWindowsUpdate) |
-| `/api/updates/download` | POST | Download updates on remote hosts |
-| `/api/updates/install` | POST | Install updates on remote hosts (with optional reboot) |
-| `/api/updates/history` | POST | Get update installation history |
-| `/api/scripts/execute` | POST | Execute PowerShell script on remote hosts (Invoke-Command) |
-| `/api/deployments/run` | POST | Copy + execute installer on remote hosts |
-| `/api/deployments/copy` | POST | Copy files/folders to remote hosts |
-| `/api/services/:hostname/list` | POST | List services on remote host (backend queries) |
-| `/api/services/:hostname/action` | POST | Start/Stop/Restart service on remote host |
-| `/api/processes/:hostname/list` | POST | List processes on remote host (backend queries) |
-| `/api/processes/:hostname/kill` | POST | Kill process on remote host |
-| `/api/power/action` | POST | Reboot/Shutdown remote hosts (Restart-Computer/Stop-Computer) |
-| `/api/power/wol` | POST | Send Wake-on-LAN magic packets |
-| `/api/power/check-pending` | POST | Check if reboot is pending on remote hosts |
-| `/api/queues/execute` | POST | Execute job queue (sequential step engine) |
-| `/api/credentials` | GET/POST | Store/retrieve credentials |
-| `/ws` | WebSocket | Real-time job progress updates |
+| `PORT` | `8080` | Listen port |
+| `PSTOOLS_PATH` | `C:\PSTools\` | Where psexec.exe lives |
+| `BIND_ADDRESS` | `0.0.0.0` | Network bind |
+| `ADMIN_USER` / `ADMIN_PASS` | _(empty)_ | Optional Basic Auth |
+| `ALLOWED_ORIGINS` | `*` | CORS |
 
-## Security Notes
+## API endpoints
 
-1. **The backend server has NO authentication** — it's designed for internal network use only. Do NOT expose it to the internet without adding authentication (e.g., API keys, Windows Authentication, or a reverse proxy with auth).
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/health` | Backend health check + endpoint inventory |
+| POST | `/api/credentials` | Store credential |
+| GET | `/api/credentials` | List credentials |
+| POST | `/api/hosts/discover-ad` | AD computer discovery via `Get-ADComputer` |
+| POST | `/api/hosts/:hostname/info` | System info via CIM |
+| POST | `/api/hosts/:hostname/ping` | Single-host ping |
+| POST | `/api/scan` | Parallel ping sweep (runspace pool) |
+| POST | `/api/updates/scan` | Scan for updates (PSWindowsUpdate) |
+| POST | `/api/updates/download` | Download updates |
+| POST | `/api/updates/install` | Install updates |
+| POST | `/api/updates/history` | Update history |
+| POST | `/api/scripts/execute` | Run PowerShell remotely |
+| POST | `/api/services/:hostname/list` | List services |
+| POST | `/api/services/:hostname/action` | Start/stop/restart service |
+| POST | `/api/processes/:hostname/list` | List processes |
+| POST | `/api/processes/:hostname/kill` | Kill process by PID |
+| POST | `/api/power/action` | Reboot/shutdown |
+| POST | `/api/power/wol` | Wake-on-LAN magic packet |
+| POST | `/api/laps/retrieve` | Get LAPS password from AD |
+| POST | `/api/laps/rotate` | Trigger LAPS password rotation |
+| POST | `/api/deploy/package` | Copy + install MSI/EXE |
+| POST | `/api/queues/execute` | Start job queue (async + WebSocket) |
+| POST | `/api/pstools/execute` | Generic PsTools runner |
+| POST | `/api/pstools/psinfo` | PsInfo |
+| POST | `/api/pstools/pslist` | PsList |
+| POST | `/api/pstools/pskill` | PsKill |
+| POST | `/api/pstools/psservice` | PsService |
+| POST | `/api/pstools/psloggedon` | PsLoggedOn |
+| POST | `/api/pstools/psshutdown` | PsShutdown |
+| POST | `/api/pstools/psfile` | PsFile |
+| POST | `/api/pstools/psgetsid` | PsGetSid |
+| POST | `/api/pstools/pssuspend` | PsSuspend |
+| POST | `/api/remote/connect` | Launch VNC/RDP viewer |
+| WS | `/ws` | Live updates (queue progress, scan results) |
 
-2. **Credentials are stored in memory** — in production, use Windows Credential Manager or an encrypted vault (e.g., Azure Key Vault, AWS Secrets Manager).
+## Production notes
 
-3. **network connectivity communication is encrypted** by default when using Kerberos authentication in a domain environment. For workgroup environments, configure network connectivity with HTTPS or use IPSec.
-
-4. **The PSWindowsUpdate module** requires the module to be installed on the admin PC (not necessarily on each target host — it can operate remotely).
+- For multi-user auth, put behind a reverse proxy (nginx/IIS) with OIDC
+- For HTTPS, terminate TLS at the reverse proxy
+- For audit log compliance, forward `/api/*` access logs to a SIEM
+- Credentials are stored in-memory only — restart loses them. For persistent storage, integrate Windows Credential Manager via the `wincred` npm package
 
 ## Troubleshooting
 
-### "Access Denied" when connecting to remote hosts
-- Ensure network connectivity is enabled on targets: `Enable-PSRemoting -Force`
-- Ensure the admin PC is in the "Administrators" group on target hosts
-- For workgroup hosts: `Set-Item WSMan:\localhost\Client\TrustedHosts -Value "*" -Force`
-- Test connectivity: `Enter-PSSession -ComputerName TARGET -Credential DOMAIN\admin`
-
-### PSWindowsUpdate not found
-```powershell
-Install-Module PSWindowsUpdate -Force -AllowClobber
-# If execution policy blocks:
-Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
-```
-
-### Backend not reachable from browser
-- Check Windows Firewall allows port 3137
-- Try `http://localhost:3137/api/health` in browser
-- Check the server console for errors
-
-### Frontend shows "Demo Mode"
-- The frontend couldn't reach the backend
-- Verify `SUPPORTHUBLAN_API_URL` is set correctly
-- Check that the backend is running
-- Check browser console for CORS errors (the backend has CORS enabled)
+See main [README.md → Troubleshooting](../README.md#troubleshooting).

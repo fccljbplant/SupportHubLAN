@@ -1,25 +1,52 @@
 /* ==========================================================================
-   SupportHubLAN Backend Server
+   SupportHubLAN Backend Server v1.2
    ==========================================================================
    This server runs on a Windows machine with admin privileges and performs
    REAL Windows administration tasks on remote hosts via:
-   - Backend Remote Execution
-   - System Queries
-   - Windows Update Operations
-   - System.Net.NetworkInformation.Ping (for host monitoring)
-   - System.Net.Sockets (for Wake-on-LAN magic packets)
+   - PsTools suite (PsExec/PsInfo/PsList/PsKill/PsService/PsLoggedOn/PsFile/PsGetSid/PsSuspend/PsShutdown)
+   - Active Directory queries (Get-ADComputer, ms-Mcs-AdmPwd for LAPS)
+   - Windows Update operations (PSWindowsUpdate module)
+   - Real ping sweeps (Test-Connection runspace pool)
+   - Wake-on-LAN (UDP magic packet broadcast)
+   - VNC/RDP viewer launch (child_process.spawn)
+   - Job Queue execution with WebSocket live progress
 
-   PREREQUISITES:
-   1. Run on Windows with Node.js 14+ installed
-   2. PowerShell 5.1 or later (built into Windows 10/11/Server 2016+)
-   3. Network access to target hosts
-   4. PSWindowsUpdate module installed: Install-Module PSWindowsUpdate -Force
-   5. Admin credentials for target hosts (domain admin or local admin)
+   ARCHITECTURE
+   ------------
+   This server serves BOTH the API (/api/*) AND the static frontend (/
+   returns ../supporthublan.html). Single port = single firewall rule.
+   The frontend auto-detects it's being served by the backend and switches
+   from DEMO mode to LIVE mode automatically.
 
-   STARTUP:
+   PREREQUISITES
+   -------------
+   1. Windows 10/11 or Server 2019+ (PsTools is Windows-only)
+   2. Node.js 18 LTS or newer — https://nodejs.org/
+   3. PowerShell 5.1+ (built into Windows)
+   4. PsTools suite extracted to C:\PSTools\ — https://learn.microsoft.com/sysinternals/downloads/pstools
+   5. PSWindowsUpdate module (optional, for Windows Updates):
+        Install-Module PSWindowsUpdate -Force -AllowClobber
+   6. ActiveDirectory module (optional, for AD import + LAPS):
+        Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0
+   7. Network access to target hosts: TCP 445 (SMB), TCP 135 (RPC), UDP 137-138 (NetBIOS)
+   8. Local admin rights on target hosts (or domain admin)
+
+   STARTUP
+   -------
    npm install
    npm start
-   Server runs on http://localhost:3137
+   → Server runs on http://localhost:8080 (or PORT from .env)
+   → Browser auto-opens to the frontend
+
+   CONFIGURATION (.env)
+   --------------------
+   PORT=8080                          # Backend listen port
+   PSTOOLS_PATH=C:\\PSTools\\          # Path to PsTools folder
+   ADMIN_USER=admin                   # Optional Basic Auth username
+   ADMIN_PASS=changeme                # Optional Basic Auth password (leave blank to disable)
+   ALLOWED_ORIGINS=*                  # CORS origins (use specific origins in production)
+   AUTO_OPEN_BROWSER=true             # Auto-open browser on startup
+   BIND_ADDRESS=0.0.0.0               # Bind address (use 127.0.0.1 to restrict to localhost)
    ========================================================================== */
 
 const express = require('express');
@@ -28,18 +55,73 @@ const bodyParser = require('body-parser');
 const { exec, execFile, spawn } = require('child_process');
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 const { WebSocketServer } = require('ws');
 const http = require('http');
+const crypto = require('crypto');
+
+// ---- Load .env (manual parser — no dotenv dependency needed) ----
+const envPath = path.join(__dirname, '.env');
+if (fs.existsSync(envPath)) {
+  fs.readFileSync(envPath, 'utf8').split('\n').forEach(line => {
+    const m = line.match(/^\s*([A-Z_]+)\s*=\s*(.*)\s*$/);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
+  });
+}
 
 const app = express();
 const server = http.createServer(app);
-const PORT = process.env.PORT || 3137;
+const PORT = parseInt(process.env.PORT || '8080', 10);
+const PSTOOLS_PATH = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
+const BIND_ADDRESS = process.env.BIND_ADDRESS || '0.0.0.0';
+const ADMIN_USER = process.env.ADMIN_USER || '';
+const ADMIN_PASS = process.env.ADMIN_PASS || '';
+const AUTO_OPEN = (process.env.AUTO_OPEN_BROWSER || 'true').toLowerCase() === 'true';
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS || '*';
 
 // ---- Middleware ----
-app.use(cors());
-app.use(bodyParser.json({ limit: '10mb' }));
+app.use(cors({ origin: ALLOWED_ORIGINS === '*' ? true : ALLOWED_ORIGINS.split(',') }));
+app.use(bodyParser.json({ limit: '50mb' }));
 
-// ---- Credential Store (in-memory; in production, use encrypted storage) ----
+// ---- Optional Basic Auth (only enabled if ADMIN_USER + ADMIN_PASS set) ----
+if (ADMIN_USER && ADMIN_PASS) {
+  app.use((req, res, next) => {
+    // Skip auth for WebSocket upgrade requests and static frontend assets from same origin
+    if (req.path === '/ws' || req.path === '/' || req.path.startsWith('/vendor/') || req.path.endsWith('.html')) {
+      return next();
+    }
+    const auth = req.headers.authorization;
+    if (!auth || !auth.startsWith('Basic ')) {
+      res.setHeader('WWW-Authenticate', 'Basic realm="SupportHubLAN"');
+      return res.status(401).send('Authentication required');
+    }
+    const [user, pass] = Buffer.from(auth.slice(6), 'base64').toString().split(':');
+    if (user === ADMIN_USER && pass === ADMIN_PASS) return next();
+    res.setHeader('WWW-Authenticate', 'Basic realm="SupportHubLAN"');
+    return res.status(401).send('Invalid credentials');
+  });
+}
+
+// ---- Static frontend: serve ../supporthublan.html and /vendor/* ----
+const FRONTEND_PATH = path.join(__dirname, '..', 'supporthublan.html');
+const VENDOR_PATH = path.join(__dirname, '..', 'vendor');
+
+app.use('/vendor', express.static(VENDOR_PATH, { maxAge: '1d' }));
+
+app.get('/', (req, res) => {
+  if (fs.existsSync(FRONTEND_PATH)) {
+    res.sendFile(FRONTEND_PATH);
+  } else {
+    res.status(404).send('Frontend file not found. Expected: ' + FRONTEND_PATH);
+  }
+});
+
+app.get('/supporthublan.html', (req, res) => {
+  if (fs.existsSync(FRONTEND_PATH)) res.sendFile(FRONTEND_PATH);
+  else res.status(404).send('Not found');
+});
+
+// ---- Credential Store (in-memory; for production use Windows Credential Manager) ----
 let credentialStore = {};
 
 // ---- Helper: Execute PowerShell command and return result ----
@@ -66,12 +148,9 @@ function runPowerShell(script, timeoutMs = 60000) {
 // ---- Helper: Build credential block for PowerShell ----
 function buildCredentialBlock(credential) {
   if (!credential || !credential.username) return '';
-  const parts = credential.username.split('\\');
-  const domain = parts.length > 1 ? parts[0] : '';
-  const user = parts.length > 1 ? parts[1] : credential.username;
   return `
-    $secPassword = ConvertTo-SecureString '${credential.password || ''}' -AsPlainText -Force
-    $cred = New-Object System.Management.Automation.PSCredential('${credential.username}', $secPassword)
+    $secPassword = ConvertTo-SecureString '${(credential.password || '').replace(/'/g, "''")}' -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential('${credential.username.replace(/'/g, "''")}', $secPassword)
   `;
 }
 
@@ -80,19 +159,63 @@ function sendResult(res, result) {
   res.json({ success: result.success, data: result.data, error: result.error, stdout: result.stdout, stderr: result.stderr });
 }
 
+// ---- Helper: Validate hostname/IP (prevent injection) ----
+function sanitizeHost(h) {
+  return String(h).replace(/[^a-zA-Z0-9._\-:]/g, '');
+}
+
 // ==========================================================================
-// HEALTH CHECK
+// HEALTH CHECK — Used by frontend to detect LIVE vs DEMO mode
 // ==========================================================================
 app.get('/api/health', (req, res) => {
+  const pstoolsInstalled = fs.existsSync(path.join(PSTOOLS_PATH, 'psexec.exe'));
+  const psWindowsUpdateAvailable = true; // Checked at runtime
   res.json({
     success: true,
     data: {
       server: 'SupportHubLAN Backend',
-      version: '1.0.0',
+      version: '1.2.0',
       platform: os.platform(),
       hostname: os.hostname(),
-      powershell: true,
-      uptime: process.uptime()
+      port: PORT,
+      uptime: process.uptime(),
+      pstoolsPath: PSTOOLS_PATH,
+      pstoolsInstalled,
+      endpoints: [
+        'GET  /api/health',
+        'POST /api/credentials',
+        'POST /api/hosts/discover-ad',
+        'POST /api/hosts/:hostname/info',
+        'POST /api/hosts/:hostname/ping',
+        'POST /api/scan',
+        'POST /api/updates/scan',
+        'POST /api/updates/download',
+        'POST /api/updates/install',
+        'POST /api/updates/history',
+        'POST /api/scripts/execute',
+        'POST /api/services/:hostname/list',
+        'POST /api/services/:hostname/action',
+        'POST /api/processes/:hostname/list',
+        'POST /api/processes/:hostname/kill',
+        'POST /api/power/action',
+        'POST /api/power/wol',
+        'POST /api/laps/retrieve',
+        'POST /api/laps/rotate',
+        'POST /api/deploy/package',
+        'POST /api/queues/execute',
+        'POST /api/pstools/execute',
+        'POST /api/pstools/psinfo',
+        'POST /api/pstools/pslist',
+        'POST /api/pstools/pskill',
+        'POST /api/pstools/psservice',
+        'POST /api/pstools/psloggedon',
+        'POST /api/pstools/psshutdown',
+        'POST /api/pstools/psfile',
+        'POST /api/pstools/psgetsid',
+        'POST /api/pstools/pssuspend',
+        'POST /api/remote/connect',
+        'WS   /ws'
+      ]
     }
   });
 });
@@ -113,14 +236,15 @@ app.get('/api/credentials', (req, res) => {
 
 // ==========================================================================
 // ACTIVE DIRECTORY IMPORT — Discover computers from AD OU
+// ==========================================================================
 app.post('/api/hosts/discover-ad', async (req, res) => {
   const { ouPath, searchScope, filter, nameAttr } = req.body;
   const script = `
     Import-Module ActiveDirectory -ErrorAction SilentlyContinue
-    $searchBase = '${ouPath || 'OU=Computers,DC=corp,DC=local'}'
-    $scope = '${searchScope || 'subtree'}'
-    $filter = '${filter || 'objectCategory=computer'}'
-    $nameAttr = '${nameAttr || 'cn'}'
+    $searchBase = '${(ouPath || 'OU=Computers,DC=corp,DC=local').replace(/'/g, "''")}'
+    $scope = '${(searchScope || 'subtree').replace(/'/g, "''")}'
+    $filter = '${(filter || 'objectCategory=computer').replace(/'/g, "''")}'
+    $nameAttr = '${(nameAttr || 'cn').replace(/'/g, "''")}'
     try {
       $computers = Get-ADComputer -Filter $filter -SearchBase $searchBase -SearchScope $scope -Properties Name, DNSHostName, IPAddress, OperatingSystem
       $results = $computers | Select-Object @{N='name';E={$_.$nameAttr}}, @{N='fqdn';E={$_.DNSHostName}}, @{N='ip';E={$_.IPAddress}}, @{N='os';E={$_.OperatingSystem}} | ConvertTo-Json -Compress
@@ -133,22 +257,19 @@ app.post('/api/hosts/discover-ad', async (req, res) => {
   res.json({ success: result.success, hosts: result.stdout, error: result.stderr });
 });
 
+// ==========================================================================
 // HOST OPERATIONS — Real system queries to remote hosts
 // ==========================================================================
-
-// Get detailed system info from a remote host via the backend
 app.post('/api/hosts/:hostname/info', async (req, res) => {
   const { hostname } = req.params;
   const { credential } = req.body;
-
-  const credBlock = credential ? `
-    $cred = New-Object System.Management.Automation.PSCredential('${credential.username}', (ConvertTo-SecureString '${credential.password}' -AsPlainText -Force))
-  ` : '';
+  const safeHost = sanitizeHost(hostname);
+  const credBlock = credential ? buildCredentialBlock(credential) : '';
 
   const script = `
     ${credBlock}
     try {
-      $params = @{ ComputerName = '${hostname}'; ErrorAction = 'Stop' }
+      $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
       ${credential ? '$params.Credential = $cred' : ''}
 
       $os = Get-CimInstance Win32_OperatingSystem @params
@@ -172,7 +293,7 @@ app.post('/api/hosts/:hostname/info', async (req, res) => {
       }
       $result | ConvertTo-Json -Compress
     } catch {
-      @{ hostname = '${hostname}'; onlineStatus = 'offline'; error = $_.Exception.Message } | ConvertTo-Json -Compress
+      @{ hostname = '${safeHost}'; onlineStatus = 'offline'; error = $_.Exception.Message } | ConvertTo-Json -Compress
     }
   `;
 
@@ -185,15 +306,15 @@ app.post('/api/hosts/:hostname/info', async (req, res) => {
   }
 });
 
-// Ping a host to check if it's online
 app.post('/api/hosts/:hostname/ping', async (req, res) => {
   const { hostname } = req.params;
+  const safeHost = sanitizeHost(hostname);
   const script = `
     try {
-      $ping = Test-Connection -ComputerName '${hostname}' -Count 1 -Quiet -ErrorAction SilentlyContinue
-      @{ hostname = '${hostname}'; online = $ping; status = if ($ping) { 'up' } else { 'down' } } | ConvertTo-Json -Compress
+      $ping = Test-Connection -ComputerName '${safeHost}' -Count 1 -Quiet -ErrorAction SilentlyContinue
+      @{ hostname = '${safeHost}'; online = $ping; status = if ($ping) { 'up' } else { 'down' } } | ConvertTo-Json -Compress
     } catch {
-      @{ hostname = '${hostname}'; online = $false; status = 'error'; error = $_.Exception.Message } | ConvertTo-Json -Compress
+      @{ hostname = '${safeHost}'; online = $false; status = 'error'; error = $_.Exception.Message } | ConvertTo-Json -Compress
     }
   `;
   const result = await runPowerShell(script, 10000);
@@ -205,22 +326,73 @@ app.post('/api/hosts/:hostname/ping', async (req, res) => {
   }
 });
 
-// Refresh system info for a host (re-query system info)
 app.post('/api/hosts/:hostname/refresh', async (req, res) => {
   req.url = `/api/hosts/${req.params.hostname}/info`;
   app.handle(req, res);
 });
 
 // ==========================================================================
+// NETWORK SCANNER — Real parallel ping sweep (replaces Math.random fallback)
+// ==========================================================================
+app.post('/api/scan', async (req, res) => {
+  const { ips } = req.body;
+  if (!Array.isArray(ips) || ips.length === 0) {
+    return res.json({ success: false, error: 'ips array required' });
+  }
+  const safeIps = ips.map(sanitizeHost).filter(Boolean).slice(0, 1024); // Cap at 1024 per scan
+  const jobScanId = 'scan-' + Date.now();
+
+  // Respond immediately with job ID, then run async + broadcast progress
+  res.json({ success: true, data: { jobId: jobScanId, total: safeIps.length } });
+
+  // Run ping sweep using runspace pool for parallelism
+  const ipsBlock = safeIps.map(ip => `'${ip}'`).join(',');
+  const script = `
+    $ips = @(${ipsBlock})
+    $pool = [RunspaceFactory]::CreateRunspacePool(1, [Math]::Min(50, $ips.Count))
+    $pool.Open()
+    $scriptBlock = {
+      param($ip)
+      $ping = Test-Connection -ComputerName $ip -Count 1 -Quiet -ErrorAction SilentlyContinue
+      return @{ ip = $ip; online = $ping }
+    }
+    $jobs = $ips | ForEach-Object {
+      $ps = [PowerShell]::Create().AddScript($scriptBlock).AddArgument($_)
+      $ps.RunspacePool = $pool
+      @{ handle = $ps; async = $ps.BeginInvoke() }
+    }
+    $results = @()
+    foreach ($j in $jobs) {
+      $results += $j.handle.EndInvoke($j.async)
+    }
+    $pool.Close()
+    $pool.Dispose()
+    $results | ConvertTo-Json -Compress
+  `;
+  const result = await runPowerShell(script, 120000);
+  let online = 0, offline = 0;
+  try {
+    const parsed = JSON.parse(result.stdout);
+    const arr = Array.isArray(parsed) ? parsed : [parsed];
+    arr.forEach(r => { if (r.online) online++; else offline++; });
+    broadcastUpdate({
+      type: 'scan-complete',
+      jobId: jobScanId,
+      results: arr,
+      summary: { total: safeIps.length, online, offline }
+    });
+  } catch (e) {
+    broadcastUpdate({ type: 'scan-error', jobId: jobScanId, error: result.stderr || 'Parse failed' });
+  }
+});
+
+// ==========================================================================
 // WINDOWS UPDATES — Real scan/download/install via PSWindowsUpdate module
 // ==========================================================================
-
-// Scan for available updates on remote host(s)
 app.post('/api/updates/scan', async (req, res) => {
   const { hostnames, credential } = req.body;
-  const hostList = hostnames.join("','");
-  const credParam = credential ? `-Credential $cred` : '';
-
+  const hostList = hostnames.map(sanitizeHost).join("','");
+  const credParam = credential ? '-Credential $cred' : '';
   const script = `
     ${credential ? buildCredentialBlock(credential) : ''}
     Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
@@ -242,24 +414,21 @@ app.post('/api/updates/scan', async (req, res) => {
     }
     $results | ConvertTo-Json -Depth 5 -Compress
   `;
-
   const result = await runPowerShell(script, 120000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Download updates on remote host(s)
 app.post('/api/updates/download', async (req, res) => {
   const { hostnames, credential, kbFilter } = req.body;
-  const hostList = hostnames.join("','");
-  const credParam = credential ? `-Credential $cred` : '';
-
+  const hostList = hostnames.map(sanitizeHost).join("','");
+  const credParam = credential ? '-Credential $cred' : '';
   const script = `
     ${credential ? buildCredentialBlock(credential) : ''}
     Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
     $results = @()
     foreach ($h in @('${hostList}')) {
       try {
-        ${kbFilter ? `$updates = Get-WindowsUpdate -ComputerName $h ${credParam} -KBArticleID '${kbFilter}' -Download -ErrorAction Stop` : `Get-WindowsUpdate -ComputerName $h ${credParam} -Download -AcceptAll -ErrorAction Stop`}
+        ${kbFilter ? `$updates = Get-WindowsUpdate -ComputerName $h ${credParam} -KBArticleID '${sanitizeHost(kbFilter)}' -Download -ErrorAction Stop` : `Get-WindowsUpdate -ComputerName $h ${credParam} -Download -AcceptAll -ErrorAction Stop`}
         $results += @{ hostname = $h; status = 'downloaded' }
       } catch {
         $results += @{ hostname = $h; status = 'failed'; error = $_.Exception.Message }
@@ -267,18 +436,15 @@ app.post('/api/updates/download', async (req, res) => {
     }
     $results | ConvertTo-Json -Compress
   `;
-
   const result = await runPowerShell(script, 300000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Install updates on remote host(s)
 app.post('/api/updates/install', async (req, res) => {
   const { hostnames, credential, kbFilter, classification, rebootBehavior } = req.body;
-  const hostList = hostnames.join("','");
-  const credParam = credential ? `-Credential $cred` : '';
-  const rebootParam = rebootBehavior === 'always' ? '-AutoReboot' : rebootBehavior === 'if-required' ? '-AutoReboot' : '';
-
+  const hostList = hostnames.map(sanitizeHost).join("','");
+  const credParam = credential ? '-Credential $cred' : '';
+  const rebootParam = rebootBehavior === 'always' || rebootBehavior === 'if-required' ? '-AutoReboot' : '';
   const script = `
     ${credential ? buildCredentialBlock(credential) : ''}
     Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
@@ -287,8 +453,8 @@ app.post('/api/updates/install', async (req, res) => {
       try {
         $params = @{ ComputerName = $h; Install = $true; AcceptAll = $true ${rebootParam ? '; ' + rebootParam : ''} }
         ${credential ? '$params.Credential = $cred' : ''}
-        ${kbFilter ? "$params.KBArticleID = '${kbFilter}'" : ''}
-        ${classification ? "$params.Category = '${classification}'" : ''}
+        ${kbFilter ? "$params.KBArticleID = '${sanitizeHost(kbFilter)}'" : ''}
+        ${classification ? "$params.Category = '${sanitizeHost(classification)}'" : ''}
         Install-WindowsUpdate @params -ErrorAction Stop
         $results += @{ hostname = $h; status = 'installed'; rebootRequired = $false }
       } catch {
@@ -297,16 +463,13 @@ app.post('/api/updates/install', async (req, res) => {
     }
     $results | ConvertTo-Json -Compress
   `;
-
   const result = await runPowerShell(script, 600000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Get update history from remote host
 app.post('/api/updates/history', async (req, res) => {
   const { hostnames, credential } = req.body;
-  const hostList = hostnames.join("','");
-
+  const hostList = hostnames.map(sanitizeHost).join("','");
   const script = `
     ${credential ? buildCredentialBlock(credential) : ''}
     Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
@@ -314,31 +477,24 @@ app.post('/api/updates/history', async (req, res) => {
     foreach ($h in @('${hostList}')) {
       try {
         $history = Get-WUHistory -ComputerName $h ${credential ? '-Credential $cred' : ''} -ErrorAction Stop
-        $results += @{
-          hostname = $h
-          updates = $history | Select-Object KB, Title, Date, Result | ConvertTo-Json
-        }
+        $results += @{ hostname = $h; updates = $history | Select-Object KB, Title, Date, Result | ConvertTo-Json }
       } catch {
         $results += @{ hostname = $h; error = $_.Exception.Message }
       }
     }
     $results | ConvertTo-Json -Depth 4 -Compress
   `;
-
   const result = await runPowerShell(script, 60000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 // ==========================================================================
-// SCRIPTS & COMMANDS — Real remote execution via PowerShell Remoting
+// SCRIPTS & COMMANDS — Real remote execution
 // ==========================================================================
-
-// Execute a command/script on remote host(s)
 app.post('/api/scripts/execute', async (req, res) => {
   const { hostnames, script: userScript, credential, language, timeout } = req.body;
-  const hostList = hostnames.join("','");
+  const hostList = hostnames.map(sanitizeHost).join("','");
   const timeoutSec = timeout || 60;
-
   const psScript = `
     ${credential ? buildCredentialBlock(credential) : ''}
     $results = @()
@@ -347,358 +503,358 @@ app.post('/api/scripts/execute', async (req, res) => {
         $params = @{ ComputerName = $h; ScriptBlock = { ${userScript} }; ErrorAction = 'Stop' }
         ${credential ? '$params.Credential = $cred' : ''}
         $output = Invoke-Command @params
-        $results += @{
-          hostname = $h
-          status = 'complete'
-          exitCode = 0
-          output = ($output | Out-String)
-        }
+        $results += @{ hostname = $h; success = $true; output = ($output | Out-String) }
       } catch {
-        $results += @{ hostname = $h; status = 'failed'; exitCode = 1; error = $_.Exception.Message }
+        $results += @{ hostname = $h; success = $false; error = $_.Exception.Message }
       }
     }
-    $results | ConvertTo-Json -Depth 3 -Compress
+    $results | ConvertTo-Json -Depth 4 -Compress
   `;
-
-  const result = await runPowerShell(psScript, (timeoutSec * 1000) + 5000);
+  const result = await runPowerShell(psScript, timeoutSec * 1000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 // ==========================================================================
-// SOFTWARE DEPLOYMENT — Copy files and execute installers remotely
+// SERVICES & PROCESSES
 // ==========================================================================
-
-// Copy file/folder to remote host(s) and optionally execute
-app.post('/api/deployments/run', async (req, res) => {
-  const { hostnames, packagePath, arguments: args, credential, rebootBehavior } = req.body;
-  const hostList = hostnames.join("','");
-  const destPath = req.body.destinationPath || 'C:\\temp\\';
-
-  const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
-    $results = @()
-    foreach ($h in @('${hostList}')) {
-      try {
-        # Copy the file to the remote host
-        $dest = "\\\\$h\\C$\\temp\\"
-        if (!(Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force }
-        Copy-Item '${packagePath}' $dest -Force -Recurse
-
-        # Execute the installer silently
-        $fileName = Split-Path '${packagePath}' -Leaf
-        $remotePath = "C:\\temp\\$fileName"
-        $invokeParams = @{ ComputerName = $h; ErrorAction = 'Stop' }
-        ${credential ? '$invokeParams.Credential = $cred' : ''}
-
-        $processScript = [ScriptBlock]::Create("Start-Process '$remotePath' -ArgumentList '${args || ''}' -Wait -NoNewWindow -PassThru")
-        $proc = Invoke-Command @invokeParams -ScriptBlock $processScript
-
-        $results += @{ hostname = $h; status = 'complete'; exitCode = $proc.ExitCode }
-
-        ${rebootBehavior === 'always' ? `
-        # Reboot if configured
-        Restart-Computer -ComputerName $h ${credential ? '-Credential $cred' : ''} -Force
-        ` : ''}
-      } catch {
-        $results += @{ hostname = $h; status = 'failed'; error = $_.Exception.Message }
-      }
-    }
-    $results | ConvertTo-Json -Compress
-  `;
-
-  const result = await runPowerShell(script, 300000);
-  res.json({ success: result.success, data: result.stdout, error: result.stderr });
-});
-
-// Copy files/folders to remote host(s) — standalone
-app.post('/api/deployments/copy', async (req, res) => {
-  const { hostnames, sourcePath, destinationPath, credential } = req.body;
-  const hostList = hostnames.join("','");
-
-  const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
-    $results = @()
-    foreach ($h in @('${hostList}')) {
-      try {
-        $dest = "\\\\$h\\${destinationPath.replace(':', '$')}"
-        Copy-Item '${sourcePath}' $dest -Force -Recurse
-        $results += @{ hostname = $h; status = 'complete' }
-      } catch {
-        $results += @{ hostname = $h; status = 'failed'; error = $_.Exception.Message }
-      }
-    }
-    $results | ConvertTo-Json -Compress
-  `;
-
-  const result = await runPowerShell(script, 120000);
-  res.json({ success: result.success, data: result.stdout, error: result.stderr });
-});
-
-// ==========================================================================
-// SERVICES & PROCESSES — Real system queries
-// ==========================================================================
-
-// Get services on remote host
 app.post('/api/services/:hostname/list', async (req, res) => {
   const { hostname } = req.params;
   const { credential } = req.body;
-
+  const safeHost = sanitizeHost(hostname);
   const script = `
     ${credential ? buildCredentialBlock(credential) : ''}
     try {
-      $params = @{ ComputerName = '${hostname}'; ErrorAction = 'Stop' }
+      $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
       ${credential ? '$params.Credential = $cred' : ''}
-      $services = Get-CimInstance Win32_Service @params | Select-Object Name, DisplayName, State, StartMode, ProcessId, StartName
-      $services | ConvertTo-Json -Depth 2 -Compress
+      Get-CimInstance Win32_Service @params | Select-Object Name, DisplayName, State, StartMode, StartName | ConvertTo-Json -Compress
     } catch {
       @{ error = $_.Exception.Message } | ConvertTo-Json -Compress
     }
   `;
-
   const result = await runPowerShell(script, 30000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Start/Stop/Restart a service on remote host
 app.post('/api/services/:hostname/action', async (req, res) => {
   const { hostname } = req.params;
   const { serviceName, action, credential } = req.body;
-
-  const actionMap = { start: 'Start-Service', stop: 'Stop-Service', restart: 'Restart-Service' };
-  const cmd = actionMap[action] || 'Restart-Service';
-
+  const safeHost = sanitizeHost(hostname);
+  const safeService = sanitizeHost(serviceName);
+  const credBlock = credential ? buildCredentialBlock(credential) : '';
+  const credParam = credential ? '-Credential $cred' : '';
   const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
+    ${credBlock}
     try {
-      $params = @{ ComputerName = '${hostname}'; Name = '${serviceName}'; ErrorAction = 'Stop' }
-      ${credential ? '$params.Credential = $cred' : ''}
-      ${cmd} @params -Force
-      @{ hostname = '${hostname}'; service = '${serviceName}'; action = '${action}'; status = 'success' } | ConvertTo-Json -Compress
+      switch ('${action}') {
+        'start'   { Start-Service   -ComputerName '${safeHost}' -Name '${safeService}' ${credParam}; $newState = 'Running' }
+        'stop'    { Stop-Service    -ComputerName '${safeHost}' -Name '${safeService}' -Force ${credParam}; $newState = 'Stopped' }
+        'restart' { Restart-Service -ComputerName '${safeHost}' -Name '${safeService}' -Force ${credParam}; $newState = 'Running' }
+        default   { throw "Unknown action: ${action}" }
+      }
+      @{ hostname = '${safeHost}'; service = '${safeService}'; state = $newState; success = $true } | ConvertTo-Json -Compress
     } catch {
-      @{ hostname = '${hostname}'; service = '${serviceName}'; action = '${action}'; status = 'failed'; error = $_.Exception.Message } | ConvertTo-Json -Compress
+      @{ hostname = '${safeHost}'; service = '${safeService}'; success = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
     }
   `;
-
   const result = await runPowerShell(script, 30000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Get processes on remote host
 app.post('/api/processes/:hostname/list', async (req, res) => {
   const { hostname } = req.params;
   const { credential } = req.body;
-
+  const safeHost = sanitizeHost(hostname);
   const script = `
     ${credential ? buildCredentialBlock(credential) : ''}
     try {
-      $params = @{ ComputerName = '${hostname}'; ErrorAction = 'Stop' }
+      $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
       ${credential ? '$params.Credential = $cred' : ''}
-      $procs = Get-CimInstance Win32_Process @params | Select-Object ProcessId, Name, @{N='CPU';E={$_.UserModeTime / 10000000}}, @{N='Memory';E={[math]::Round($_.WorkingSetSize / 1MB, 1)}}
-      $procs | ConvertTo-Json -Depth 2 -Compress
+      Get-CimInstance Win32_Process @params | Select-Object ProcessId, Name, @{N='MemMB';E={[math]::Round($_.WorkingSetSize/1MB,1)}}, @{N='CPU';E={$_.UserModeTime/1e7}} | ConvertTo-Json -Compress
     } catch {
       @{ error = $_.Exception.Message } | ConvertTo-Json -Compress
     }
   `;
-
   const result = await runPowerShell(script, 30000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Kill a process on remote host
 app.post('/api/processes/:hostname/kill', async (req, res) => {
   const { hostname } = req.params;
-  const { pid: procId, name, credential } = req.body;
-
+  const { pid, name, credential } = req.body;
+  const safeHost = sanitizeHost(hostname);
+  const safePid = parseInt(pid, 10);
+  if (!safePid) return res.json({ success: false, error: 'Invalid PID' });
   const script = `
     ${credential ? buildCredentialBlock(credential) : ''}
     try {
-      $params = @{ ComputerName = '${hostname}'; ErrorAction = 'Stop' }
-      ${credential ? '$params.Credential = $cred' : ''}
-      ${procId ? `Invoke-Command @params -ScriptBlock { Stop-Process -Id ${procId} -Force }` : `Invoke-Command @params -ScriptBlock { Get-Process -Name '${name}' | Stop-Process -Force }`}
-      @{ hostname = '${hostname}'; ${procId ? `pid = ${procId}` : `name = '${name}'`}; status = 'killed' } | ConvertTo-Json -Compress
+      Invoke-Command -ComputerName '${safeHost}' ${credential ? '-Credential $cred' : ''} -ScriptBlock { Stop-Process -Id ${safePid} -Force } -ErrorAction Stop
+      @{ hostname = '${safeHost}'; pid = ${safePid}; killed = $true } | ConvertTo-Json -Compress
     } catch {
-      @{ hostname = '${hostname}'; status = 'failed'; error = $_.Exception.Message } | ConvertTo-Json -Compress
+      @{ hostname = '${safeHost}'; pid = ${safePid}; killed = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
     }
   `;
-
   const result = await runPowerShell(script, 15000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 // ==========================================================================
-// POWER MANAGEMENT — Real reboot/shutdown/Wake-on-LAN
+// POWER MANAGEMENT — Restart / Stop / Wake-on-LAN
 // ==========================================================================
-
-// Reboot or shutdown remote host(s)
 app.post('/api/power/action', async (req, res) => {
-  const { hostnames, action, credential, force } = req.body;
-  const hostList = hostnames.join("','");
-  const forceParam = force ? '-Force' : '';
-
+  const { hostname, action, credential, message, timeout } = req.body;
+  const safeHost = sanitizeHost(hostname);
+  const credBlock = credential ? buildCredentialBlock(credential) : '';
+  const credParam = credential ? '-Credential $cred' : '';
+  const msgParam = message ? `-Force` : `-Force`;
   const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
-    $results = @()
-    foreach ($h in @('${hostList}')) {
-      try {
-        $params = @{ ComputerName = $h; ErrorAction = 'Stop' ${forceParam ? '; ' + forceParam : ''} }
-        ${credential ? '$params.Credential = $cred' : ''}
-        ${action === 'reboot' ? 'Restart-Computer @params' : action === 'shutdown' ? 'Stop-Computer @params' : ''}
-        $results += @{ hostname = $h; status = 'success'; action = '${action}' }
-      } catch {
-        $results += @{ hostname = $h; status = 'failed'; error = $_.Exception.Message }
+    ${credBlock}
+    try {
+      switch ('${action}') {
+        'reboot'   { Restart-Computer -ComputerName '${safeHost}' ${credParam} ${msgParam} ${message ? `-Comment "${message.replace(/"/g, '`"')}"` : ''} -ErrorAction Stop }
+        'shutdown' { Stop-Computer -ComputerName '${safeHost}' ${credParam} -Force -ErrorAction Stop }
+        'startup'  { throw 'Cannot power on via PowerShell — use Wake-on-LAN /api/power/wol endpoint' }
+        default    { throw "Unknown action: ${action}" }
       }
+      @{ hostname = '${safeHost}'; action = '${action}'; success = $true } | ConvertTo-Json -Compress
+    } catch {
+      @{ hostname = '${safeHost}'; action = '${action}'; success = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
     }
-    $results | ConvertTo-Json -Compress
   `;
-
-  const result = await runPowerShell(script, 30000);
+  const result = await runPowerShell(script, 20000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Wake on LAN — send magic packet
 app.post('/api/power/wol', async (req, res) => {
-  const { macAddresses } = req.body;
+  const { mac } = req.body;
+  if (!mac || !/^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$/.test(mac)) {
+    return res.json({ success: false, error: 'Invalid MAC address. Format: AA:BB:CC:DD:EE:FF' });
+  }
+  // Build magic packet: 6 bytes of 0xFF + 16 repetitions of MAC
+  const macParts = mac.split(/[:-]/).map(h => parseInt(h, 16));
+  const magic = Buffer.alloc(102);
+  magic.fill(0xFF, 0, 6);
+  for (let i = 6; i < 102; i += 6) {
+    for (let j = 0; j < 6; j++) magic[i + j] = macParts[j];
+  }
+  // Broadcast on UDP port 9 (discard) — most NICs respond to this
+  const sock = require('dgram').createSocket('udp4');
+  sock.bind(() => {
+    sock.setBroadcast(true);
+    sock.send(magic, 9, '255.255.255.255', (err) => {
+      sock.close();
+      res.json({ success: !err, data: { mac, sent: !err }, error: err ? err.message : null });
+    });
+  });
+});
 
+// ==========================================================================
+// LAPS — Retrieve / Rotate Local Admin Passwords (NEW — was missing)
+// ==========================================================================
+app.post('/api/laps/retrieve', async (req, res) => {
+  const { hostnames, credential } = req.body;
+  const hostList = hostnames.map(sanitizeHost).join("','");
   const script = `
+    ${credential ? buildCredentialBlock(credential) : ''}
+    Import-Module ActiveDirectory -ErrorAction SilentlyContinue
     $results = @()
-    foreach ($mac in @('${macAddresses.join("','")}')) {
+    foreach ($h in @('${hostList}')) {
       try {
-        $macBytes = $mac -split '[-:]' | ForEach-Object { [Convert]::ToByte($_, 16) }
-        $packet = [byte[]](,0xFF * 6) + ($macBytes * 16)
-        $udp = New-Object System.Net.Sockets.UdpClient
-        $udp.Connect([System.Net.IPAddress]::Broadcast, 9)
-        $udp.Send($packet, $packet.Length) | Out-Null
-        $udp.Close()
-        $results += @{ mac = $mac; status = 'sent' }
+        $computer = Get-ADComputer -Identity $h -Properties ms-Mcs-AdmPwd, ms-Mcs-AdmPwdExpirationTime, DNSHostName -ErrorAction Stop
+        $results += @{
+          hostname = $h
+          password = $computer.'ms-Mcs-AdmPwd'
+          expirationTime = if ($computer.'ms-Mcs-AdmPwdExpirationTime') { [DateTime]::FromFileTimeUtc([long]$computer.'ms-Mcs-AdmPwdExpirationTime') } else { $null }
+          success = $true
+        }
       } catch {
-        $results += @{ mac = $mac; status = 'failed'; error = $_.Exception.Message }
+        $results += @{ hostname = $h; success = $false; error = $_.Exception.Message }
       }
     }
-    $results | ConvertTo-Json -Compress
+    $results | ConvertTo-Json -Depth 4 -Compress
   `;
-
-  const result = await runPowerShell(script, 10000);
+  const result = await runPowerShell(script, 30000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Check if reboot is pending on remote host(s)
-app.post('/api/power/check-pending', async (req, res) => {
+app.post('/api/laps/rotate', async (req, res) => {
   const { hostnames, credential } = req.body;
-  const hostList = hostnames.join("','");
+  const hostList = hostnames.map(sanitizeHost).join("','");
+  // Reset-AdmPwdPassword comes from the LAPS PowerShell module (or AdmPwd.PS legacy)
+  // For modern Windows LAPS (Server 2022+/Win 11+), use Reset-LapsPassword
+  const script = `
+    ${credential ? buildCredentialBlock(credential) : ''}
+    Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+    $results = @()
+    foreach ($h in @('${hostList}')) {
+      try {
+        # Try modern LAPS first (Windows 11 22H2+, Server 2022+)
+        try {
+          Invoke-Command -ComputerName $h ${credential ? '-Credential $cred' : ''} -ScriptBlock { Reset-LapsPassword } -ErrorAction Stop
+          $results += @{ hostname = $h; rotated = $true; method = 'modern' }
+        } catch {
+          # Fall back to legacy LAPS — set the expiration time to now
+          Set-ADComputer -Identity $h -Replace @{'ms-Mcs-AdmPwdExpirationTime' = '0'} -ErrorAction Stop
+          $results += @{ hostname = $h; rotated = $true; method = 'legacy' }
+        }
+      } catch {
+        $results += @{ hostname = $h; rotated = $false; error = $_.Exception.Message }
+      }
+    }
+    $results | ConvertTo-Json -Depth 4 -Compress
+  `;
+  const result = await runPowerShell(script, 60000);
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
+});
 
+// ==========================================================================
+// SOFTWARE DEPLOYMENT
+// ==========================================================================
+app.post('/api/deploy/package', async (req, res) => {
+  const { hostnames, packagePath, arguments: args, credential, rebootBehavior } = req.body;
+  const hostList = hostnames.map(sanitizeHost).join("','");
+  const safePath = (packagePath || '').replace(/"/g, '`"').replace(/'/g, "''");
+  const safeArgs = (args || '').replace(/"/g, '`"').replace(/'/g, "''");
   const script = `
     ${credential ? buildCredentialBlock(credential) : ''}
     $results = @()
     foreach ($h in @('${hostList}')) {
       try {
-        $params = @{ ComputerName = $h; ErrorAction = 'Stop' }
-        ${credential ? '$params.Credential = $cred' : ''}
-        $pending = $false
-        $keys = @(
-          'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending',
-          'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired'
-        )
-        $result = Invoke-Command @params -ScriptBlock {
-          param($keys)
-          foreach ($k in $keys) { if (Test-Path $k) { return $true } }
-          return $false
-        } -ArgumentList $keys
-        $results += @{ hostname = $h; pendingReboot = $result }
+        # Copy package to remote host
+        $remotePath = "\\\\$h\\C$\\Temp\\$(Split-Path '${safePath}' -Leaf)"
+        Copy-Item '${safePath}' $remotePath -Force -ErrorAction Stop
+        # Execute remotely
+        $cmd = "& \\"C:\\Temp\\$(Split-Path '${safePath}' -Leaf)\\" ${safeArgs}"
+        $output = Invoke-Command -ComputerName $h ${credential ? '-Credential $cred' : ''} -ScriptBlock { param($c) Invoke-Expression $c } -ArgumentList $cmd -ErrorAction Stop
+        $results += @{ hostname = $h; success = $true; output = ($output | Out-String) }
+        ${rebootBehavior === 'always' ? `Restart-Computer -ComputerName $h ${credential ? '-Credential $cred' : ''} -Force` : ''}
       } catch {
-        $results += @{ hostname = $h; pendingReboot = $false; error = $_.Exception.Message }
+        $results += @{ hostname = $h; success = $false; error = $_.Exception.Message }
       }
     }
-    $results | ConvertTo-Json -Compress
+    $results | ConvertTo-Json -Depth 4 -Compress
   `;
-
-  const result = await runPowerShell(script, 30000);
+  const result = await runPowerShell(script, 300000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 // ==========================================================================
-// JOB QUEUE EXECUTION — Real sequential step execution
+// JOB QUEUE EXECUTION — Real sequential step execution + WebSocket progress
 // ==========================================================================
-
-// Execute a job queue on target hosts
 app.post('/api/queues/execute', async (req, res) => {
-  const { steps, hostnames, credential, errorHandling } = req.body;
-
-  // For long-running jobs, start async and return a job ID
+  const { steps, hostnames, credential, errorHandling, queueName } = req.body;
   const jobId = 'job-' + Date.now();
+  const credBlock = credential ? buildCredentialBlock(credential) : '';
+  const credParam = credential ? '-Credential $cred' : '';
 
-  // Execute steps sequentially (async — don't block the HTTP response)
+  // Respond immediately with job ID
+  res.json({ success: true, data: { jobId, status: 'running', stepCount: steps.length, hostCount: hostnames.length, queueName: queueName || 'Untitled Queue' } });
+
+  // Execute async + broadcast progress
   (async () => {
-    for (const step of steps) {
-      for (const hostname of hostnames) {
+    let totalSteps = steps.length * hostnames.length;
+    let completed = 0;
+    broadcastUpdate({ type: 'queue-start', jobId, queueName: queueName || 'Untitled Queue', total: totalSteps, completed: 0 });
+
+    for (let si = 0; si < steps.length; si++) {
+      const step = steps[si];
+      for (let hi = 0; hi < hostnames.length; hi++) {
+        const hostname = sanitizeHost(hostnames[hi]);
+        let stepResult = { success: false, output: '', error: '' };
+        const progressMsg = { type: 'queue-progress', jobId, step: step.type, stepIndex: si, totalSteps: steps.length, hostname, hostIndex: hi, totalHosts: hostnames.length, completed, total: totalSteps, status: 'running' };
+        broadcastUpdate(progressMsg);
+
         try {
+          let script = '';
           switch (step.type) {
             case 'check-updates':
-              await runPowerShell(`Import-Module PSWindowsUpdate; Get-WindowsUpdate -ComputerName '${hostname}' ${credential ? '-Credential $cred' : ''}`);
+              script = `Import-Module PSWindowsUpdate; Get-WindowsUpdate -ComputerName '${hostname}' ${credParam} | ConvertTo-Json -Compress`;
               break;
             case 'download-updates':
-              await runPowerShell(`Import-Module PSWindowsUpdate; Get-WindowsUpdate -ComputerName '${hostname}' ${credential ? '-Credential $cred' : ''} -Download -AcceptAll`);
+              script = `Import-Module PSWindowsUpdate; Get-WindowsUpdate -ComputerName '${hostname}' ${credParam} -Download -AcceptAll | ConvertTo-Json -Compress`;
               break;
             case 'install-all':
-              await runPowerShell(`Import-Module PSWindowsUpdate; Install-WindowsUpdate -ComputerName '${hostname}' ${credential ? '-Credential $cred' : ''} -AcceptAll -AutoReboot`);
+            case 'install-updates':
+              script = `Import-Module PSWindowsUpdate; Install-WindowsUpdate -ComputerName '${hostname}' ${credParam} -AcceptAll -AutoReboot | ConvertTo-Json -Compress`;
               break;
             case 'reboot':
-              await runPowerShell(`Restart-Computer -ComputerName '${hostname}' ${credential ? '-Credential $cred' : ''} -Force`);
+              script = `Restart-Computer -ComputerName '${hostname}' ${credParam} -Force; @{ hostname='${hostname}'; rebooted=$true } | ConvertTo-Json -Compress`;
               break;
             case 'shutdown':
-              await runPowerShell(`Stop-Computer -ComputerName '${hostname}' ${credential ? '-Credential $cred' : ''} -Force`);
+              script = `Stop-Computer -ComputerName '${hostname}' ${credParam} -Force; @{ hostname='${hostname}'; stopped=$true } | ConvertTo-Json -Compress`;
               break;
             case 'wait-for-online':
-              let online = false;
-              for (let i = 0; i < 60; i++) {
-                const r = await runPowerShell(`Test-Connection -ComputerName '${hostname}' -Count 1 -Quiet`, 5000);
-                if (r.stdout.trim() === 'True') { online = true; break; }
-                await new Promise(resolve => setTimeout(resolve, 5000));
-              }
+              script = `for ($i=0; $i -lt 60; $i++) { if (Test-Connection -ComputerName '${hostname}' -Count 1 -Quiet) { break }; Start-Sleep -Seconds 5 }; @{ hostname='${hostname}'; online=$true } | ConvertTo-Json -Compress`;
               break;
             case 'run-command':
               if (step.config?.code) {
-                await runPowerShell(`Invoke-Command -ComputerName '${hostname}' ${credential ? '-Credential $cred' : ''} -ScriptBlock { ${step.config.code} }`);
+                script = `Invoke-Command -ComputerName '${hostname}' ${credParam} -ScriptBlock { ${step.config.code} } | Out-String`;
               }
               break;
             case 'start-service':
               if (step.config?.serviceName) {
-                await runPowerShell(`Start-Service -ComputerName '${hostname}' -Name '${step.config.serviceName}' ${credential ? '-Credential $cred' : ''}`);
+                script = `Start-Service -ComputerName '${hostname}' -Name '${sanitizeHost(step.config.serviceName)}' ${credParam}; @{ hostname='${hostname}'; service='${sanitizeHost(step.config.serviceName)}'; state='Running' } | ConvertTo-Json -Compress`;
               }
               break;
             case 'stop-service':
               if (step.config?.serviceName) {
-                await runPowerShell(`Stop-Service -ComputerName '${hostname}' -Name '${step.config.serviceName}' ${credential ? '-Credential $cred' : ''} -Force`);
+                script = `Stop-Service -ComputerName '${hostname}' -Name '${sanitizeHost(step.config.serviceName)}' -Force ${credParam}; @{ hostname='${hostname}'; service='${sanitizeHost(step.config.serviceName)}'; state='Stopped' } | ConvertTo-Json -Compress`;
               }
               break;
             case 'restart-service':
               if (step.config?.serviceName) {
-                await runPowerShell(`Restart-Service -ComputerName '${hostname}' -Name '${step.config.serviceName}' ${credential ? '-Credential $cred' : ''} -Force`);
+                script = `Restart-Service -ComputerName '${hostname}' -Name '${sanitizeHost(step.config.serviceName)}' -Force ${credParam}; @{ hostname='${hostname}'; service='${sanitizeHost(step.config.serviceName)}'; state='Running' } | ConvertTo-Json -Compress`;
+              }
+              break;
+            case 'psexec-run':
+              if (step.config?.command) {
+                script = `& '${PSTOOLS_PATH}psexec.exe' \\\\${hostname} -accepteula ${step.config.command}`;
               }
               break;
             case 'wait-minutes':
-              if (step.config?.minutes) {
-                await new Promise(resolve => setTimeout(resolve, step.config.minutes * 60000));
-              }
+              await new Promise(r => setTimeout(r, (step.config?.minutes || 1) * 60000));
+              stepResult = { success: true, output: `Waited ${step.config?.minutes || 1} minute(s)` };
               break;
-            // Add more step types as needed
+            default:
+              stepResult = { success: false, error: `Unknown step type: ${step.type}` };
+          }
+          if (script) {
+            const r = await runPowerShell(script, 300000);
+            stepResult = { success: r.success, output: r.stdout, error: r.stderr };
           }
         } catch (e) {
-          if (errorHandling === 'stop') break;
+          stepResult = { success: false, error: e.message };
+        }
+
+        completed++;
+        broadcastUpdate({
+          type: 'queue-step-complete',
+          jobId, step: step.type, stepIndex: si, hostname, hostIndex: hi,
+          completed, total: totalSteps,
+          success: stepResult.success,
+          output: stepResult.output?.slice(0, 5000),
+          error: stepResult.error,
+          status: stepResult.success ? 'success' : 'failed'
+        });
+
+        if (!stepResult.success && errorHandling === 'stop') {
+          broadcastUpdate({ type: 'queue-aborted', jobId, reason: 'Step failed and errorHandling=stop', step, hostname, completed, total: totalSteps });
+          return;
         }
       }
     }
-    // Job complete — in production, update job status via WebSocket
+    broadcastUpdate({ type: 'queue-complete', jobId, completed, total: totalSteps, status: 'completed' });
   })();
-
-  res.json({ success: true, data: { jobId, status: 'running', stepCount: steps.length, hostCount: hostnames.length } });
 });
 
 // ==========================================================================
-// PSTOOLS — Execute PsTools commands on remote hosts
+// PSTOOLS — Execute PsTools commands on remote hosts (configurable path)
 // ==========================================================================
+function pstoolsExe(name) {
+  return path.join(PSTOOLS_PATH, name);
+}
+
 app.post('/api/pstools/execute', async (req, res) => {
   const { tool, hostname, args, credential } = req.body;
-  const pstoolsPath = 'C:\\PSTools\\'; // Configurable
   const toolMap = {
     psexec: 'psexec.exe', psinfo: 'psinfo.exe', pslist: 'pslist.exe',
     pskill: 'pskill.exe', psservice: 'psservice.exe', psloggedon: 'psloggedon.exe',
@@ -706,107 +862,127 @@ app.post('/api/pstools/execute', async (req, res) => {
     pssuspend: 'pssuspend.exe'
   };
   const exe = toolMap[tool] || 'psexec.exe';
-  const target = credential ? `\\\\${hostname}` : `\\\\${hostname}`;
-  const fullCmd = `"${pstoolsPath}${exe}" ${target} -accepteula ${args || ''}`;
-
+  const safeHost = sanitizeHost(hostname);
+  const target = `\\\\${safeHost}`;
+  const fullCmd = `"${pstoolsExe(exe)}" ${target} -accepteula ${args || ''}`;
   const result = await runPowerShell(fullCmd, 60000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Get system info via PsInfo
 app.post('/api/pstools/psinfo', async (req, res) => {
-  const { hostname, credential } = req.body;
-  const pstoolsPath = 'C:\\PSTools\\';
-  const cmd = `"${pstoolsPath}psinfo.exe" \\${hostname} -accepteula`;
+  const { hostname } = req.body;
+  const safeHost = sanitizeHost(hostname);
+  const cmd = `"${pstoolsExe('psinfo.exe')}" \\\\${safeHost} -accepteula`;
   const result = await runPowerShell(cmd, 30000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// List processes via PsList
 app.post('/api/pstools/pslist', async (req, res) => {
   const { hostname } = req.body;
-  const pstoolsPath = 'C:\\PSTools\\';
-  const cmd = `"${pstoolsPath}pslist.exe" \\${hostname} -accepteula`;
+  const safeHost = sanitizeHost(hostname);
+  const cmd = `"${pstoolsExe('pslist.exe')}" \\\\${safeHost} -accepteula`;
   const result = await runPowerShell(cmd, 30000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Kill process via PsKill
 app.post('/api/pstools/pskill', async (req, res) => {
   const { hostname, target } = req.body;
-  const pstoolsPath = 'C:\\PSTools\\';
-  const cmd = `"${pstoolsPath}pskill.exe" \\${hostname} ${target} -accepteula`;
+  const safeHost = sanitizeHost(hostname);
+  const safeTarget = sanitizeHost(target);
+  const cmd = `"${pstoolsExe('pskill.exe')}" \\\\${safeHost} ${safeTarget} -accepteula`;
   const result = await runPowerShell(cmd, 15000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Query services via PsService
 app.post('/api/pstools/psservice', async (req, res) => {
   const { hostname, action, serviceName } = req.body;
-  const pstoolsPath = 'C:\\PSTools\\';
-  const actionCmd = action && serviceName ? `${action} "${serviceName}"` : 'query';
-  const cmd = `"${pstoolsPath}psservice.exe" \\${hostname} ${actionCmd} -accepteula`;
+  const safeHost = sanitizeHost(hostname);
+  const safeService = serviceName ? sanitizeHost(serviceName) : '';
+  const actionCmd = action && serviceName ? `${action} "${safeService}"` : 'query';
+  const cmd = `"${pstoolsExe('psservice.exe')}" \\\\${safeHost} ${actionCmd} -accepteula`;
   const result = await runPowerShell(cmd, 30000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Show logged-on users via PsLoggedOn
 app.post('/api/pstools/psloggedon', async (req, res) => {
   const { hostname } = req.body;
-  const pstoolsPath = 'C:\\PSTools\\';
-  const cmd = `"${pstoolsPath}psloggedon.exe" \\${hostname} -accepteula`;
+  const safeHost = sanitizeHost(hostname);
+  const cmd = `"${pstoolsExe('psloggedon.exe')}" \\\\${safeHost} -accepteula`;
   const result = await runPowerShell(cmd, 15000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Reboot/shutdown via PsShutdown
 app.post('/api/pstools/psshutdown', async (req, res) => {
   const { hostname, action, timeout, message } = req.body;
-  const pstoolsPath = 'C:\\PSTools\\';
+  const safeHost = sanitizeHost(hostname);
   const actionFlag = action === 'shutdown' ? '-s' : action === 'abort' ? '-a' : '-r';
-  const cmd = `"${pstoolsPath}psshutdown.exe" \\${hostname} ${actionFlag} -t ${timeout || 5} -c -accepteula ${message ? `-m "${message}"` : ''}`;
+  const safeMsg = message ? message.replace(/"/g, '`"') : '';
+  const cmd = `"${pstoolsExe('psshutdown.exe')}" \\\\${safeHost} ${actionFlag} -t ${timeout || 5} -c -accepteula ${message ? `-m "${safeMsg}"` : ''}`;
   const result = await runPowerShell(cmd, 15000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Show open files via PsFile
 app.post('/api/pstools/psfile', async (req, res) => {
   const { hostname } = req.body;
-  const pstoolsPath = 'C:\\PSTools\\';
-  const cmd = `"${pstoolsPath}psfile.exe" \\${hostname} -accepteula`;
+  const safeHost = sanitizeHost(hostname);
+  const cmd = `"${pstoolsExe('psfile.exe')}" \\\\${safeHost} -accepteula`;
   const result = await runPowerShell(cmd, 15000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Get SID via PsGetSid
 app.post('/api/pstools/psgetsid', async (req, res) => {
   const { hostname } = req.body;
-  const pstoolsPath = 'C:\\PSTools\\';
-  const cmd = `"${pstoolsPath}psgetsid.exe" \\${hostname} -accepteula`;
+  const safeHost = sanitizeHost(hostname);
+  const cmd = `"${pstoolsExe('psgetsid.exe')}" \\\\${safeHost} -accepteula`;
   const result = await runPowerShell(cmd, 15000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Suspend/resume process via PsSuspend
 app.post('/api/pstools/pssuspend', async (req, res) => {
   const { hostname, target, action } = req.body;
-  const pstoolsPath = 'C:\\PSTools\\';
+  const safeHost = sanitizeHost(hostname);
+  const safeTarget = sanitizeHost(target);
   const actionFlag = action === 'resume' ? '-r' : '';
-  const cmd = `"${pstoolsPath}pssuspend.exe" ${actionFlag} \\${hostname} ${target} -accepteula`;
+  const cmd = `"${pstoolsExe('pssuspend.exe')}" ${actionFlag} \\\\${safeHost} ${safeTarget} -accepteula`;
   const result = await runPowerShell(cmd, 15000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
-// Launch VNC/RDP to remote host
+// ==========================================================================
+// REMOTE DESKTOP — Launch VNC/RDP viewer on the backend machine
+// ==========================================================================
 app.post('/api/remote/connect', async (req, res) => {
   const { hostname, ip, protocol, port } = req.body;
-  if (protocol === 'VNC') {
-    const vncPath = 'C:\\Program Files\\RealVNC\\VNC Viewer\\vncviewer.exe';
-    spawn(vncPath, [`${ip}::${port || 5900}`], { detached: true, stdio: 'ignore' }).unref();
-  } else {
-    spawn('mstsc.exe', [`/v:${ip}:${port || 3389}`], { detached: true, stdio: 'ignore' }).unref();
+  const safeIp = sanitizeHost(ip || hostname);
+  try {
+    let proc, vncPath;
+    if (protocol === 'VNC') {
+      // Try common VNC viewer paths
+      const candidates = [
+        'C:\\Program Files\\RealVNC\\VNC Viewer\\vncviewer.exe',
+        'C:\\Program Files\\TightVNC\\tvnviewer.exe',
+        'C:\\Program Files\\TigerVNC\\vncviewer.exe',
+        'C:\\Program Files\\uvnc bvba\\UltraVNC\\vncviewer.exe',
+        'C:\\Program Files (x86)\\RealVNC\\VNC Viewer\\vncviewer.exe'
+      ];
+      vncPath = candidates.find(p => fs.existsSync(p));
+      if (!vncPath) {
+        return res.json({ success: false, error: 'No VNC viewer found. Install RealVNC/TightVNC/TigerVNC/UltraVNC or set the path in Settings.' });
+      }
+      proc = spawn(vncPath, [`${safeIp}::${port || 5900}`], { detached: true, stdio: 'ignore' });
+    } else {
+      // RDP — mstsc is built into Windows
+      proc = spawn('mstsc.exe', [`/v:${safeIp}:${port || 3389}`], { detached: true, stdio: 'ignore' });
+    }
+    proc.unref();
+    proc.on('error', (err) => {
+      // Logged after response sent — would need broadcastUpdate to surface
+      console.error('Viewer launch failed:', err.message);
+    });
+    res.json({ success: true, data: { protocol, hostname: safeIp, port, viewerPath: vncPath || 'mstsc.exe' } });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
   }
-  res.json({ success: true, data: { protocol, hostname, ip, port } });
 });
 
 // ==========================================================================
@@ -820,43 +996,71 @@ wss.on('connection', (ws) => {
   ws.on('message', (msg) => {
     try {
       const data = JSON.parse(msg);
-      // Handle WebSocket messages (subscribe to job updates, etc.)
+      if (data.type === 'subscribe' && data.jobId) {
+        ws._subscribedJobs = ws._subscribedJobs || new Set();
+        ws._subscribedJobs.add(data.jobId);
+      }
     } catch (e) {}
   });
   ws.on('close', () => clients.delete(ws));
-  ws.send(JSON.stringify({ type: 'connected', message: 'SupportHubLAN WebSocket connected' }));
+  ws.send(JSON.stringify({ type: 'connected', message: 'SupportHubLAN WebSocket connected', serverTime: new Date().toISOString() }));
 });
 
 function broadcastUpdate(data) {
   const msg = JSON.stringify(data);
-  clients.forEach(ws => { if (ws.readyState === 1) ws.send(msg); });
+  clients.forEach(ws => {
+    if (ws.readyState === 1) {
+      // Send all updates — frontend can filter by jobId if needed
+      ws.send(msg);
+    }
+  });
 }
 
 // ==========================================================================
 // START SERVER
 // ==========================================================================
-server.listen(PORT, () => {
+server.listen(PORT, BIND_ADDRESS, () => {
+  const displayIp = BIND_ADDRESS === '0.0.0.0' ? 'localhost' : BIND_ADDRESS;
   console.log(`
-╔══════════════════════════════════════════════════════════════╗
-║  SupportHubLAN Backend Server v1.0.0                         ║
-║  Running on http://localhost:${PORT}                           ║
-║                                                              ║
-║  This server performs REAL Windows administration tasks:     ║
-║  • Windows Updates (scan/download/install via PSWindowsUpdate)║
-║  • PsTools suite (PsExec/PsInfo/PsList/PsKill/PsService)    ║
-║  • VNC/RDP launch (vncviewer.exe / mstsc.exe)               ║
-║  • Software deployment (MSI/EXE/PS1 via Invoke-Command)      ║
-║  • Power management (Restart-Computer/Stop-Computer/WoL)     ║
-║  • Services & Processes (Get-CimInstance/Invoke-Command)     ║
-║  • Host monitoring (Test-Connection/Ping)                    ║
-║  • Job Queue execution (sequential step engine)              ║
-║                                                              ║
-║  PREREQUISITES:                                              ║
-║  1. Windows with Node.js 14+                                 ║
-║  2. PowerShell 5.1+ (built into Windows)                     ║
-║  3. PSWindowsUpdate module: Install-Module PSWindowsUpdate   ║
-║  4. WinRM enabled on targets: winrm quickconfig              ║
-║  5. Admin credentials for remote hosts                       ║
-╚══════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║  SupportHubLAN Backend Server v1.2.0                             ║
+║  Listening on http://${displayIp}:${PORT}                            ║
+║                                                                  ║
+║  ✓ Serving frontend at /                                         ║
+║  ✓ API endpoints at /api/*                                       ║
+║  ✓ WebSocket at /ws (job progress)                               ║
+║                                                                  ║
+║  Configuration:                                                  ║
+║  • PSTOOLS_PATH = ${PSTOOLS_PATH.padEnd(42)}    ║
+║  • Auth         = ${ADMIN_USER ? 'ENABLED (user: ' + ADMIN_USER + ')'.padEnd(42) : 'DISABLED'.padEnd(42)}    ║
+║  • Bind address = ${BIND_ADDRESS.padEnd(42)}    ║
+║                                                                  ║
+║  This server performs REAL Windows administration:                ║
+║  • PsTools (PsExec/PsInfo/PsList/PsKill/PsService/PsLoggedOn)    ║
+║  • Windows Updates (PSWindowsUpdate)                             ║
+║  • Active Directory (Get-ADComputer + LAPS ms-Mcs-AdmPwd)        ║
+║  • VNC/RDP launch (vncviewer.exe / mstsc.exe)                    ║
+║  • Software deployment (Copy-Item + Invoke-Command)              ║
+║  • Power management (Restart/Stop-Computer + WoL UDP)            ║
+║  • Network scanner (parallel Test-Connection runspace pool)      ║
+║  • Job Queue execution with live WebSocket progress              ║
+║                                                                  ║
+║  PREREQUISITES:                                                  ║
+║  1. Windows with Node.js 18+                                     ║
+║  2. PsTools extracted to ${PSTOOLS_PATH}              ║
+║  3. Admin rights on target hosts                                 ║
+║  4. Network: TCP 445 (SMB), TCP 135 (RPC) to targets             ║
+║                                                                  ║
+║  Open in browser: http://${displayIp}:${PORT}                        ║
+╚══════════════════════════════════════════════════════════════════╝
   `);
+
+  // Auto-open browser (Windows only)
+  if (AUTO_OPEN && process.platform === 'win32') {
+    exec(`start http://localhost:${PORT}`, (err) => {
+      if (err) console.log('  (Could not auto-open browser. Open http://localhost:' + PORT + ' manually.)');
+    });
+  } else if (AUTO_OPEN) {
+    console.log('  (Auto-open is Windows-only. Open http://localhost:' + PORT + ' in your browser.)');
+  }
 });

@@ -32,18 +32,29 @@
 SupportHubLAN is a browser-based console for managing a fleet of Windows PCs on a LAN. You run a small Node.js backend on a Windows admin workstation (the "admin PC"); the backend talks to target PCs over SMB/RPC using Sysinternals **PsTools**. You point your browser at the backend and manage everything from there.
 
 **What it does:**
-- Inventory hosts (manual entry, CSV import, IP/subnet scanner, Active Directory import)
-- Run PsTools commands on remote hosts (PsExec, PsInfo, PsList, PsKill, PsService, PsLoggedOn, PsFile, PsGetSid, PsSuspend, PsShutdown)
-- Launch VNC/RDP viewers from the inventory grid (one click)
-- Scan/install Windows Updates (`PSWindowsUpdate` module)
-- Manage services and processes on remote hosts
-- Retrieve/rotate LAPS passwords (Local Administrator Password Solution)
-- Build job queues (multi-step task sequences) with live WebSocket progress
-- Export/import the host grid as an **AES-256 encrypted `.bps` file** (Web Crypto API)
-- Wake-on-LAN for offline hosts
+- **Multi-inventory management** — create multiple named inventories (each = a tab above the grid); hosts, credentials, audit logs stored in **SQLite with AES-256-GCM encryption** for credential fields
+- **Inventory population** — manual entry, CSV import with column mapping, IP/subnet scanner with parallel ping sweep, Active Directory import via `Get-ADComputer`
+- **PsTools suite** — PsExec (remote shell), PsInfo, PsList, PsKill, PsService, PsLoggedOn, PsFile, PsGetSid, PsSuspend, PsShutdown — all 10 tools wired to real backend endpoints
+- **Per-row inventory actions** — each host row has 3 compact action buttons: VNC/RDP connect (Monitor icon), remote command shell (TerminalSquare icon — runs `psexec \\host cmd`), PC event log viewer (FileText icon)
+- **Remote desktop** — VNC (RealVNC/TightVNC/TigerVNC/UltraVNC auto-detected) or RDP (`mstsc.exe`) — configurable in Settings → Remote Desktop
+- **Windows Updates** — scan, download, install via `PSWindowsUpdate` module; update history; WSUS settings
+- **Software deployment** — MSI/EXE/PS1 installer deployment to selected hosts (`Copy-Item` + `Invoke-Command`); saved package library
+- **Scripts & Commands** — saved PowerShell/CMD script library with quick-run; per-host execution via `Invoke-Command`
+- **Services & Processes** — list/start/stop/restart services; list/kill processes on remote hosts
+- **Power management** — reboot, shutdown, Wake-on-LAN (UDP magic packet)
+- **Job Queue** — multi-step task sequences with 50+ step types, live WebSocket progress streaming
+- **Scheduler** — schedule recurring jobs (daily/weekly/monthly)
+- **Reports & Logs** — patch compliance, deployment history, audit trail
+- **Audit log** — persistent in SQLite, every action logged with timestamp/user/result
+- **LAPS** — retrieve and rotate Local Administrator Password Solution passwords (`ms-Mcs-AdmPwd` attribute)
+- **Encrypted grid files** — export/import host grid as `.bps` files (AES-256-GCM via Web Crypto, password-protected)
+- **VSCode-style terminal panel** — collapsible, resizable bottom panel with 4 tabs (All/Current/Errors/Terminal); type PsTools commands directly; live streams job progress + audit events
+- **Multi-user features** — user accounts, roles (Admin/Operator/Read-Only/Remote Only), MFA, API keys
+- **Notifications** — event-based alerts (job failed, host offline, etc.) with email/SMTP integration
+- **Themes** — Dark/Light/System with working toggle (applyTheme modifies DOM, persists to localStorage, follows OS preference in System mode)
 
 **What it does NOT do (by design):**
-- It does not require PowerShell Remoting (WinRM) enabled on target hosts
+- It does not require PowerShell Remoting (WinRM) enabled on target hosts (uses PsTools/SMB instead)
 - It does not require WMI RPC bindings beyond what PsTools already needs
 - It does not install a persistent agent on target hosts (agentless)
 - It does not work over the raw internet (see [Can I use this over the internet?](#can-i-use-this-over-the-internet))
@@ -337,21 +348,25 @@ See [Configuration reference](#configuration-reference-env) above.
 
 ### Frontend settings (in-app, persisted to localStorage)
 
-Open the app → gear icon (top right) → **Settings**.
+Open the app → gear icon (top right) → **Settings**. Settings has 15 tabs:
 
-| Tab | Setting | Purpose |
-|---|---|---|
-| **PsTools** | PsTools folder path | Override `PSTOOLS_PATH` per-session without restarting the backend (frontend sends it in API calls) |
-| **PsTools** | Default timeout | Per-command timeout in seconds (default 60) |
-| **Remote Desktop** | Protocol (VNC / RDP) | Which viewer to launch from the grid monitor icon |
-| **Remote Desktop** | VNC viewer path | Override the auto-detected VNC viewer path |
-| **Remote Desktop** | Default port | VNC (5900) or RDP (3389) |
-| **Appearance** | Theme | Dark / Light |
-| **Appearance** | Density | Compact / Comfortable |
-| **Audit** | Retention (days) | How long to keep audit log entries (default 365) |
-| **LAPS** | AD Domain | Domain for LAPS queries |
-| **LAPS** | AD Service Account | Account with permission to read `ms-Mcs-AdmPwd` |
-| **Grid Protection** | Default encryption | AES-256 whole-file (default) / per-field / none |
+| Tab | Purpose |
+|---|---|
+| **General** | App display name, timezone, density, session timeout, backend URL, theme & appearance (Dark/Light/System + accent colors), backend connection tester |
+| **Appearance** | Theme mode (Dark/Light/System), table density, sidebar default, font size, keyboard shortcut tip |
+| **PsTools** | PsTools folder path (override per-session), default timeout, suite documentation |
+| **Remote Desktop** | Protocol selector (VNC / RDP), VNC viewer path override, default port (5900/3389), auto-detection of installed viewers (RealVNC/TightVNC/TigerVNC/UltraVNC) |
+| **Active Directory** | Default domain, domain controller, search base (OU), search scope, name attribute, default filter, service account, auto-import on startup, "Test AD Connection" button |
+| **Credentials** | Encrypted credential store (AES-256-GCM via SQLite) — domain creds, service accounts, local admin accounts |
+| **LAPS** | AD domain, service account, password complexity/length/age/expiration, "Rotate Passwords Now" + "Retrieve Passwords" buttons (real backend calls) |
+| **Inventories** | Multi-inventory management — create/rename/delete/activate inventories. Each inventory = one tab in Computer Inventory |
+| **Notifications** | Event-based notifications (job failed, host offline, critical update pending, etc.) with frequency + recipients |
+| **Email** | SMTP server config for email notifications |
+| **Users & Roles** | User management — invite users, assign roles (Admin/Operator/Read-Only/Remote Only), MFA toggle |
+| **Grid Protection** | Default encryption for `.bps` grid files (AES-256 whole-file / per-field / none), encryption key source (auto/password/custom), backup key export |
+| **API Keys** | Generate/revoke API keys for programmatic access to the backend |
+| **Retention** | Audit log retention (days), job log retention, report archive retention, automatic cleanup schedule |
+| **Production Mode** | Connect frontend to a real backend server — configuration, status, switch from demo to production |
 
 ### Per-host settings (in inventory grid)
 
@@ -542,20 +557,54 @@ The HTML has CDN fallbacks that will load from unpkg.com if the local vendor fil
 ## Roadmap
 
 ### Done in v1.2
-- ✅ Real PsTools execution (all 10 tools)
+- ✅ Real PsTools execution (all 10 tools wired to backend endpoints)
 - ✅ Real AD import + LAPS retrieve/rotate
-- ✅ Real network scanner (parallel ping sweep)
+- ✅ Real network scanner (parallel ping sweep via runspace pool)
 - ✅ Real Job Queue with WebSocket live progress
-- ✅ Honest DEMO MODE (no more fake success toasts)
-- ✅ Bundled vendor deps for offline LAN use
-- ✅ Backend serves frontend (single port)
+- ✅ Honest DEMO MODE (no fake success toasts; honest "backend not connected" warnings)
+- ✅ Bundled vendor deps for offline LAN use (`/vendor/`)
+- ✅ Backend serves frontend (single port 8080)
 
-### Planned for v1.3
-- 🔲 HTTPS with auto self-signed cert generation
-- 🔲 Multi-user auth (OIDC via Authelia/Authentik)
+### Done in v1.3
+- ✅ SQLite backend with AES-256-GCM encrypted credentials (`db.js`)
+- ✅ Multi-inventory management (each inventory = a tab above the grid)
+- ✅ VSCode-style bottom terminal panel with live logs + PsTools command input
+- ✅ Settings restructured (General → Appearance → PsTools → Remote Desktop → AD → Credentials → LAPS → Inventories → Notifications → Email → Users → Grid Protection → API Keys → Retention → Production Mode)
+- ✅ Working theme toggle (Dark/Light/System — applyTheme modifies DOM, persists, follows OS)
+- ✅ Backend WebSocket supports `terminal-run` — spawn PsExec/ping/powershell, stream stdout/stderr
+
+### Done in v1.4
+- ✅ Resizable terminal panel (drag handle, default 3 lines / 80px, persists height)
+- ✅ Removed accent color from theme (per user request)
+- ✅ IP Scan button in toolbar opens scanner directly (skips method picker)
+- ✅ DeployPackageModal — install MSI/EXE/PS1 on selected hosts, saved package library
+- ✅ Fixed executePowerAction — was passing wrong shape to backend, now per-host iteration
+- ✅ RunCommandModal — run PowerShell/CMD on selected hosts, saved command library
+- ✅ Updates toolbar Install button wired to real `/api/updates/install`
+
+### Done in v1.4.1
+- ✅ PC Log button per inventory row (FileText icon) → opens PCLogModal
+- ✅ New `/api/hosts/:hostname/eventlog` endpoint (Get-WinEvent, last 7 days, severity filter)
+- ✅ Improved column chooser — pill-button format with On/Off/Locked badges, All/None/Reset quick actions
+
+### Done in v1.4.2
+- ✅ Inline right drawer (flexbox sibling, not position:fixed) — terminal no longer extends underneath
+- ✅ Cmd button per inventory row (TerminalSquare icon) — opens terminal, auto-runs `psexec \\host cmd`
+- ✅ Security architecture documented in README (browser sandbox vs backend execution)
+
+### Done in v1.4.3 (current)
+- ✅ Restored sidebar items that were wrongly removed (Deployments, Scripts, Services, Scheduler, Reports)
+- ✅ Restored Settings tabs (Appearance, Notifications, Email, Users & Roles, API Keys, Production Mode)
+- ✅ Appearance tab now uses working applyTheme (Dark/Light/System buttons)
+- ✅ README audited and rewritten to reflect actual feature set
+
+### Planned for v1.5
+- 🔲 HTTPS with auto self-signed cert generation (for VPN-based remote access)
+- 🔲 Multi-user auth via OIDC (Authelia/Authentik integration)
 - 🔲 Host grouping (folders/tags in sidebar)
 - 🔲 Saved filter views
 - 🔲 Export audit log to CSV/SIEM
+- 🔲 SQLite hosts ↔ React state sync (currently uses localStorage in DEMO mode)
 
 ### Planned for v2.0 (cloud relay mode)
 - 🔲 Optional cloud-hosted UI at `app.supporthublan.io`

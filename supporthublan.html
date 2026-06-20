@@ -1685,13 +1685,18 @@
      ====================================================================== */
 
   const NAV_ITEMS = [
-    { id: 'dashboard',  label: 'Dashboard',          icon: 'LayoutDashboard' },
-    { id: 'inventory',  label: 'Computer Inventory', icon: 'Server' },
-    { id: 'updates',    label: 'Windows Updates',    icon: 'ShieldCheck', badgeKey: 'updates' },
-    { id: 'power',      label: 'Power & Wake-on-LAN', icon: 'Power' },
-    { id: 'queue',      label: 'Job Queue',          icon: 'ListOrdered', badgeKey: 'jobs' },
-    { id: 'audit',      label: 'Audit Log',          icon: 'History' },
-    { id: 'settings',   label: 'Settings',           icon: 'Settings' },
+    { id: 'dashboard',   label: 'Dashboard',           icon: 'LayoutDashboard' },
+    { id: 'inventory',   label: 'Computer Inventory',  icon: 'Server' },
+    { id: 'updates',     label: 'Windows Updates',     icon: 'ShieldCheck', badgeKey: 'updates' },
+    { id: 'deployments', label: 'Software Deployment', icon: 'Package' },
+    { id: 'scripts',     label: 'Scripts & Commands',  icon: 'Terminal' },
+    { id: 'services',    label: 'Services & Processes', icon: 'Activity' },
+    { id: 'power',       label: 'Power & Wake-on-LAN', icon: 'Power' },
+    { id: 'queue',       label: 'Job Queue',           icon: 'ListOrdered', badgeKey: 'jobs' },
+    { id: 'scheduler',   label: 'Scheduler',           icon: 'CalendarClock' },
+    { id: 'reports',     label: 'Reports & Logs',      icon: 'FileText' },
+    { id: 'audit',       label: 'Audit Log',           icon: 'History' },
+    { id: 'settings',    label: 'Settings',            icon: 'Settings' },
   ];
 
   // Global app state context
@@ -7454,14 +7459,20 @@
         <TabGroup
           tabs={[
             { id: 'general', label: 'General', icon: 'Settings' },
+            { id: 'appearance', label: 'Appearance', icon: 'Palette' },
             { id: 'adapters', label: 'PsTools', icon: 'Terminal' },
             { id: 'remote', label: 'Remote Desktop', icon: 'Monitor' },
             { id: 'ad', label: 'Active Directory', icon: 'Network' },
             { id: 'credentials', label: 'Credentials', icon: 'KeyRound' },
             { id: 'laps', label: 'LAPS', icon: 'ShieldCheck' },
             { id: 'inventories', label: 'Inventories', icon: 'Server' },
+            { id: 'notifications', label: 'Notifications', icon: 'Bell' },
+            { id: 'email', label: 'Email', icon: 'Mail' },
+            { id: 'users', label: 'Users & Roles', icon: 'Users' },
             { id: 'grid-protection', label: 'Grid Protection', icon: 'Lock' },
+            { id: 'api', label: 'API Keys', icon: 'Key' },
             { id: 'retention', label: 'Retention', icon: 'Archive' },
+            { id: 'production', label: 'Production Mode', icon: 'Server' },
           ]}
           active={activeTab}
           onChange={setActiveTab}
@@ -7989,15 +8000,22 @@
         )}
 
         {activeTab === 'appearance' && (
-          <SectionCard title="Appearance">
+          <SectionCard title="Appearance" description="Visual customization — theme, density, font">
             <div className="space-y-3">
-              <FormField label="Theme" hint="Press 't' anywhere to toggle quickly">
+              <FormField label="Theme Mode" hint="Press 't' anywhere to toggle quickly · System theme follows OS preference">
                 <div className="flex gap-2">
-                  <button onClick={() => setTheme('dark')} className={`px-3 py-2 text-xs rounded border ${theme === 'dark' ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-surface-raised text-text-dim hover:text-text'}`}>Dark</button>
-                  <button onClick={() => setTheme('light')} className={`px-3 py-2 text-xs rounded border ${theme === 'light' ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-surface-raised text-text-dim hover:text-text'}`}>Light</button>
+                  <button onClick={() => { setTheme('dark'); applyTheme('dark'); toast.success('Theme: Dark'); }} className={`flex items-center gap-2 px-3 py-2 text-xs rounded border-2 ${theme === 'dark' ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-surface-raised text-text-dim hover:text-text'}`}>
+                    <Icon name="Moon" size={12} /> Dark
+                  </button>
+                  <button onClick={() => { setTheme('light'); applyTheme('light'); toast.success('Theme: Light'); }} className={`flex items-center gap-2 px-3 py-2 text-xs rounded border-2 ${theme === 'light' ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-surface-raised text-text-dim hover:text-text'}`}>
+                    <Icon name="Sun" size={12} /> Light
+                  </button>
+                  <button onClick={() => { setTheme('system'); applyTheme(window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); toast.success('Theme: System'); }} className={`flex items-center gap-2 px-3 py-2 text-xs rounded border-2 ${theme === 'system' ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-surface-raised text-text-dim hover:text-text'}`}>
+                    <Icon name="Monitor" size={12} /> System
+                  </button>
                 </div>
+                <div className="text-[11px] text-text-dim mt-1.5">Current effective theme: <span className="font-mono text-text">{document.documentElement.classList.contains('dark') ? 'dark' : 'light'}</span></div>
               </FormField>
-              <FormField label="Accent Color"><div className="flex gap-2">{['#4f83ff','#22c55e','#f59e0b','#ec4899','#a855f7'].map(c => <button key={c} className="w-7 h-7 rounded-full border-2 border-border" style={{ background: c }} />)}</div></FormField>
               <FormField label="Table Density"><Select defaultValue="default"><option value="compact">Compact</option><option value="default">Default</option><option value="comfortable">Comfortable</option></Select></FormField>
               <FormField label="Sidebar Default"><Select><option>Expanded</option><option>Icon-only</option></Select></FormField>
               <FormField label="Font Size"><Select><option>Default</option><option>Large</option></Select></FormField>
@@ -8773,8 +8791,13 @@
         case 'dashboard': return <DashboardScreen />;
         case 'inventory': return <InventoryScreen />;
         case 'updates': return <UpdatesScreen />;
+        case 'deployments': return <DeploymentsScreen />;
+        case 'scripts': return <ScriptsScreen />;
+        case 'services': return <ServicesScreen />;
         case 'power': return <PowerScreen />;
         case 'queue': return <QueueScreen />;
+        case 'scheduler': return <SchedulerScreen />;
+        case 'reports': return <ReportsScreen />;
         case 'audit': return <AuditScreen />;
         case 'settings': return <SettingsScreen />;
         default: return <DashboardScreen />;

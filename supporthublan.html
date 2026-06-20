@@ -296,49 +296,6 @@
     }
     window._supporthublanBackendStatus = 'checking'; // checking | connected | demo
 
-    // ---- AES Encryption Utilities (Web Crypto API) ----
-    // Used for encrypted .bps grid file export/import (like BatchPatch's whole-file encryption)
-    window.SupportHubLANCrypto = (function() {
-      async function deriveKey(password, salt) {
-        const enc = new TextEncoder();
-        const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
-        return crypto.subtle.deriveKey(
-          { name: 'PBKDF2', salt: salt, iterations: 100000, hash: 'SHA-256' },
-          keyMaterial,
-          { name: 'AES-GCM', length: 256 },
-          false,
-          ['encrypt', 'decrypt']
-        );
-      }
-
-      async function encrypt(text, password) {
-        const enc = new TextEncoder();
-        const salt = crypto.getRandomValues(new Uint8Array(16));
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-        const key = await deriveKey(password, salt);
-        const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, enc.encode(text));
-        // Pack: salt(16) + iv(12) + ciphertext
-        const packed = new Uint8Array(salt.length + iv.length + ciphertext.byteLength);
-        packed.set(salt, 0);
-        packed.set(iv, salt.length);
-        packed.set(new Uint8Array(ciphertext), salt.length + iv.length);
-        // Base64 encode for text storage
-        return btoa(String.fromCharCode(...packed));
-      }
-
-      async function decrypt(base64Data, password) {
-        const packed = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
-        const salt = packed.slice(0, 16);
-        const iv = packed.slice(16, 28);
-        const ciphertext = packed.slice(28);
-        const key = await deriveKey(password, salt);
-        const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, ciphertext);
-        return new TextDecoder().decode(decrypted);
-      }
-
-      return { encrypt, decrypt, deriveKey };
-    })();
-
     // ---- IP Range / Subnet Scanner Utilities ----
     window.SupportHubLANScanner = (function() {
       // Parse IP range: "10.10.1.1-10.10.1.50" or "10.10.1.1-50"
@@ -1990,8 +1947,10 @@
   };
 
   // ---- Right Drawer INLINE (flexbox sibling, not fixed) — used in v1.4.2+
-  // Same content as RightDrawer, but rendered inline so the terminal panel
-  // and main workspace shrink to make room. Drawer scrolls independently.
+  // Desktop (lg+): renders as a 380px flexbox sibling of the workspace.
+  //   The workspace (incl. terminal panel) shrinks to make room.
+  // Mobile (<lg): renders as a full-screen overlay ABOVE the workspace,
+  //   but BELOW the terminal panel so the terminal stays visible at the bottom.
   const RightDrawerInline = ({ open, kind, data }) => {
     const { navigate, closeDrawer } = useApp();
     const [tab, setTab] = useState('overview');
@@ -2026,31 +1985,52 @@
     ];
 
     return (
-      <aside className="hidden lg:flex w-[380px] bg-surface border-l border-border flex-col flex-shrink-0 animate-slideIn">
-        {/* Header */}
-        <div className="flex items-center justify-between p-3 border-b border-border">
-          <div className="min-w-0">
-            <div className="text-meta text-text-dim uppercase">{kind === 'host' ? 'Host Detail' : 'Job Detail'}</div>
-            <div className="text-sm font-semibold text-text font-mono truncate">{host ? host.hostname : job.name}</div>
+      <>
+        {/* Mobile (<lg): full-screen overlay that sits ABOVE workspace but BELOW terminal.
+            The terminal panel is rendered later in the DOM with a higher z-index, so it stays visible. */}
+        <div className="lg:hidden fixed top-14 bottom-0 left-0 right-0 z-30 bg-surface flex flex-col animate-slideIn">
+          <div className="flex items-center justify-between p-3 border-b border-border">
+            <div className="min-w-0">
+              <div className="text-meta text-text-dim uppercase">{kind === 'host' ? 'Host Detail' : 'Job Detail'}</div>
+              <div className="text-sm font-semibold text-text font-mono truncate">{host ? host.hostname : job.name}</div>
+            </div>
+            <IconButton icon="X" onClick={closeDrawer} title="Close (Esc)" />
           </div>
-          <IconButton icon="X" onClick={closeDrawer} title="Close (Esc)" />
+          <div className="flex items-center gap-1 px-2 border-b border-border overflow-x-auto">
+            {tabs.map(t => (
+              <button key={t.id} onClick={() => setTab(t.id)} className={`flex items-center gap-1.5 px-2.5 py-2 text-[11px] font-medium whitespace-nowrap border-b-2 -mb-px ${tab === t.id ? 'border-primary text-primary' : 'border-transparent text-text-dim hover:text-text'}`}>
+                <Icon name={t.icon} size={12} />{t.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex-1 overflow-y-auto p-3">
+            {host && <HostDrawerTab tab={tab} host={host} />}
+            {job && <JobDrawerTab tab={tab} job={job} />}
+          </div>
         </div>
 
-        {/* Tabs */}
-        <div className="flex items-center gap-1 px-2 border-b border-border overflow-x-auto">
-          {tabs.map(t => (
-            <button key={t.id} onClick={() => setTab(t.id)} className={`flex items-center gap-1.5 px-2.5 py-2 text-[11px] font-medium whitespace-nowrap border-b-2 -mb-px ${tab === t.id ? 'border-primary text-primary' : 'border-transparent text-text-dim hover:text-text'}`}>
-              <Icon name={t.icon} size={12} />{t.label}
-            </button>
-          ))}
-        </div>
-
-        {/* Content — scrolls independently */}
-        <div className="flex-1 overflow-y-auto p-3">
-          {host && <HostDrawerTab tab={tab} host={host} />}
-          {job && <JobDrawerTab tab={tab} job={job} />}
-        </div>
-      </aside>
+        {/* Desktop (lg+): inline flexbox sibling — workspace shrinks to make room */}
+        <aside className="hidden lg:flex w-[380px] bg-surface border-l border-border flex-col flex-shrink-0 animate-slideIn">
+          <div className="flex items-center justify-between p-3 border-b border-border">
+            <div className="min-w-0">
+              <div className="text-meta text-text-dim uppercase">{kind === 'host' ? 'Host Detail' : 'Job Detail'}</div>
+              <div className="text-sm font-semibold text-text font-mono truncate">{host ? host.hostname : job.name}</div>
+            </div>
+            <IconButton icon="X" onClick={closeDrawer} title="Close (Esc)" />
+          </div>
+          <div className="flex items-center gap-1 px-2 border-b border-border overflow-x-auto">
+            {tabs.map(t => (
+              <button key={t.id} onClick={() => setTab(t.id)} className={`flex items-center gap-1.5 px-2.5 py-2 text-[11px] font-medium whitespace-nowrap border-b-2 -mb-px ${tab === t.id ? 'border-primary text-primary' : 'border-transparent text-text-dim hover:text-text'}`}>
+                <Icon name={t.icon} size={12} />{t.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex-1 overflow-y-auto p-3">
+            {host && <HostDrawerTab tab={tab} host={host} />}
+            {job && <JobDrawerTab tab={tab} job={job} />}
+          </div>
+        </aside>
+      </>
     );
   };
 
@@ -2850,7 +2830,6 @@
     const [showColumnChooser, setShowColumnChooser] = useState(false);
     const [hiddenCols, setHiddenCols] = useState(new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials']));
     const [confirmReboot, setConfirmReboot] = useState(false);
-    const [showGridFileModal, setShowGridFileModal] = useState(null);
     const [contextMenu, setContextMenu] = useState(null);
     const [remoteDesktopProtocol, setRemoteDesktopProtocol] = useState(() => { try { return localStorage.getItem('supporthublan:rdp-protocol') || 'VNC'; } catch(e) { return 'VNC'; } });
 
@@ -3168,7 +3147,7 @@
               <div className="p-4 border border-border rounded-lg bg-surface-raised">
                 <Icon name="Download" size={24} className="text-success mb-2" />
                 <h4 className="text-sm font-semibold text-text mb-1">Export Inventory</h4>
-                <p className="text-xs text-text-dim mb-3">Download the full host inventory as CSV, encrypted .bps, or JSON.</p>
+                <p className="text-xs text-text-dim mb-3">Download the full host inventory as CSV or JSON.</p>
                 <div className="flex gap-2 flex-wrap">
                   <ActionButton variant="secondary" size="sm" icon="FileText" onClick={() => {
                     const csv = ['hostname,ipAddress,osName,patchState,onlineStatus,site,owner'].concat(hosts.map(h => [h.hostname, h.ipAddress, h.osName, h.patchState, h.onlineStatus, h.site, h.owner].join(','))).join('\n');
@@ -3185,14 +3164,10 @@
                     const blob = new Blob([json], { type: 'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'inventory.json'; a.click(); URL.revokeObjectURL(url);
                     toast.success(`Exported ${hosts.length} hosts to JSON`);
                   }}>JSON</ActionButton>
-                  <ActionButton variant="primary" size="sm" icon="Lock" onClick={() => setShowGridFileModal({ mode: 'export' })}>Encrypted .bps</ActionButton>
                 </div>
               </div>
               <div className="p-4 border border-border rounded-lg bg-surface-raised">
                 <Icon name="Upload" size={24} className="text-warning mb-2" />
-                <h4 className="text-sm font-semibold text-text mb-1">Import Encrypted Grid (.bps)</h4>
-                <p className="text-xs text-text-dim mb-3">Load a previously saved encrypted grid file. Password required for encrypted files.</p>
-                <ActionButton variant="primary" size="sm" icon="Lock" onClick={() => setShowGridFileModal({ mode: 'import' })}>Import Grid File</ActionButton>
               </div>
             </div>
           </SectionCard>
@@ -3223,6 +3198,8 @@
             />
 
             {showColumnChooser && (
+              <>
+              <div className="fixed inset-0 z-20" onClick={() => setShowColumnChooser(false)} />
               <div className="absolute right-4 z-30 w-72 p-3 bg-surface border border-border rounded-lg shadow-raised">
                 <div className="flex items-center justify-between mb-2 pb-2 border-b border-border">
                   <div className="text-meta text-text-dim uppercase">Toggle Columns</div>
@@ -3274,6 +3251,7 @@
                   <button onClick={() => setShowColumnChooser(false)} className="text-text-dim hover:text-text">Done</button>
                 </div>
               </div>
+              </>
             )}
 
             <BulkActionBar selectedCount={selectedIds.length} actions={bulkActions} onClear={() => setSelectedIds([])} />
@@ -3282,7 +3260,6 @@
             <ActionToolbar groups={[
               { label: 'Hosts', items: [
                 { icon: 'Plus', label: 'Add', onClick: () => { setAddModalMethod(null); setShowAddModal(true); } },
-                { icon: 'ScanLine', label: 'Scan IP', onClick: () => { setAddModalMethod('scan'); setShowAddModal(true); } },
                 { icon: 'RefreshCw', label: 'Refresh', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; } updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, lastSeen: new Date().toISOString() } : h)); toast.success(`Refreshed ${selectedIds.length} host(s)`); }, disabled: selectedIds.length === 0 },
               ]},
               { label: 'Updates', items: [
@@ -3341,7 +3318,6 @@
               ]},
               { label: 'Data', items: [
                 { icon: 'Download', label: 'Export', onClick: () => { const csv = ['hostname,ipAddress,osName,patchState,onlineStatus,site,owner'].concat(hosts.filter(h => selectedIds.length === 0 || selectedIds.includes(h.id)).map(h => [h.hostname, h.ipAddress, h.osName, h.patchState, h.onlineStatus, h.site, h.owner].join(','))).join('\n'); const blob = new Blob([csv], { type: 'text/csv' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'hosts-export.csv'; a.click(); URL.revokeObjectURL(url); toast.success('Exported to CSV'); } },
-                { icon: 'Lock', label: '.bps', onClick: () => setShowGridFileModal({ mode: 'export' }) },
               ]},
             ]} />
 
@@ -3411,13 +3387,6 @@
         <PCLogModal open={!!logHost} host={logHost} onClose={() => setLogHost(null)} />
 
         {/* Encrypted Grid File Export/Import Modal */}
-        <GridFileModal
-          open={!!showGridFileModal}
-          onClose={() => setShowGridFileModal(null)}
-          mode={showGridFileModal?.mode || 'export'}
-          hosts={hosts}
-          onImport={(importedHosts) => { addHosts(importedHosts); appendAudit({ action: 'hosts.import-grid', actionCategory: 'Inventory', targetType: 'Host', targetIds: importedHosts.map(h => h.id), parameters: { count: importedHosts.length }, result: 'success' }); }}
-        />
 
         {/* Reboot Confirmation Dialog */}
         <ConfirmDialog
@@ -4318,115 +4287,7 @@
   };
 
   // ---- Encrypted Grid Export/Import ----
-  const exportGrid = async (hosts, filename, encrypt, password) => {
-    const data = JSON.stringify(hosts, null, 2);
-    let content, ext, mime;
-    if (encrypt) {
-      if (!password) { return { error: 'Password required for encryption' }; }
-      content = 'SHLENC:' + await window.SupportHubLANCrypto.encrypt(data, password);
-      ext = '.bps'; mime = 'application/octet-stream';
-    } else {
-      content = data; ext = '.json'; mime = 'application/json';
-    }
-    const blob = new Blob([content], { type: mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href = url; a.download = (filename || 'supporthublan-grid-export') + ext; a.click();
-    URL.revokeObjectURL(url);
-    return { success: true, count: hosts.length, encrypted: encrypt };
-  };
-
-  const importGrid = async (text, password) => {
-    if (text.startsWith('SHLENC:')) {
-      if (!password) { return { error: 'This file is encrypted. Enter the password to decrypt.' }; }
-      try {
-        const decrypted = await window.SupportHubLANCrypto.decrypt(text.substring(6), password);
-        return { hosts: JSON.parse(decrypted), encrypted: true };
-      } catch (e) { return { error: 'Decryption failed. Wrong password?' }; }
-    }
-    try { return { hosts: JSON.parse(text), encrypted: false }; }
-    catch (e) { return { error: 'Invalid file format' }; }
-  };
-
-  // ---- Encrypted Export/Import Modal ----
-  const GridFileModal = ({ open, onClose, mode, hosts, onImport }) => {
-    const toast = useToast();
-    const [password, setPassword] = useState('');
-    const [encrypt, setEncrypt] = useState(true);
-    const [filename, setFilename] = useState('supporthublan-grid');
-    const [importText, setImportText] = useState('');
-    const [importError, setImportError] = useState('');
-
-    const handleExport = async () => {
-      const result = await exportGrid(hosts, filename, encrypt, password);
-      if (result.error) { toast.warning(result.error); return; }
-      toast.success(`Exported ${result.count} hosts to ${filename}.${result.encrypted ? 'bps (encrypted)' : 'json'}`);
-      onClose();
-    };
-
-    const handleImport = async () => {
-      setImportError('');
-      const result = await importGrid(importText, password);
-      if (result.error) { setImportError(result.error); toast.warning(result.error); return; }
-      if (result.hosts && result.hosts.length > 0) {
-        onImport(result.hosts);
-        toast.success(`Imported ${result.hosts.length} hosts from ${result.encrypted ? 'encrypted .bps file' : 'JSON file'}`);
-        onClose();
-      } else { setImportError('No hosts found in file'); }
-    };
-
-    const handleFileUpload = (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
-      const reader = new FileReader();
-      reader.onload = (ev) => { setImportText(ev.target.result); toast.info(`Loaded ${file.name} (${(file.size / 1024).toFixed(1)} KB)`); };
-      reader.readAsText(file);
-    };
-
-    return (
-      <Modal open={open} onClose={onClose} title={mode === 'export' ? 'Export Grid (Save to File)' : 'Import Grid (Load from File)'} size="md"
-        footer={<>
-          <ActionButton variant="secondary" onClick={onClose}>Cancel</ActionButton>
-          {mode === 'export'
-            ? <ActionButton variant="primary" icon="Download" onClick={handleExport}>Export</ActionButton>
-            : <ActionButton variant="primary" icon="Upload" onClick={handleImport}>Import</ActionButton>}
-        </>}>
-        <div className="space-y-3">
-          {mode === 'export' ? (
-            <>
-              <div className="p-2 bg-info/10 border border-info/30 rounded text-xs text-info">
-                <Icon name="Info" size={12} className="inline mr-1.5" />
-                Export {hosts.length} hosts to a file. Encrypted files use AES-256 (like BatchPatch .bps files).
-              </div>
-              <FormField label="File Name"><Input value={filename} onChange={e => setFilename(e.target.value)} placeholder="supporthublan-grid" /></FormField>
-              <FormField label="Encryption">
-                <div className="flex gap-2">
-                  <button onClick={() => setEncrypt(true)} className={`px-3 py-1.5 text-xs rounded border ${encrypt ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-surface-raised text-text-dim'}`}>Encrypted (.bps) — AES-256</button>
-                  <button onClick={() => setEncrypt(false)} className={`px-3 py-1.5 text-xs rounded border ${!encrypt ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-surface-raised text-text-dim'}`}>Plain JSON (.json)</button>
-                </div>
-              </FormField>
-              {encrypt && <FormField label="Encryption Password" required hint="Required for encrypted export. Without this password, the file cannot be opened."><Input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Enter a strong password" /></FormField>}
-            </>
-          ) : (
-            <>
-              <FormField label="Upload File">
-                <input type="file" accept=".bps,.json,.csv,.txt" onChange={handleFileUpload} className="text-xs text-text-dim file:mr-2 file:py-1 file:px-3 file:rounded file:border-0 file:bg-primary file:text-white file:text-xs file:cursor-pointer" />
-              </FormField>
-              <FormField label="Or Paste File Contents">
-                <Textarea rows={4} value={importText} onChange={e => setImportText(e.target.value)} placeholder="Paste .bps (encrypted) or JSON content here…" className="font-mono text-[10px]" />
-              </FormField>
-              {importText.startsWith('SHLENC:') && (
-                <FormField label="Decryption Password" required hint="This file is encrypted. Enter the password to decrypt.">
-                  <Input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Enter password" />
-                </FormField>
-              )}
-              {importError && <div className="p-2 bg-danger/10 border border-danger/30 rounded text-xs text-danger"><Icon name="AlertTriangle" size={12} className="inline mr-1.5" />{importError}</div>}
-            </>
-          )}
-        </div>
-      </Modal>
-    );
-  };
-  /* __SCREEN_INVENTORY_END__ */
+    /* __SCREEN_INVENTORY_END__ */
   /* ========================================================================
      SCREEN 03 — WINDOWS UPDATES
      ====================================================================== */
@@ -7469,7 +7330,6 @@
             { id: 'notifications', label: 'Notifications', icon: 'Bell' },
             { id: 'email', label: 'Email', icon: 'Mail' },
             { id: 'users', label: 'Users & Roles', icon: 'Users' },
-            { id: 'grid-protection', label: 'Grid Protection', icon: 'Lock' },
             { id: 'api', label: 'API Keys', icon: 'Key' },
             { id: 'retention', label: 'Retention', icon: 'Archive' },
             { id: 'production', label: 'Production Mode', icon: 'Server' },
@@ -7960,44 +7820,6 @@
           </SectionCard>
         )}
 
-        {activeTab === 'grid-protection' && (
-          <div className="space-y-4">
-            <SectionCard title="Grid File Protection" description="Configure encryption for grid files saved to disk (.bps format)">
-              <div className="space-y-3">
-                <FormField label="Default Protection Method">
-                  <Select defaultValue="whole-file">
-                    <option value="whole-file">Whole-file encryption (AES-256) — encrypts entire grid file</option>
-                    <option value="per-field">Per-field encryption — encrypts only credential fields</option>
-                    <option value="none">No encryption (not recommended)</option>
-                  </Select>
-                </FormField>
-                <FormField label="Encryption Key Source">
-                  <Select defaultValue="auto">
-                    <option value="auto">Auto-generated key (stored in Windows DPAPI)</option>
-                    <option value="password">Password-derived key (prompted on save/open)</option>
-                    <option value="custom">Custom key file</option>
-                  </Select>
-                </FormField>
-                <FormField label="Backup Encryption Key">
-                  <div className="text-xs text-text-dim p-2 bg-surface-raised rounded border border-border">
-                    <Icon name="AlertTriangle" size={12} className="inline mr-1.5 text-warning" />
-                    If you lose your encryption key, grid files cannot be recovered. Click below to export a backup key.
-                  </div>
-                  <ActionButton variant="secondary" size="sm" icon="Download" className="mt-2" onClick={() => {
-                    const key = 'shl_enc_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-                    const blob = new Blob([`supporthublan Encryption Key Backup\nGenerated: ${new Date().toISOString()}\nKey: ${key}\n\nStore this file in a secure location. Without it, encrypted grid files cannot be opened.`], { type: 'text/plain' });
-                    const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'supporthublan-key-backup.txt'; a.click(); URL.revokeObjectURL(url);
-                    appendAudit({ action: 'settings.key-backup', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: {}, result: 'success' });
-                    toast.success('Encryption key backup downloaded. Store it securely.');
-                  }}>Export Key Backup</ActionButton>
-                </FormField>
-                <div className="flex gap-2 pt-2">
-                  <ActionButton variant="primary" icon="Check" onClick={() => { appendAudit({ action: 'settings.protection-save', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: {}, result: 'success' }); toast.success('Grid protection settings saved.'); }}>Save Settings</ActionButton>
-                </div>
-              </div>
-            </SectionCard>
-          </div>
-        )}
 
         {activeTab === 'appearance' && (
           <SectionCard title="Appearance" description="Visual customization — theme, density, font">
@@ -9090,7 +8912,7 @@
     }
 
     return (
-      <div className="flex-shrink-0 bg-[#0c0e16] border-t-2 border-border flex flex-col relative" style={{ height: height + 'px' }}>
+      <div className="flex-shrink-0 bg-[#0c0e16] border-t-2 border-border flex flex-col relative z-40" style={{ height: height + 'px' }}>
         {/* Resize handle — drag up/down to resize the panel */}
         <div
           onMouseDown={startResize}

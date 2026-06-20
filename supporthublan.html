@@ -1220,7 +1220,7 @@
   const PageHeader = ({ breadcrumb = [], title, subtitle, actions }) => {
     const { navigate } = useApp();
     return (
-      <div className="flex items-start justify-between gap-4 mb-4">
+      <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 mb-4">
         <div className="min-w-0">
           {breadcrumb.length > 0 && (
             <nav className="flex items-center gap-1.5 text-meta text-text-dim mb-1">
@@ -1240,7 +1240,7 @@
           </div>
           {subtitle && <p className="text-xs text-text-dim mt-0.5 ml-6">{subtitle}</p>}
         </div>
-        {actions && <div className="flex items-center gap-2 flex-shrink-0">{actions}</div>}
+        {actions && <div className="flex items-center gap-2 flex-wrap flex-shrink-0">{actions}</div>}
       </div>
     );
   };
@@ -1643,7 +1643,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v1.4.10';
+  const APP_VERSION = 'v1.4.11';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -1716,8 +1716,8 @@
           </button>
         </div>
 
-        {/* Center: Global Search */}
-        <div className="flex-1 max-w-xl relative">
+        {/* Center: Global Search — hidden on very small screens to prevent cramping */}
+        <div className="flex-1 max-w-xl relative hidden sm:block">
           <Icon name="Search" size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted" />
           <input
             ref={searchRef}
@@ -1725,7 +1725,7 @@
             onChange={(e) => setSearch(e.target.value)}
             onFocus={() => setSearchFocused(true)}
             onBlur={() => setTimeout(() => setSearchFocused(false), 150)}
-            placeholder="Search hosts, IP, tags, menu…  ( /  or  Ctrl+K )"
+            placeholder="Search…  ( /  or  Ctrl+K )"
             className="w-full pl-9 pr-3 py-1.5 text-xs bg-surface-raised border border-border rounded text-text placeholder:text-muted focus:border-primary focus:outline-none"
           />
           {searchFocused && searchResults && (searchResults.hosts?.length > 0 || searchResults.nav?.length > 0) && (
@@ -1760,7 +1760,7 @@
         </div>
 
         {/* Right: Fleet status, notifications, profile */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1 sm:gap-2">
           <div className="hidden md:flex items-center gap-2 px-2.5 py-1 bg-surface-raised border border-border rounded text-xs">
             <span className="flex items-center gap-1 text-text-dim">
               <Icon name="Server" size={12} className="text-info" />
@@ -1809,13 +1809,13 @@
 
           {/* Profile */}
           <div className="relative">
-            <button onClick={() => setProfileOpen(o => !o)} className="flex items-center gap-2 px-2 py-1 rounded hover:bg-surface-raised">
+            <button onClick={() => setProfileOpen(o => !o)} className="flex items-center gap-1.5 px-1.5 py-1 rounded hover:bg-surface-raised" title={CURRENT_USER.username + ' — ' + CURRENT_USER.role}>
               <div className="w-7 h-7 rounded-full bg-primary/20 border border-primary/40 flex items-center justify-center text-xs font-semibold text-primary">JM</div>
               <div className="hidden lg:block text-left">
                 <div className="text-xs font-medium text-text leading-tight">{CURRENT_USER.username}</div>
                 <div className="text-[10px] text-text-dim leading-tight">{CURRENT_USER.role}</div>
               </div>
-              <Icon name="ChevronDown" size={12} className="text-text-dim" />
+              <Icon name="ChevronDown" size={12} className="hidden sm:block text-text-dim" />
             </button>
             {profileOpen && (
               <>
@@ -2608,7 +2608,7 @@
           title="Operations Dashboard"
           subtitle="Live fleet overview · Last refresh: just now"
           actions={<>
-            <ActionButton variant="secondary" icon="Sparkles" onClick={() => {
+            <ActionButton variant="secondary" icon="Sparkles" className="hidden md:inline-flex" onClick={() => {
               // Trigger a burst of demo activity so the dashboard comes alive
               const onlineHosts = hosts.filter(h => h.onlineStatus === 'online');
               const serverHosts = onlineHosts.filter(h => h.tags.includes('server'));
@@ -2628,7 +2628,7 @@
               setTimeout(() => executePowerAction({ action: 'reboot', targetIds: target1.slice(0, 1) }), 600);
               toast.success('Demo activity seeded — scan, deploy, script, and reboot triggered. Watch the Active Jobs panel and Audit Trail.');
             }}>Seed Demo Activity</ActionButton>
-            <ActionButton variant="primary" icon="RefreshCw" onClick={() => { updateHosts(prev => prev.map(h => ({...h, lastSeen: new Date().toISOString()}))); toast.success('Fleet data refreshed'); }}>Refresh</ActionButton>
+            <ActionButton variant="primary" icon="RefreshCw" onClick={() => { updateHosts(prev => prev.map(h => ({...h, lastSeen: new Date().toISOString()}))); toast.success('Fleet data refreshed'); }}><span className="hidden sm:inline">Refresh</span></ActionButton>
           </>}
         />
 

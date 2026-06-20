@@ -8823,7 +8823,7 @@
               )}
               {/* Main workspace — vertical split: content (top) + terminal panel (bottom) */}
               <div className="flex-1 flex flex-col overflow-hidden min-w-0">
-                <main id="workspace" className="flex-1 overflow-y-auto p-4 bg-bg min-h-0">
+                <main id="workspace" className="flex-1 overflow-y-auto p-4 bg-bg" style={{ minHeight: '120px' }}>
                   {renderScreen()}
                 </main>
                 <TerminalPanel />
@@ -8846,8 +8846,18 @@
   const TerminalPanel = () => {
     const { activeJobs, auditEvents } = useApp();
     const [collapsed, setCollapsed] = useState(() => { try { return localStorage.getItem('supporthublan:terminal-collapsed') === '1'; } catch { return false; } });
-    // Default 3 lines tall (~80px) — user can drag to resize
-    const [height, setHeight] = useState(() => { try { return parseInt(localStorage.getItem('supporthublan:terminal-height') || '80', 10); } catch { return 80; } });
+    // Default 3 lines tall (~80px) — user can drag to resize.
+    // IMPORTANT: Clamp stored value to a safe max on load to prevent the panel
+    // from covering the whole screen if a stale value is in localStorage.
+    const [height, setHeight] = useState(() => {
+      try {
+        const stored = parseInt(localStorage.getItem('supporthublan:terminal-height') || '80', 10);
+        if (isNaN(stored) || stored < 60) return 80; // default if invalid
+        // Cap at 40% of viewport height to prevent the panel from covering the screen
+        const maxH = Math.floor(window.innerHeight * 0.4);
+        return Math.min(stored, maxH);
+      } catch { return 80; }
+    });
     const [resizing, setResizing] = useState(false);
     const [activeTab, setActiveTab] = useState('all'); // all | current | errors | terminal
     const [lines, setLines] = useState([]);
@@ -8903,8 +8913,8 @@
       const onMove = (ev) => {
         const y = ev.touches ? ev.touches[0].clientY : ev.clientY;
         const delta = startY - y;
-        // Min 60px (1 line), max 60% of viewport
-        const newH = Math.max(60, Math.min(window.innerHeight * 0.6, startH + delta));
+        // Min 60px (1 line), max 40% of viewport — prevents covering the workspace
+        const newH = Math.max(60, Math.min(window.innerHeight * 0.4, startH + delta));
         setHeight(Math.round(newH));
       };
       const onUp = () => {

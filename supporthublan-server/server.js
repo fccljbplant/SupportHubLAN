@@ -243,7 +243,11 @@ app.put('/api/inventories/:id', (req, res) => {
   const id = parseInt(req.params.id, 10);
   const { name, description, color } = req.body;
   const r = db.inventories.rename(id, name, description || '');
-  if (color) db.db.prepare('UPDATE inventories SET color = ? WHERE id = ?').run(color, id);
+  if (color && db.db) db.db.prepare('UPDATE inventories SET color = ? WHERE id = ?').run(color, id);
+  else if (color && db.USE_JSON_FALLBACK) {
+    const inv = db.inventories.get(id);
+    if (inv) { inv.color = color; }
+  }
   res.json(r);
 });
 

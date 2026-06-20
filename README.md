@@ -112,6 +112,43 @@ See [Deployment](#deployment--full-setup-on-a-windows-admin-pc) below. ~15 minut
 | `Math.random()` demo fallbacks were removed | Honest "DEMO MODE" empty states instead of fake "online" hosts |
 | Audit log writes moved into `.then()` callbacks | The audit log is now trustworthy as a compliance record |
 
+### How can a browser HTML file execute server-side commands?
+
+A browser is sandboxed — JavaScript in an HTML page **cannot** directly spawn processes or run PowerShell. SupportHubLAN uses the standard web app security model:
+
+```
+1. User clicks a button in the HTML (e.g. "PsInfo on PC-01")
+       ↓
+2. JavaScript in the browser calls:
+       fetch('http://admin-pc:8080/api/pstools/psinfo', {
+         method: 'POST',
+         body: JSON.stringify({ hostname: 'PC-01' })
+       })
+       ↓
+3. The Node.js backend (server.js) receives the HTTP POST.
+   The browser DID NOT execute anything — it just sent an HTTP request.
+       ↓
+4. The backend (running on the admin PC, NOT in the browser) calls:
+       spawn('powershell.exe', ['-Command', 'psinfo.exe \\PC-01 -accepteula'])
+   This runs ON THE BACKEND MACHINE — using Node's child_process module.
+       ↓
+5. PsExec.exe on the backend talks to PC-01 over SMB (port 445)
+   and RPC (port 135) — the same way an admin would run it manually.
+       ↓
+6. Output flows back:
+   PC-01 → PsExec → PowerShell → Node.js → HTTP response → browser displays it
+```
+
+**The security boundary is at the backend, not the browser.** Anyone who can reach `http://your-admin-pc:8080` can trigger PsExec on any host the admin PC can reach. To secure this:
+
+1. **Bind to localhost only** — set `BIND_ADDRESS=127.0.0.1` in `.env` (default is `0.0.0.0` for LAN convenience)
+2. **Enable Basic Auth** — set `ADMIN_USER` and `ADMIN_PASS` in `.env`
+3. **Never expose port 8080 to the internet** — use a VPN (Tailscale/WireGuard) for remote access
+4. **Run the backend as a low-privilege service account** that is local admin only on target hosts (not Domain Admin)
+5. **Audit log** — every API call is logged to SQLite with timestamp, action, parameters, and result
+
+This is the same architecture used by every web-based RMM tool (Action1, NinjaRMM, ManageEngine, BatchPatch's web UI). The browser is just a UI; the security boundary is the backend's HTTP listener.
+
 ---
 
 ## Deployment — Full setup on a Windows admin PC

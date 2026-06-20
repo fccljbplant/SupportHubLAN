@@ -1984,6 +1984,71 @@
     );
   };
 
+  // ---- Right Drawer INLINE (flexbox sibling, not fixed) — used in v1.4.2+
+  // Same content as RightDrawer, but rendered inline so the terminal panel
+  // and main workspace shrink to make room. Drawer scrolls independently.
+  const RightDrawerInline = ({ open, kind, data }) => {
+    const { navigate, closeDrawer } = useApp();
+    const [tab, setTab] = useState('overview');
+    useEffect(() => { setTab('overview'); }, [data?.id]);
+    useEffect(() => {
+      const h = (e) => { if (e.key === 'Escape' && open) closeDrawer(); };
+      window.addEventListener('keydown', h);
+      return () => window.removeEventListener('keydown', h);
+    }, [open, closeDrawer]);
+    if (!open || !data) return null;
+    const host = kind === 'host' ? data : null;
+    const job = kind === 'job' ? data : null;
+
+    let tabs = [];
+    if (host) tabs = [
+      { id: 'overview', label: 'Overview', icon: 'Info' },
+      { id: 'updates', label: 'Updates', icon: 'ShieldCheck' },
+      { id: 'deployments', label: 'Deployments', icon: 'Package' },
+      { id: 'jobs', label: 'Jobs', icon: 'ListOrdered' },
+      { id: 'services', label: 'Services', icon: 'Activity' },
+      { id: 'processes', label: 'Processes', icon: 'Cpu' },
+      { id: 'logs', label: 'Event Logs', icon: 'FileText' },
+      { id: 'network', label: 'Network', icon: 'Network' },
+      { id: 'apps', label: 'Installed Apps', icon: 'Boxes' },
+      { id: 'audit', label: 'Audit Trail', icon: 'History' },
+    ];
+    if (job) tabs = [
+      { id: 'overview', label: 'Overview', icon: 'Info' },
+      { id: 'steps', label: 'Steps', icon: 'ListOrdered' },
+      { id: 'hosts', label: 'Hosts', icon: 'Server' },
+      { id: 'log', label: 'Live Log', icon: 'Terminal' },
+    ];
+
+    return (
+      <aside className="hidden lg:flex w-[380px] bg-surface border-l border-border flex-col flex-shrink-0 animate-slideIn">
+        {/* Header */}
+        <div className="flex items-center justify-between p-3 border-b border-border">
+          <div className="min-w-0">
+            <div className="text-meta text-text-dim uppercase">{kind === 'host' ? 'Host Detail' : 'Job Detail'}</div>
+            <div className="text-sm font-semibold text-text font-mono truncate">{host ? host.hostname : job.name}</div>
+          </div>
+          <IconButton icon="X" onClick={closeDrawer} title="Close (Esc)" />
+        </div>
+
+        {/* Tabs */}
+        <div className="flex items-center gap-1 px-2 border-b border-border overflow-x-auto">
+          {tabs.map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} className={`flex items-center gap-1.5 px-2.5 py-2 text-[11px] font-medium whitespace-nowrap border-b-2 -mb-px ${tab === t.id ? 'border-primary text-primary' : 'border-transparent text-text-dim hover:text-text'}`}>
+              <Icon name={t.icon} size={12} />{t.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Content — scrolls independently */}
+        <div className="flex-1 overflow-y-auto p-3">
+          {host && <HostDrawerTab tab={tab} host={host} />}
+          {job && <JobDrawerTab tab={tab} job={job} />}
+        </div>
+      </aside>
+    );
+  };
+
   // Host drawer tab content
   const HostDrawerTab = ({ tab, host }) => {
     const { activeJobs, hosts, updateHosts, addJob, appendAudit, executePowerAction } = useApp();
@@ -2765,6 +2830,18 @@
     const [showDeployModal, setShowDeployModal] = useState(false);
     const [showCommandModal, setShowCommandModal] = useState(false);
     const [logHost, setLogHost] = useState(null); // host object for PC Log modal
+
+    // Open the bottom terminal panel and run a PsExec command on the given host.
+    // Dispatches a global event the TerminalPanel listens for.
+    const openTerminalForHost = (host) => {
+      // 1. Make sure terminal is expanded
+      try { localStorage.setItem('supporthublan:terminal-collapsed', '0'); } catch {}
+      // 2. Tell the terminal panel to expand + switch to Terminal tab + run command
+      window.dispatchEvent(new CustomEvent('supporthublan:terminal-open', {
+        detail: { command: `psexec \\\\${host.hostname} cmd`, host: host.hostname }
+      }));
+      toast.info(`Opening remote shell on ${host.hostname}…`);
+    };
     const [showColumnChooser, setShowColumnChooser] = useState(false);
     const [hiddenCols, setHiddenCols] = useState(new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials']));
     const [confirmReboot, setConfirmReboot] = useState(false);
@@ -2948,6 +3025,13 @@
             className="inline-flex items-center justify-center w-7 h-7 rounded border border-border bg-surface-raised hover:border-primary hover:bg-primary/10 hover:text-primary text-text-dim transition-colors"
           >
             <Icon name={remoteDesktopProtocol === 'VNC' ? 'Monitor' : 'MonitorSmartphone'} size={14} />
+          </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); openTerminalForHost(h); }}
+            title={`Open remote command shell on ${h.hostname} (PsExec)`}
+            className="inline-flex items-center justify-center w-7 h-7 rounded border border-border bg-surface-raised hover:border-primary hover:bg-primary/10 hover:text-primary text-text-dim transition-colors"
+          >
+            <Icon name="TerminalSquare" size={14} />
           </button>
           <button
             onClick={(e) => { e.stopPropagation(); setLogHost(h); }}
@@ -8715,15 +8799,17 @@
                 </div>
               )}
               {/* Main workspace — vertical split: content (top) + terminal panel (bottom) */}
-              <div className="flex-1 flex flex-col overflow-hidden">
-                <main id="workspace" className="flex-1 overflow-y-auto p-4 bg-bg">
+              <div className="flex-1 flex flex-col overflow-hidden min-w-0">
+                <main id="workspace" className="flex-1 overflow-y-auto p-4 bg-bg min-h-0">
                   {renderScreen()}
                 </main>
                 <TerminalPanel />
               </div>
+              {/* Right Drawer — inline (flexbox sibling) so terminal does not extend underneath.
+                  When open, the main workspace shrinks to make room. Drawer scrolls independently. */}
+              <RightDrawerInline open={drawer.open} kind={drawer.kind} data={drawer.data} onClose={closeDrawer} />
             </div>
             <StatusBar />
-            <RightDrawer open={drawer.open} kind={drawer.kind} data={drawer.data} onClose={closeDrawer} />
             <ShortcutsOverlay open={showShortcuts} onClose={() => setShowShortcuts(false)} />
           </div>
         </ToastProvider>
@@ -8754,6 +8840,33 @@
 
     // Persist collapsed state
     useEffect(() => { try { localStorage.setItem('supporthublan:terminal-collapsed', collapsed ? '1' : '0'); } catch {} }, [collapsed]);
+
+    // Listen for "open terminal and run command" events from the inventory row "Cmd" button
+    useEffect(() => {
+      const handler = (e) => {
+        const { command, host } = e.detail || {};
+        // Expand the panel
+        setCollapsed(false);
+        // Switch to the Terminal tab so the input is visible
+        setActiveTab('terminal');
+        // Auto-run the command after a tick (give the panel time to expand)
+        setTimeout(() => {
+          if (command && window._supporthublanWs && window._supporthublanWs.readyState === 1) {
+            setHistory(prev => [...prev.slice(-50), command]);
+            setHistoryIdx(-1);
+            setRunning(true);
+            window._supporthublanWs.send(JSON.stringify({ type: 'terminal-run', command, sessionId }));
+            appendLine(`\x1b[36m$ ${command}\x1b[0m\r\n`, 'command');
+          } else if (command) {
+            appendLine(`\x1b[33mQueued: ${command}\x1b[0m\r\nWebSocket not ready yet — click in the terminal input and press Enter to retry.`, 'stderr');
+          }
+          // Focus the input
+          setTimeout(() => inputRef.current?.focus(), 200);
+        }, 250);
+      };
+      window.addEventListener('supporthublan:terminal-open', handler);
+      return () => window.removeEventListener('supporthublan:terminal-open', handler);
+    }, [sessionId, appendLine]);
 
     // Persist height
     useEffect(() => { try { localStorage.setItem('supporthublan:terminal-height', String(height)); } catch {} }, [height]);

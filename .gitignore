@@ -4,3 +4,9 @@ node_modules/
 .DS_Store
 Thumbs.db
 *.bps
+
+# SQLite database + WAL files (contains encrypted credentials + audit log)
+supporthublan-server/data/
+*.db
+*.db-wal
+*.db-shm

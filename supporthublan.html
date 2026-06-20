@@ -1680,16 +1680,11 @@
 
   const NAV_ITEMS = [
     { id: 'dashboard',  label: 'Dashboard',          icon: 'LayoutDashboard' },
-    { id: 'inventory',  label: 'Inventory',          icon: 'Server' },
+    { id: 'inventory',  label: 'Computer Inventory', icon: 'Server' },
     { id: 'updates',    label: 'Windows Updates',    icon: 'ShieldCheck', badgeKey: 'updates' },
-    { id: 'deployments', label: 'Deployments',       icon: 'Package' },
-    { id: 'scripts',    label: 'Scripts & Commands', icon: 'Terminal' },
-    { id: 'services',   label: 'Services & Processes', icon: 'Activity' },
-    { id: 'remote',     label: 'Remote Access',      icon: 'Monitor' },
-    { id: 'power',      label: 'Power & Wake',       icon: 'Power' },
+    { id: 'power',      label: 'Power & Wake-on-LAN', icon: 'Power' },
     { id: 'queue',      label: 'Job Queue',          icon: 'ListOrdered', badgeKey: 'jobs' },
-    { id: 'scheduler',  label: 'Scheduler',          icon: 'CalendarClock' },
-    { id: 'reports',    label: 'Reports & Logs',     icon: 'FileText' },
+    { id: 'audit',      label: 'Audit Log',          icon: 'History' },
     { id: 'settings',   label: 'Settings',           icon: 'Settings' },
   ];
 
@@ -2696,6 +2691,61 @@
      SCREEN 02 — INVENTORY
      ====================================================================== */
 
+  // ============================================================
+  // INVENTORY TABS BAR — Shows multiple inventories as tabs above the grid
+  // ============================================================
+  const InventoryTabsBar = () => {
+    const toast = useToast();
+    const { navigate } = useApp();
+    const [inventories, setInventories] = useState([]);
+    const [activeId, setActiveId] = useState(() => { try { return parseInt(localStorage.getItem('supporthublan:active-inventory') || '0', 10); } catch { return 0; } });
+
+    const load = async () => {
+      try {
+        const resp = await fetch(`${window.SUPPORTHUBLAN_API_URL}/api/inventories`);
+        const json = await resp.json();
+        if (json.success && json.data.length > 0) {
+          setInventories(json.data);
+          const active = json.data.find(i => i.is_active === 1) || json.data[0];
+          setActiveId(active.id);
+        }
+      } catch (e) {
+        // Backend not connected — show only "Local" tab
+        setInventories([{ id: 0, name: 'Local (demo)', description: 'localStorage only', is_active: 1 }]);
+      }
+    };
+
+    useEffect(() => { load(); }, []);
+
+    const activate = async (id) => {
+      setActiveId(id);
+      try { localStorage.setItem('supporthublan:active-inventory', String(id)); } catch {}
+      if (id > 0) {
+        try {
+          await fetch(`${window.SUPPORTHUBLAN_API_URL}/api/inventories/${id}/activate`, { method: 'POST' });
+        } catch {}
+      }
+      // Reload hosts from the selected inventory
+      window.dispatchEvent(new CustomEvent('supporthublan:inventory-changed', { detail: { id } }));
+    };
+
+    return (
+      <div className="flex items-center gap-1 border-b border-border overflow-x-auto">
+        {inventories.map(inv => (
+          <button key={inv.id} onClick={() => activate(inv.id)}
+            className={`flex items-center gap-2 px-3 py-2 text-xs font-medium border-b-2 -mb-px whitespace-nowrap ${activeId === inv.id ? 'border-primary text-primary' : 'border-transparent text-text-dim hover:text-text'}`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${inv.is_active ? 'bg-success' : 'bg-text-dim'}`} />
+            {inv.name}
+          </button>
+        ))}
+        <button onClick={() => navigate('settings')}
+          className="px-2 py-2 text-text-dim hover:text-primary" title="Manage inventories in Settings">
+          <Icon name="Plus" size={14} />
+        </button>
+      </div>
+    );
+  };
+
   const InventoryScreen = () => {
     const { route, openHost, openDrawer, hosts, addHosts, addJob, appendAudit } = useApp();
     const toast = useToast();
@@ -2932,8 +2982,8 @@
       <div className="space-y-3">
         <PageHeader
           breadcrumb={['supporthublan', 'Inventory']}
-          title="Host Inventory"
-          subtitle={`${hosts.length} hosts across ${SITES.length} sites · ${hosts.filter(h=>h.onlineStatus==='online').length} online`}
+          title="Computer Inventory"
+          subtitle={`${hosts.length} hosts · ${hosts.filter(h=>h.onlineStatus==='online').length} online`}
           actions={
             <>
               <ActionButton variant="secondary" icon="Download" onClick={() => {
@@ -6594,9 +6644,207 @@
      SCREEN 12 — SETTINGS
      ====================================================================== */
 
+  // ============================================================
+  // BACKEND CONNECTION TESTER — Used in Settings → General
+  // ============================================================
+  const BackendConnectionTester = () => {
+    const toast = useToast();
+    const [status, setStatus] = useState('idle'); // idle | checking | ok | fail
+    const [info, setInfo] = useState(null);
+    const [lastChecked, setLastChecked] = useState(null);
+
+    const test = async () => {
+      setStatus('checking');
+      try {
+        const ctrl = new AbortController();
+        setTimeout(() => ctrl.abort(), 5000);
+        const resp = await fetch((window.SUPPORTHUBLAN_API_URL) + '/api/health', { signal: ctrl.signal });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const json = await resp.json();
+        setInfo(json.data);
+        setStatus('ok');
+        setLastChecked(new Date());
+        toast.success(`Backend OK — v${json.data?.version}`);
+      } catch (e) {
+        setStatus('fail');
+        setLastChecked(new Date());
+        toast.error('Backend not reachable', { detail: e.message });
+      }
+    };
+
+    useEffect(() => { test(); }, []);
+
+    return (
+      <div className="space-y-3">
+        <div className="flex items-center gap-3">
+          <div className={`px-2.5 py-1 rounded text-xs font-medium ${
+            status === 'ok' ? 'bg-success/15 text-success' :
+            status === 'fail' ? 'bg-danger/15 text-danger' :
+            status === 'checking' ? 'bg-info/15 text-info' :
+            'bg-surface-raised text-text-dim'
+          }`}>
+            {status === 'checking' && <><Icon name="Loader2" size={11} className="inline animate-spin mr-1" /> Checking…</>}
+            {status === 'ok' && <><Icon name="CheckCircle2" size={11} className="inline mr-1" /> LIVE</>}
+            {status === 'fail' && <><Icon name="AlertCircle" size={11} className="inline mr-1" /> OFFLINE</>}
+            {status === 'idle' && 'Idle'}
+          </div>
+          <ActionButton variant="secondary" size="sm" icon="RefreshCw" onClick={test}>Test Now</ActionButton>
+          {lastChecked && <span className="text-meta text-text-dim">Last checked: {lastChecked.toLocaleTimeString()}</span>}
+        </div>
+
+        {info && (
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+            <div className="p-2 bg-surface-raised rounded border border-border">
+              <div className="text-meta text-text-dim uppercase">Version</div>
+              <div className="font-mono text-text">{info.version}</div>
+            </div>
+            <div className="p-2 bg-surface-raised rounded border border-border">
+              <div className="text-meta text-text-dim uppercase">Hostname</div>
+              <div className="font-mono text-text">{info.hostname}</div>
+            </div>
+            <div className="p-2 bg-surface-raised rounded border border-border">
+              <div className="text-meta text-text-dim uppercase">Platform</div>
+              <div className="font-mono text-text">{info.platform}</div>
+            </div>
+            <div className="p-2 bg-surface-raised rounded border border-border">
+              <div className="text-meta text-text-dim uppercase">PsTools</div>
+              <div className={`font-mono ${info.pstoolsInstalled ? 'text-success' : 'text-danger'}`}>
+                {info.pstoolsInstalled ? 'INSTALLED' : 'NOT FOUND'}
+              </div>
+            </div>
+          </div>
+        )}
+        {info && (
+          <div className="text-xs">
+            <div className="text-meta text-text-dim uppercase mb-1">PsTools Path</div>
+            <code className="font-mono text-text bg-surface-raised px-2 py-1 rounded">{info.pstoolsPath}</code>
+          </div>
+        )}
+        {info && info.endpoints && (
+          <details className="text-xs">
+            <summary className="cursor-pointer text-text-dim hover:text-text">{info.endpoints.length} API endpoints available — click to view</summary>
+            <div className="mt-2 p-2 bg-surface-raised rounded border border-border font-mono text-[10px] text-text-dim max-h-40 overflow-y-auto">
+              {info.endpoints.map((e, i) => <div key={i}>{e}</div>)}
+            </div>
+          </details>
+        )}
+      </div>
+    );
+  };
+
+  // ============================================================
+  // INVENTORIES MANAGER — Used in Settings → Inventories tab
+  // ============================================================
+  const InventoriesManager = () => {
+    const toast = useToast();
+    const { appendAudit } = useApp();
+    const [inventories, setInventories] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [showCreate, setShowCreate] = useState(false);
+    const [newInv, setNewInv] = useState({ name: '', description: '', color: 'blue' });
+
+    const load = async () => {
+      setLoading(true);
+      try {
+        const resp = await fetch(`${window.SUPPORTHUBLAN_API_URL}/api/inventories`);
+        const json = await resp.json();
+        if (json.success) setInventories(json.data);
+      } catch (e) {
+        toast.error('Failed to load inventories — backend not connected');
+      }
+      setLoading(false);
+    };
+
+    useEffect(() => { load(); }, []);
+
+    const create = async () => {
+      if (!newInv.name.trim()) { toast.warning('Name required'); return; }
+      try {
+        const resp = await fetch(`${window.SUPPORTHUBLAN_API_URL}/api/inventories`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(newInv)
+        });
+        const json = await resp.json();
+        if (json.success) {
+          toast.success(`Inventory "${newInv.name}" created`);
+          setShowCreate(false);
+          setNewInv({ name: '', description: '', color: 'blue' });
+          load();
+        } else {
+          toast.error('Failed to create inventory', { detail: json.error });
+        }
+      } catch (e) { toast.error('Failed to create inventory', { detail: e.message }); }
+    };
+
+    const activate = async (id) => {
+      try {
+        await fetch(`${window.SUPPORTHUBLAN_API_URL}/api/inventories/${id}/activate`, { method: 'POST' });
+        toast.success('Inventory activated');
+        load();
+      } catch (e) { toast.error('Failed to activate'); }
+    };
+
+    const remove = async (id, name) => {
+      if (!confirm(`Delete inventory "${name}"? All hosts in it will be permanently removed.`)) return;
+      try {
+        const resp = await fetch(`${window.SUPPORTHUBLAN_API_URL}/api/inventories/${id}`, { method: 'DELETE' });
+        const json = await resp.json();
+        if (json.success) { toast.success('Inventory deleted'); load(); }
+        else toast.error('Failed to delete', { detail: json.error });
+      } catch (e) { toast.error('Failed to delete'); }
+    };
+
+    if (loading) return <div className="p-4 text-center text-text-dim text-xs">Loading…</div>;
+
+    return (
+      <SectionCard title="Inventory Management" description="Create and manage multiple named inventories. Each inventory appears as a tab in Computer Inventory.">
+        <div className="space-y-2">
+          {inventories.length === 0 ? (
+            <div className="p-4 text-center text-text-dim text-xs">No inventories. Create one below.</div>
+          ) : inventories.map(inv => (
+            <div key={inv.id} className={`flex items-center justify-between p-3 rounded border ${inv.is_active ? 'border-primary bg-primary/5' : 'border-border bg-surface-raised'}`}>
+              <div className="flex items-center gap-3">
+                <span className={`w-2 h-2 rounded-full bg-${inv.color === 'blue' ? 'primary' : inv.color === 'green' ? 'success' : inv.color === 'red' ? 'danger' : 'warning'}`} />
+                <div>
+                  <div className="text-sm font-medium text-text">{inv.name} {inv.is_active === 1 && <span className="ml-2 px-1.5 py-0.5 text-[10px] bg-success/15 text-success rounded">ACTIVE</span>}</div>
+                  <div className="text-meta text-text-dim">{inv.description || 'No description'}</div>
+                </div>
+              </div>
+              <div className="flex items-center gap-1">
+                {!inv.is_active && <ActionButton variant="ghost" size="xs" icon="Check" onClick={() => activate(inv.id)}>Activate</ActionButton>}
+                <ActionButton variant="ghost" size="xs" icon="Trash2" onClick={() => remove(inv.id, inv.name)} />
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="mt-3">
+          {!showCreate ? (
+            <ActionButton variant="primary" size="sm" icon="Plus" onClick={() => setShowCreate(true)}>New Inventory</ActionButton>
+          ) : (
+            <div className="p-3 border border-border rounded space-y-2">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                <FormField label="Name"><Input value={newInv.name} onChange={(e) => setNewInv(n => ({ ...n, name: e.target.value }))} placeholder="e.g. Lab PCs" /></FormField>
+                <FormField label="Description"><Input value={newInv.description} onChange={(e) => setNewInv(n => ({ ...n, description: e.target.value }))} placeholder="Optional description" /></FormField>
+                <FormField label="Color">
+                  <Select value={newInv.color} onChange={(e) => setNewInv(n => ({ ...n, color: e.target.value }))}>
+                    <option value="blue">Blue</option><option value="green">Green</option><option value="amber">Amber</option><option value="red">Red</option>
+                  </Select>
+                </FormField>
+              </div>
+              <div className="flex gap-2">
+                <ActionButton variant="primary" size="sm" icon="Check" onClick={create}>Create</ActionButton>
+                <ActionButton variant="ghost" size="sm" onClick={() => setShowCreate(false)}>Cancel</ActionButton>
+              </div>
+            </div>
+          )}
+        </div>
+      </SectionCard>
+    );
+  };
+
   const SettingsScreen = () => {
     const toast = useToast();
-    const { users, addUser, updateUser, removeUser, appendAudit, theme, setTheme, apiKeys, addApiKey, removeApiKey, maintenanceWindows, addMaintenanceWindow, removeMaintenanceWindow, notificationRules, updateNotificationRule } = useApp();
+    const { users, addUser, updateUser, removeUser, appendAudit, theme, setTheme, applyTheme, apiKeys, addApiKey, removeApiKey, maintenanceWindows, addMaintenanceWindow, removeMaintenanceWindow, notificationRules, updateNotificationRule } = useApp();
     const [remoteDesktopProtocol, setRemoteDesktopProtocol] = useState(() => { try { return localStorage.getItem('supporthublan:rdp-protocol') || 'VNC'; } catch(e) { return 'VNC'; } });
     const [activeTab, setActiveTab] = useState('general');
     const [showInvite, setShowInvite] = useState(false);
@@ -6614,34 +6862,154 @@
         <TabGroup
           tabs={[
             { id: 'general', label: 'General', icon: 'Settings' },
-            { id: 'adapters', label: 'Execution Adapters', icon: 'Plug' },
+            { id: 'adapters', label: 'PsTools', icon: 'Terminal' },
+            { id: 'remote', label: 'Remote Desktop', icon: 'Monitor' },
+            { id: 'ad', label: 'Active Directory', icon: 'Network' },
             { id: 'credentials', label: 'Credentials', icon: 'KeyRound' },
-            { id: 'remote', label: 'Remote Access', icon: 'Monitor' },
-            { id: 'notifications', label: 'Notifications', icon: 'Bell' },
-            { id: 'email', label: 'Email', icon: 'Mail' },
-            { id: 'users', label: 'Users & Roles', icon: 'Users' },
-            { id: 'retention', label: 'Retention', icon: 'Archive' },
-            { id: 'appearance', label: 'Appearance', icon: 'Palette' },
             { id: 'laps', label: 'LAPS', icon: 'ShieldCheck' },
+            { id: 'inventories', label: 'Inventories', icon: 'Server' },
             { id: 'grid-protection', label: 'Grid Protection', icon: 'Lock' },
-            { id: 'production', label: 'Production Mode', icon: 'Server' },
-            { id: 'api', label: 'API Keys', icon: 'Key' },
+            { id: 'retention', label: 'Retention', icon: 'Archive' },
           ]}
           active={activeTab}
           onChange={setActiveTab}
         />
 
         {activeTab === 'general' && (
-          <SectionCard title="General Settings">
+          <div className="space-y-4">
+            <SectionCard title="General Settings" description="Core application preferences">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <FormField label="App Display Name"><Input defaultValue="SupportHubLAN" /></FormField>
+                <FormField label="Backend Server URL"><Input defaultValue={window.SUPPORTHUBLAN_API_URL || 'http://localhost:8080'} className="font-mono" onChange={(e) => { window.SUPPORTHUBLAN_API_URL = e.target.value; if (window.SupportHubLANAPI) window.SupportHubLANAPI.apiUrl = e.target.value; }} /></FormField>
+                <FormField label="Default Timezone"><Select defaultValue={Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York'}>
+                  <option value="America/New_York">America/New_York (EST/EDT)</option>
+                  <option value="America/Chicago">America/Chicago (CST/CDT)</option>
+                  <option value="America/Denver">America/Denver (MST/MDT)</option>
+                  <option value="America/Los_Angeles">America/Los_Angeles (PST/PDT)</option>
+                  <option value="America/Anchorage">America/Anchorage (AKST/AKDT)</option>
+                  <option value="America/Halifax">America/Halifax (AST/ADT)</option>
+                  <option value="America/Sao_Paulo">America/Sao_Paulo (BRT)</option>
+                  <option value="America/Mexico_City">America/Mexico_City (CST)</option>
+                  <option value="Europe/London">Europe/London (GMT/BST)</option>
+                  <option value="Europe/Paris">Europe/Paris (CET/CEST)</option>
+                  <option value="Europe/Berlin">Europe/Berlin (CET/CEST)</option>
+                  <option value="Europe/Moscow">Europe/Moscow (MSK)</option>
+                  <option value="Europe/Istanbul">Europe/Istanbul (TRT)</option>
+                  <option value="Africa/Cairo">Africa/Cairo (EET)</option>
+                  <option value="Africa/Johannesburg">Africa/Johannesburg (SAST)</option>
+                  <option value="Asia/Dubai">Asia/Dubai (GST)</option>
+                  <option value="Asia/Karachi">Asia/Karachi (PKT)</option>
+                  <option value="Asia/Kolkata">Asia/Kolkata (IST)</option>
+                  <option value="Asia/Dhaka">Asia/Dhaka (BST)</option>
+                  <option value="Asia/Bangkok">Asia/Bangkok (ICT)</option>
+                  <option value="Asia/Shanghai">Asia/Shanghai (CST)</option>
+                  <option value="Asia/Hong_Kong">Asia/Hong_Kong (HKT)</option>
+                  <option value="Asia/Tokyo">Asia/Tokyo (JST)</option>
+                  <option value="Asia/Seoul">Asia/Seoul (KST)</option>
+                  <option value="Asia/Singapore">Asia/Singapore (SGT)</option>
+                  <option value="Australia/Sydney">Australia/Sydney (AEST/AEDT)</option>
+                  <option value="Australia/Perth">Australia/Perth (AWST)</option>
+                  <option value="Pacific/Auckland">Pacific/Auckland (NZST/NZDT)</option>
+                  <option value="Pacific/Honolulu">Pacific/Honolulu (HST)</option>
+                  <option value="UTC">UTC</option>
+                </Select></FormField>
+                <FormField label="Default Table Density"><Select defaultValue="default"><option value="compact">Compact</option><option value="default">Default</option><option value="comfortable">Comfortable</option></Select></FormField>
+                <FormField label="Session Timeout (minutes)"><Input type="number" defaultValue={30} /></FormField>
+                <FormField label="Auto-open browser on backend startup"><Select defaultValue="Yes"><option>Yes</option><option>No</option></Select></FormField>
+              </div>
+              <div className="mt-3"><ActionButton variant="primary" icon="Check" onClick={() => { appendAudit({ action: 'settings.general-save', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: {}, result: 'success' }); toast.success('General settings saved.'); }}>Save</ActionButton></div>
+            </SectionCard>
+
+            <SectionCard title="Theme & Appearance" description="Visual customization — dark/light theme, accent colors, density">
+              <div className="space-y-4">
+                <FormField label="Theme Mode">
+                  <div className="flex gap-2">
+                    <button onClick={() => { setTheme('dark'); applyTheme('dark'); toast.success('Theme: Dark'); }}
+                      className={`flex items-center gap-2 px-4 py-2 rounded border-2 ${theme === 'dark' ? 'border-primary bg-primary/10 text-primary' : 'border-border text-text-dim hover:text-text'}`}>
+                      <Icon name="Moon" size={14} /> Dark
+                    </button>
+                    <button onClick={() => { setTheme('light'); applyTheme('light'); toast.success('Theme: Light'); }}
+                      className={`flex items-center gap-2 px-4 py-2 rounded border-2 ${theme === 'light' ? 'border-primary bg-primary/10 text-primary' : 'border-border text-text-dim hover:text-text'}`}>
+                      <Icon name="Sun" size={14} /> Light
+                    </button>
+                    <button onClick={() => { setTheme('system'); applyTheme(window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); toast.success('Theme: System'); }}
+                      className={`flex items-center gap-2 px-4 py-2 rounded border-2 ${theme === 'system' ? 'border-primary bg-primary/10 text-primary' : 'border-border text-text-dim hover:text-text'}`}>
+                      <Icon name="Monitor" size={14} /> System
+                    </button>
+                  </div>
+                  <div className="text-[11px] text-text-dim mt-1.5">Current effective theme: <span className="font-mono text-text">{document.documentElement.classList.contains('dark') ? 'dark' : 'light'}</span></div>
+                </FormField>
+
+                <FormField label="Accent Color">
+                  <div className="flex gap-2">
+                    {['#4f83ff', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4'].map(color => (
+                      <button key={color} onClick={() => { document.documentElement.style.setProperty('--c-primary', color); document.documentElement.style.setProperty('--c-primary-hover', color + 'dd'); try { localStorage.setItem('supporthublan:accent-color', color); } catch {} toast.success(`Accent color set`); }}
+                        className="w-8 h-8 rounded-full border-2 border-border hover:scale-110 transition-transform" style={{ backgroundColor: color }} title={color} />
+                    ))}
+                  </div>
+                </FormField>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <FormField label="Sidebar Default"><Select defaultValue="Expanded"><option>Expanded</option><option>Icon-only</option></Select></FormField>
+                  <FormField label="Bottom Terminal Panel"><Select defaultValue={localStorage.getItem('supporthublan:terminal-collapsed') === '1' ? 'Collapsed' : 'Expanded'} onChange={(e) => { try { localStorage.setItem('supporthublan:terminal-collapsed', e.target.value === 'Collapsed' ? '1' : '0'); } catch {} window.location.reload(); }}><option>Expanded</option><option>Collapsed</option></Select></FormField>
+                  <FormField label="Show Status Badges in Grid"><Select defaultValue="Yes"><option>Yes</option><option>No</option></Select></FormField>
+                  <FormField label="Auto-refresh Host Status (seconds)"><Input type="number" defaultValue={60} /></FormField>
+                </div>
+
+                <div className="mt-2 p-3 bg-surface-raised rounded border border-border">
+                  <div className="text-xs font-medium text-text mb-2">Live Preview</div>
+                  <div className="flex items-center gap-2">
+                    <span className="px-2 py-1 text-xs bg-primary text-white rounded">Primary Button</span>
+                    <span className="px-2 py-1 text-xs bg-success/15 text-success rounded">Success</span>
+                    <span className="px-2 py-1 text-xs bg-warning/15 text-warning rounded">Warning</span>
+                    <span className="px-2 py-1 text-xs bg-danger/15 text-danger rounded">Danger</span>
+                    <span className="px-2 py-1 text-xs bg-surface border border-border text-text rounded">Default</span>
+                  </div>
+                </div>
+              </div>
+            </SectionCard>
+
+            <SectionCard title="Backend Connection" description="Test and configure the SupportHubLAN backend connection">
+              <BackendConnectionTester />
+            </SectionCard>
+          </div>
+        )}
+
+        {activeTab === 'ad' && (
+          <SectionCard title="Active Directory Configuration" description="Default settings for AD import and LAPS queries">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <FormField label="App Display Name"><Input defaultValue="supporthublan" /></FormField>
-              <FormField label="Default Timezone"><Select defaultValue="America/New_York (EST/EDT)"><option value="America/New_York (EST/EDT)">America/New_York (EST/EDT) (EST/EDT)</option><option value="America/Chicago">America/Chicago (CST/CDT)</option><option value="America/Denver">America/Denver (MST/MDT)</option><option value="America/Los_Angeles">America/Los_Angeles (PST/PDT)</option><option value="America/Anchorage">America/Anchorage (AKST/AKDT)</option><option value="America/Halifax">America/Halifax (AST/ADT)</option><option value="America/Sao_Paulo">America/Sao_Paulo (BRT)</option><option value="America/Mexico_City">America/Mexico_City (CST)</option><option value="Europe/London">Europe/London (GMT/BST)</option><option value="Europe/Paris">Europe/Paris (CET/CEST)</option><option value="Europe/Berlin">Europe/Berlin (CET/CEST)</option><option value="Europe/Moscow">Europe/Moscow (MSK)</option><option value="Europe/Istanbul">Europe/Istanbul (TRT)</option><option value="Africa/Cairo">Africa/Cairo (EET)</option><option value="Africa/Johannesburg">Africa/Johannesburg (SAST)</option><option value="Asia/Dubai">Asia/Dubai (GST)</option><option value="Asia/Karachi">Asia/Karachi (PKT)</option><option value="Asia/Kolkata">Asia/Kolkata (IST)</option><option value="Asia/Dhaka">Asia/Dhaka (BST)</option><option value="Asia/Bangkok">Asia/Bangkok (ICT)</option><option value="Asia/Shanghai">Asia/Shanghai (CST)</option><option value="Asia/Hong_Kong">Asia/Hong_Kong (HKT)</option><option value="Asia/Tokyo">Asia/Tokyo (JST)</option><option value="Asia/Seoul">Asia/Seoul (KST)</option><option value="Asia/Singapore">Asia/Singapore (SGT)</option><option value="Australia/Sydney">Australia/Sydney (AEST/AEDT)</option><option value="Australia/Perth">Australia/Perth (AWST)</option><option value="Pacific/Auckland">Pacific/Auckland (NZST/NZDT)</option><option value="Pacific/Honolulu">Pacific/Honolulu (HST)</option><option value="UTC">UTC</option></Select></FormField>
-              <FormField label="Default Table Density"><Select defaultValue="default"><option value="compact">Compact</option><option value="default">Default</option><option value="comfortable">Comfortable</option></Select></FormField>
-              <FormField label="Session Timeout (minutes)"><Input type="number" defaultValue={30} /></FormField>
-              <FormField label="Enable task scheduler on startup"><Select defaultValue="No"><option>Yes</option><option>No</option></Select></FormField>
+              <FormField label="Default Domain (FQDN)"><Input defaultValue="corp.local" className="font-mono" /></FormField>
+              <FormField label="Default Domain Controller"><Input defaultValue="dc01.corp.local" className="font-mono" /></FormField>
+              <FormField label="Default Search Base (OU)"><Input defaultValue="OU=Computers,DC=corp,DC=local" className="font-mono" /></FormField>
+              <FormField label="Search Scope"><Select defaultValue="subtree"><option value="subtree">Subtree (entire OU tree)</option><option value="onelevel">One Level (direct children only)</option><option value="base">Base (just the OU itself)</option></Select></FormField>
+              <FormField label="Computer Name Attribute"><Select defaultValue="cn"><option value="cn">cn (NetBIOS name)</option><option value="name">name (Display name)</option><option value="DNSHostName">DNSHostName (FQDN)</option></Select></FormField>
+              <FormField label="Default Filter"><Input defaultValue="objectCategory=computer" className="font-mono" /></FormField>
+              <FormField label="Service Account (for AD queries)"><Input defaultValue="CORP\svc-supporthublan" className="font-mono" /></FormField>
+              <FormField label="Auto-import on startup"><Select defaultValue="No"><option>Yes</option><option>No</option></Select></FormField>
             </div>
-            <div className="mt-3"><ActionButton variant="primary" icon="Check" onClick={() => { appendAudit({ action: 'settings.general-save', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: {}, result: 'success' }); toast.success('General settings saved.'); }}>Save</ActionButton></div>
+            <div className="mt-3 p-3 bg-info/10 border border-info/30 rounded text-xs text-info">
+              <Icon name="Info" size={12} className="inline mr-1.5" />
+              The ActiveDirectory PowerShell module must be installed on the backend (RSAT): <code className="font-mono">Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0</code>
+            </div>
+            <div className="mt-3">
+              <ActionButton variant="primary" icon="Check" onClick={() => { appendAudit({ action: 'settings.ad-save', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: {}, result: 'success' }); toast.success('AD settings saved.'); }}>Save</ActionButton>
+              <ActionButton variant="secondary" icon="Network" className="ml-2" onClick={async () => {
+                toast.info('Testing AD connection…');
+                if (window.SupportHubLANAPI) {
+                  try {
+                    const r = await window.SupportHubLANAPI.apiCall('/api/hosts/discover-ad', { ouPath: 'OU=Computers,DC=corp,DC=local', searchScope: 'subtree' });
+                    if (r.success && !r.demo) toast.success(`AD connection OK — found hosts`);
+                    else if (r.demo) toast.warning('AD test skipped — backend not connected');
+                    else toast.error('AD test failed', { detail: r.error, duration: 8000 });
+                  } catch (e) { toast.error('AD test failed', { detail: e.message }); }
+                }
+              }}>Test AD Connection</ActionButton>
+            </div>
           </SectionCard>
+        )}
+
+        {activeTab === 'inventories' && (
+          <InventoriesManager />
         )}
 
         {activeTab === 'adapters' && (
@@ -7642,6 +8010,46 @@
 
     const toggleTheme = useCallback(() => setTheme(t => t === 'dark' ? 'light' : 'dark'), []);
 
+    // ---- applyTheme: actually applies the theme to <html> class + persists ----
+    // (This was missing — theme toggle was updating state but never changing the DOM)
+    const applyTheme = useCallback((mode) => {
+      const html = document.documentElement;
+      const effective = mode === 'system'
+        ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+        : mode;
+      if (effective === 'dark') {
+        html.classList.add('dark');
+        html.classList.remove('light');
+      } else {
+        html.classList.add('light');
+        html.classList.remove('dark');
+      }
+      try { localStorage.setItem('supporthublan:theme', mode); } catch {}
+    }, []);
+
+    // Apply theme on mount + whenever theme changes
+    useEffect(() => { applyTheme(theme); }, [theme, applyTheme]);
+
+    // Listen to system theme changes when in 'system' mode
+    useEffect(() => {
+      if (theme !== 'system') return;
+      const mq = window.matchMedia('(prefers-color-scheme: dark)');
+      const handler = () => applyTheme('system');
+      mq.addEventListener('change', handler);
+      return () => mq.removeEventListener('change', handler);
+    }, [theme, applyTheme]);
+
+    // Restore saved accent color on mount
+    useEffect(() => {
+      try {
+        const accent = localStorage.getItem('supporthublan:accent-color');
+        if (accent) {
+          document.documentElement.style.setProperty('--c-primary', accent);
+          document.documentElement.style.setProperty('--c-primary-hover', accent + 'dd');
+        }
+      } catch {}
+    }, []);
+
     // ---- Keyboard shortcuts ----
     // ? → show shortcuts overlay, g d/i/u/q/s/r/p/e → navigate, Esc → close drawer/overlay
     useEffect(() => {
@@ -7771,7 +8179,7 @@
       route, navigate, search, setSearch,
       openHost, openJob, openDrawer: setDrawer, closeDrawer,
       lastRefresh, setLastRefresh,
-      theme, toggleTheme, showShortcuts, setShowShortcuts,
+      theme, toggleTheme, applyTheme, setTheme, showShortcuts, setShowShortcuts,
       // stateful data
       hosts, activeJobs, savedQueues, queueDraft, auditEvents,
       users, patchHistory, deploymentHistory, jobLogs,
@@ -7791,14 +8199,9 @@
         case 'dashboard': return <DashboardScreen />;
         case 'inventory': return <InventoryScreen />;
         case 'updates': return <UpdatesScreen />;
-        case 'deployments': return <DeploymentsScreen />;
-        case 'scripts': return <ScriptsScreen />;
-        case 'services': return <ServicesScreen />;
-        case 'remote': return <RemoteScreen />;
         case 'power': return <PowerScreen />;
         case 'queue': return <QueueScreen />;
-        case 'scheduler': return <SchedulerScreen />;
-        case 'reports': return <ReportsScreen />;
+        case 'audit': return <AuditScreen />;
         case 'settings': return <SettingsScreen />;
         default: return <DashboardScreen />;
       }
@@ -7821,10 +8224,13 @@
                   <div className="w-56"><Sidebar collapsed={false} onNavigate={() => setMobileNavOpen(false)} /></div>
                 </div>
               )}
-              {/* Main workspace */}
-              <main id="workspace" className="flex-1 overflow-y-auto p-4 bg-bg">
-                {renderScreen()}
-              </main>
+              {/* Main workspace — vertical split: content (top) + terminal panel (bottom) */}
+              <div className="flex-1 flex flex-col overflow-hidden">
+                <main id="workspace" className="flex-1 overflow-y-auto p-4 bg-bg">
+                  {renderScreen()}
+                </main>
+                <TerminalPanel />
+              </div>
             </div>
             <StatusBar />
             <RightDrawer open={drawer.open} kind={drawer.kind} data={drawer.data} onClose={closeDrawer} />
@@ -7832,6 +8238,372 @@
           </div>
         </ToastProvider>
       </AppCtx.Provider>
+    );
+  };
+
+  // ============================================================
+  // TERMINAL PANEL — VSCode-style bottom panel for live logs + PsTools command input
+  // ============================================================
+  const TerminalPanel = () => {
+    const { activeJobs, auditEvents } = useApp();
+    const [collapsed, setCollapsed] = useState(() => { try { return localStorage.getItem('supporthublan:terminal-collapsed') === '1'; } catch { return false; } });
+    const [activeTab, setActiveTab] = useState('all'); // all | current | errors | terminal
+    const [lines, setLines] = useState([]);
+    const [command, setCommand] = useState('');
+    const [history, setHistory] = useState([]);
+    const [historyIdx, setHistoryIdx] = useState(-1);
+    const [running, setRunning] = useState(false);
+    const [sessionId] = useState(() => 'term-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
+    const [autoScroll, setAutoScroll] = useState(true);
+    const scrollRef = useRef(null);
+    const inputRef = useRef(null);
+    const linesRef = useRef([]);
+
+    // Persist collapsed state
+    useEffect(() => { try { localStorage.setItem('supporthublan:terminal-collapsed', collapsed ? '1' : '0'); } catch {} }, [collapsed]);
+
+    // Keep linesRef in sync
+    useEffect(() => { linesRef.current = lines; }, [lines]);
+
+    // Append a line
+    const appendLine = useCallback((line, stream = 'info') => {
+      const ts = new Date().toLocaleTimeString();
+      setLines(prev => [...prev.slice(-500), { ts, line: String(line), stream }]); // cap at 500 lines
+    }, []);
+
+    // Watch active jobs and append their step changes to the terminal
+    const lastJobStepRef = useRef({});
+    useEffect(() => {
+      activeJobs.forEach(job => {
+        const last = lastJobStepRef.current[job.id];
+        if (last !== job.step) {
+          lastJobStepRef.current[job.id] = job.step;
+          if (job.step) {
+            const color = job.status === 'failed' ? '\x1b[31m' : job.status === 'completed' ? '\x1b[32m' : '\x1b[36m';
+            appendLine(`${color}[${job.name}] ${job.step}${job.status === 'completed' ? ' — done' : job.status === 'failed' ? ' — FAILED' : ''}\x1b[0m`, job.status === 'failed' ? 'stderr' : 'stdout');
+          }
+        }
+      });
+    }, [activeJobs, appendLine]);
+
+    // Watch audit events — show new ones in terminal
+    const lastAuditIdRef = useRef(null);
+    useEffect(() => {
+      if (!auditEvents || auditEvents.length === 0) return;
+      const latest = auditEvents[0];
+      if (lastAuditIdRef.current === null) {
+        lastAuditIdRef.current = latest.id;
+        return;
+      }
+      if (latest.id !== lastAuditIdRef.current) {
+        lastAuditIdRef.current = latest.id;
+        const color = latest.result === 'success' ? '\x1b[32m' : latest.result === 'failed' ? '\x1b[31m' : '\x1b[33m';
+        appendLine(`${color}[audit] ${latest.action} → ${latest.result}${latest.parameters?.hostname ? ' on ' + latest.parameters.hostname : ''}\x1b[0m`, latest.result === 'failed' ? 'stderr' : 'info');
+      }
+    }, [auditEvents, appendLine]);
+
+    // WebSocket message handler for terminal output
+    useEffect(() => {
+      const handler = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'terminal-output' && data.sessionId === sessionId) {
+            appendLine(data.line, data.stream || 'stdout');
+          } else if (data.type === 'terminal-complete' && data.sessionId === sessionId) {
+            setRunning(false);
+          } else if (data.type === 'terminal-error' && data.sessionId === sessionId) {
+            appendLine(`\x1b[31mError: ${data.error}\x1b[0m`, 'stderr');
+            setRunning(false);
+          } else if (data.type === 'queue-step-complete' || data.type === 'queue-progress' || data.type === 'queue-complete') {
+            const color = data.status === 'failed' ? '\x1b[31m' : data.type === 'queue-complete' ? '\x1b[32m' : '\x1b[36m';
+            const label = data.type === 'queue-complete'
+              ? `[queue] Complete — ${data.completed}/${data.total} steps`
+              : `[queue] Step ${data.stepIndex + 1}/${data.totalSteps} on ${data.hostname} — ${data.status || 'running'} (${data.completed}/${data.total})`;
+            appendLine(`${color}${label}\x1b[0m`, data.status === 'failed' ? 'stderr' : 'stdout');
+          } else if (data.type === 'scan-complete') {
+            const s = data.summary;
+            appendLine(`\x1b[32m[scan] Complete — ${s.online}/${s.total} hosts online\x1b[0m`, 'stdout');
+          }
+        } catch {}
+      };
+      // The WebSocket is opened by StatusBar's useEffect and stored at window._supporthublanWs
+      // We add our own listener that checks the raw message via a CustomEvent
+      // Simpler: poll window._supporthublanWs every 200ms
+      const interval = setInterval(() => {
+        if (window._supporthublanWs && !window._supporthublanWs._supporthublanListenerAdded) {
+          window._supporthublanWs.addEventListener('message', handler);
+          window._supporthublanWs._supporthublanListenerAdded = true;
+        }
+      }, 200);
+      return () => {
+        clearInterval(interval);
+        if (window._supporthublanWs) {
+          window._supporthublanWs.removeEventListener('message', handler);
+          window._supporthublanWs._supporthublanListenerAdded = false;
+        }
+      };
+    }, [sessionId, appendLine]);
+
+    // Auto-scroll
+    useEffect(() => {
+      if (autoScroll && scrollRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      }
+    }, [lines, autoScroll]);
+
+    // Run command
+    const runCommand = () => {
+      const cmd = command.trim();
+      if (!cmd) return;
+      if (!window._supporthublanWs || window._supporthublanWs.readyState !== 1) {
+        appendLine('\x1b[31mError: WebSocket not connected. Backend must be running to execute commands.\x1b[0m', 'stderr');
+        return;
+      }
+      setHistory(prev => [...prev.slice(-50), cmd]);
+      setHistoryIdx(-1);
+      setRunning(true);
+      window._supporthublanWs.send(JSON.stringify({ type: 'terminal-run', command: cmd, sessionId }));
+      setCommand('');
+    };
+
+    // Filter lines by active tab
+    const filteredLines = lines.filter(l => {
+      if (activeTab === 'all') return true;
+      if (activeTab === 'errors') return l.stream === 'stderr';
+      if (activeTab === 'current') return true; // would filter by current host — for now, same as all
+      if (activeTab === 'terminal') return true; // only manual commands — would need tagging
+      return true;
+    });
+
+    // Render ANSI color codes (simple parser — converts \x1b[...m to spans)
+    const renderLine = (text) => {
+      // Strip ANSI for now — Terminal panel doesn't need full color support
+      const stripped = text.replace(/\x1b\[[0-9;]*m/g, '');
+      return stripped;
+    };
+
+    const handleKeyDown = (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); runCommand(); }
+      else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (history.length > 0) {
+          const newIdx = historyIdx === -1 ? history.length - 1 : Math.max(0, historyIdx - 1);
+          setHistoryIdx(newIdx);
+          setCommand(history[newIdx]);
+        }
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (historyIdx !== -1) {
+          const newIdx = historyIdx + 1;
+          if (newIdx >= history.length) { setHistoryIdx(-1); setCommand(''); }
+          else { setHistoryIdx(newIdx); setCommand(history[newIdx]); }
+        }
+      } else if (e.key === 'l' && e.ctrlKey) {
+        e.preventDefault();
+        setLines([]);
+      }
+    };
+
+    if (collapsed) {
+      return (
+        <div className="flex-shrink-0 bg-surface border-t border-border h-7 flex items-center px-3 text-meta text-text-dim">
+          <button onClick={() => setCollapsed(false)} className="flex items-center gap-1.5 hover:text-text">
+            <Icon name="ChevronUp" size={12} /> Terminal
+            {running && <span className="ml-2 w-1.5 h-1.5 bg-success rounded-full animate-pulse" />}
+            {lines.length > 0 && <span className="ml-1">({lines.length} lines)</span>}
+          </button>
+        </div>
+      );
+    }
+
+    return (
+      <div className="flex-shrink-0 bg-[#0c0e16] border-t-2 border-border flex flex-col" style={{ height: '280px' }}>
+        {/* Tab bar */}
+        <div className="flex items-center justify-between border-b border-[#1f2230] bg-[#0f1117] px-1">
+          <div className="flex">
+            {[
+              { id: 'all', label: 'All', icon: 'List' },
+              { id: 'current', label: 'Current', icon: 'Crosshair' },
+              { id: 'errors', label: 'Errors', icon: 'AlertCircle' },
+              { id: 'terminal', label: 'Terminal', icon: 'Terminal' },
+            ].map(t => (
+              <button key={t.id} onClick={() => { setActiveTab(t.id); if (t.id === 'terminal') setTimeout(() => inputRef.current?.focus(), 100); }}
+                className={`flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium border-b-2 -mb-px ${activeTab === t.id ? 'border-primary text-primary' : 'border-transparent text-gray-400 hover:text-gray-200'}`}>
+                <Icon name={t.icon} size={11} />{t.label}
+                {t.id === 'errors' && lines.filter(l => l.stream === 'stderr').length > 0 && (
+                  <span className="ml-1 px-1 text-[9px] bg-red-500/20 text-red-400 rounded">{lines.filter(l => l.stream === 'stderr').length}</span>
+                )}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-1">
+            <button onClick={() => setAutoScroll(a => !a)} title="Toggle auto-scroll" className={`p-1 rounded ${autoScroll ? 'text-primary' : 'text-gray-500'} hover:bg-[#1f2230]`}>
+              <Icon name="ArrowDownToLine" size={12} />
+            </button>
+            <button onClick={() => setLines([])} title="Clear (Ctrl+L)" className="p-1 rounded text-gray-400 hover:bg-[#1f2230]">
+              <Icon name="Trash2" size={12} />
+            </button>
+            <button onClick={() => setCollapsed(true)} title="Collapse panel" className="p-1 rounded text-gray-400 hover:bg-[#1f2230]">
+              <Icon name="ChevronDown" size={12} />
+            </button>
+          </div>
+        </div>
+
+        {/* Output area */}
+        <div ref={scrollRef} className="flex-1 overflow-y-auto font-mono text-[12px] leading-[1.4] p-2 text-gray-300" style={{ fontFamily: 'JetBrains Mono, Consolas, "Courier New", monospace' }}>
+          {filteredLines.length === 0 ? (
+            <div className="text-gray-600 italic px-1 py-2">
+              No output yet. Type a PsTools command below (e.g. <code className="text-gray-400">psinfo \\pc-01</code>) or run an action from the inventory.
+            </div>
+          ) : (
+            filteredLines.map((l, i) => (
+              <div key={i} className={`whitespace-pre-wrap break-all ${l.stream === 'stderr' ? 'text-red-400' : l.stream === 'stdout' ? 'text-gray-300' : l.stream === 'command' ? 'text-cyan-400' : 'text-gray-500'}`}>
+                <span className="text-gray-600 mr-2">{l.ts}</span>
+                {renderLine(l.line)}
+              </div>
+            ))
+          )}
+        </div>
+
+        {/* Command input */}
+        <div className="border-t border-[#1f2230] bg-[#0f1117] flex items-center px-2 py-1.5">
+          <span className="text-success font-mono text-[12px] mr-2 flex-shrink-0">ps&gt;</span>
+          <input
+            ref={inputRef}
+            type="text"
+            value={command}
+            onChange={(e) => setCommand(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Type a PsTools command — e.g.  psexec \\pc-01 cmd   |   psinfo \\pc-01   |   ping pc-01   |   powershell Get-Service"
+            className="flex-1 bg-transparent border-0 outline-none font-mono text-[12px] text-gray-200 placeholder-gray-600"
+            style={{ fontFamily: 'JetBrains Mono, Consolas, "Courier New", monospace' }}
+            disabled={running}
+          />
+          {running && (
+            <button onClick={() => window._supporthublanWs?.send(JSON.stringify({ type: 'terminal-kill', sessionId }))}
+              className="ml-2 px-2 py-0.5 text-[10px] bg-red-500/20 text-red-400 rounded hover:bg-red-500/30">
+              Stop
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  // ============================================================
+  // AUDIT SCREEN — Persistent audit log from SQLite
+  // ============================================================
+  const AuditScreen = () => {
+    const { toast } = useApp();
+    const [entries, setEntries] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [search, setSearch] = useState('');
+    const [filter, setFilter] = useState('all');
+    const [page, setPage] = useState(0);
+    const pageSize = 50;
+
+    const loadAudit = async () => {
+      setLoading(true);
+      try {
+        if (window.SupportHubLANAPI) {
+          const url = search
+            ? `${window.SUPPORTHUBLAN_API_URL}/api/audit/search?q=${encodeURIComponent(search)}`
+            : `${window.SUPPORTHUBLAN_API_URL}/api/audit?limit=${pageSize}&offset=${page * pageSize}`;
+          const resp = await fetch(url);
+          const json = await resp.json();
+          if (json.success) setEntries(json.data || []);
+        }
+      } catch (e) {
+        // Fallback to local auditEvents
+      }
+      setLoading(false);
+    };
+
+    useEffect(() => { loadAudit(); }, [page, search]);
+
+    const clearAudit = async () => {
+      if (!confirm('Clear all audit log entries? This cannot be undone.')) return;
+      try {
+        await fetch(`${window.SUPPORTHUBLAN_API_URL}/api/audit/clear`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+        toast.success('Audit log cleared');
+        loadAudit();
+      } catch (e) { toast.error('Failed to clear audit log'); }
+    };
+
+    const filtered = entries.filter(e => {
+      if (filter === 'all') return true;
+      if (filter === 'success') return e.result === 'success';
+      if (filter === 'failed') return e.result === 'failed';
+      if (filter === 'skipped') return e.result === 'skipped';
+      return true;
+    });
+
+    return (
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-xl font-semibold text-text">Audit Log</h1>
+            <p className="text-xs text-text-dim mt-0.5">Persistent log of all admin actions. Stored in SQLite on the backend.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <input type="text" value={search} onChange={(e) => { setSearch(e.target.value); setPage(0); }} placeholder="Search..." className="px-2 py-1 text-xs bg-surface-raised border border-border rounded text-text w-48" />
+            <select value={filter} onChange={(e) => setFilter(e.target.value)} className="px-2 py-1 text-xs bg-surface-raised border border-border rounded text-text">
+              <option value="all">All Results</option>
+              <option value="success">Success Only</option>
+              <option value="failed">Failed Only</option>
+              <option value="skipped">Skipped Only</option>
+            </select>
+            <ActionButton variant="ghost" size="sm" icon="RefreshCw" onClick={loadAudit}>Refresh</ActionButton>
+            <ActionButton variant="danger" size="sm" icon="Trash2" onClick={clearAudit}>Clear All</ActionButton>
+          </div>
+        </div>
+
+        <SectionCard>
+          {loading ? (
+            <div className="p-4 text-center text-text-dim text-xs">Loading…</div>
+          ) : filtered.length === 0 ? (
+            <div className="p-4 text-center text-text-dim text-xs">No audit entries found.</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-border text-text-dim text-meta">
+                    <th className="text-left p-2 font-medium">Timestamp</th>
+                    <th className="text-left p-2 font-medium">Action</th>
+                    <th className="text-left p-2 font-medium">Category</th>
+                    <th className="text-left p-2 font-medium">Targets</th>
+                    <th className="text-left p-2 font-medium">Result</th>
+                    <th className="text-left p-2 font-medium">User</th>
+                    <th className="text-left p-2 font-medium">Output / Error</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map(e => (
+                    <tr key={e.id} className="border-b border-border hover:bg-surface-raised">
+                      <td className="p-2 font-mono text-text-dim whitespace-nowrap">{e.timestamp}</td>
+                      <td className="p-2 text-text font-mono">{e.action}</td>
+                      <td className="p-2 text-text-dim">{e.category || '—'}</td>
+                      <td className="p-2 text-text-dim text-[11px] max-w-xs truncate">{e.target_ids || '—'}</td>
+                      <td className="p-2">
+                        <span className={`px-1.5 py-0.5 text-[10px] rounded font-medium ${e.result === 'success' ? 'bg-success/15 text-success' : e.result === 'failed' ? 'bg-danger/15 text-danger' : e.result === 'skipped' ? 'bg-warning/15 text-warning' : 'bg-surface-raised text-text-dim'}`}>{e.result}</span>
+                      </td>
+                      <td className="p-2 text-text-dim">{e.user || '—'}</td>
+                      <td className="p-2 text-text-dim text-[11px] max-w-md truncate font-mono" title={e.output || ''}>{e.output || '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <div className="flex items-center justify-between p-2 border-t border-border text-meta text-text-dim">
+            <span>Page {page + 1} · {filtered.length} entries shown</span>
+            <div className="flex gap-1">
+              <ActionButton variant="ghost" size="xs" disabled={page === 0} onClick={() => setPage(p => Math.max(0, p - 1))}>Previous</ActionButton>
+              <ActionButton variant="ghost" size="xs" disabled={filtered.length < pageSize} onClick={() => setPage(p => p + 1)}>Next</ActionButton>
+            </div>
+          </div>
+        </SectionCard>
+      </div>
     );
   };
 

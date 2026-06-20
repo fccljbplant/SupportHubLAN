@@ -60,6 +60,9 @@ const { WebSocketServer } = require('ws');
 const http = require('http');
 const crypto = require('crypto');
 
+// ---- SQLite + AES-256 encrypted credential storage ----
+const db = require('./db');
+
 // ---- Load .env (manual parser — no dotenv dependency needed) ----
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
@@ -221,17 +224,178 @@ app.get('/api/health', (req, res) => {
 });
 
 // ==========================================================================
-// CREDENTIALS — Store/retrieve credentials for remote operations
+// INVENTORIES — Multi-inventory management (SQLite-backed)
+// Each inventory = one tab in the UI
 // ==========================================================================
+app.get('/api/inventories', (req, res) => {
+  res.json({ success: true, data: db.inventories.list() });
+});
+
+app.post('/api/inventories', (req, res) => {
+  const { name, description, color } = req.body;
+  if (!name) return res.json({ success: false, error: 'name required' });
+  const r = db.inventories.create(name, description, color);
+  if (r.success) db.audit.add({ action: 'inventory.create', category: 'Inventory', result: 'success', parameters: { name, description } });
+  res.json(r);
+});
+
+app.put('/api/inventories/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const { name, description, color } = req.body;
+  const r = db.inventories.rename(id, name, description || '');
+  if (color) db.db.prepare('UPDATE inventories SET color = ? WHERE id = ?').run(color, id);
+  res.json(r);
+});
+
+app.post('/api/inventories/:id/activate', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  db.inventories.setActive(id);
+  db.audit.add({ action: 'inventory.activate', category: 'Inventory', result: 'success', parameters: { id } });
+  res.json({ success: true });
+});
+
+app.delete('/api/inventories/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  // Prevent deleting the last inventory
+  if (db.inventories.list().length <= 1) {
+    return res.json({ success: false, error: 'Cannot delete the last inventory' });
+  }
+  const r = db.inventories.delete(id);
+  if (r.success) db.audit.add({ action: 'inventory.delete', category: 'Inventory', result: 'success', parameters: { id } });
+  res.json(r);
+});
+
+// ==========================================================================
+// HOSTS — CRUD against SQLite (per inventory)
+// ==========================================================================
+app.get('/api/inventories/:id/hosts', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  res.json({ success: true, data: db.hosts.list(id) });
+});
+
+app.post('/api/inventories/:id/hosts', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const { host } = req.body;
+  if (!host || !host.hostname) return res.json({ success: false, error: 'host.hostname required' });
+  const r = db.hosts.upsert(id, host);
+  if (r.success) db.audit.add({ action: 'hosts.upsert', category: 'Inventory', targetType: 'Host', result: 'success', parameters: { hostname: host.hostname, inventoryId: id } });
+  res.json(r);
+});
+
+app.post('/api/inventories/:id/hosts/bulk', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const { hosts: hostList } = req.body;
+  if (!Array.isArray(hostList)) return res.json({ success: false, error: 'hosts array required' });
+  const r = db.hosts.bulkUpsert(id, hostList);
+  db.audit.add({ action: 'hosts.bulk-import', category: 'Inventory', targetType: 'Host', result: 'success', parameters: { count: hostList.length, inventoryId: id, ...r } });
+  res.json(r);
+});
+
+app.put('/api/hosts/:hostId', (req, res) => {
+  const hostId = parseInt(req.params.hostId, 10);
+  const r = db.hosts.update(hostId, req.body);
+  res.json(r);
+});
+
+app.delete('/api/hosts/:hostId', (req, res) => {
+  const hostId = parseInt(req.params.hostId, 10);
+  db.hosts.delete(hostId);
+  db.audit.add({ action: 'hosts.delete', category: 'Inventory', targetType: 'Host', result: 'success', parameters: { hostId } });
+  res.json({ success: true });
+});
+
+app.delete('/api/inventories/:id/hosts', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  db.hosts.deleteAll(id);
+  db.audit.add({ action: 'hosts.clear-all', category: 'Inventory', result: 'success', parameters: { inventoryId: id } });
+  res.json({ success: true });
+});
+
+// ==========================================================================
+// CREDENTIALS — Encrypted at rest (AES-256-GCM via db.js)
+// ==========================================================================
+app.get('/api/credentials', (req, res) => {
+  const { inventoryId } = req.query;
+  res.json({ success: true, data: db.credentials.list(inventoryId ? parseInt(inventoryId, 10) : null) });
+});
+
 app.post('/api/credentials', (req, res) => {
+  const { inventoryId, name, username, password, domain, type } = req.body;
+  if (!name || !username || !password) return res.json({ success: false, error: 'name, username, password required' });
+  const r = db.credentials.create(inventoryId || null, name, username, password, domain, type);
+  if (r.success) db.audit.add({ action: 'credentials.create', category: 'Security', result: 'success', parameters: { name, username, domain } });
+  res.json(r);
+});
+
+app.get('/api/credentials/:id', (req, res) => {
+  // Returns the decrypted password — only the API can read this, not the browser
+  const id = parseInt(req.params.id, 10);
+  const cred = db.credentials.get(id);
+  if (!cred) return res.json({ success: false, error: 'not found' });
+  res.json({ success: true, data: cred });
+});
+
+app.delete('/api/credentials/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  db.credentials.delete(id);
+  db.audit.add({ action: 'credentials.delete', category: 'Security', result: 'success', parameters: { id } });
+  res.json({ success: true });
+});
+
+// ==========================================================================
+// AUDIT LOG — Persistent in SQLite
+// ==========================================================================
+app.get('/api/audit', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || '200', 10), 1000);
+  const offset = parseInt(req.query.offset || '0', 10);
+  res.json({ success: true, data: db.audit.list(limit, offset) });
+});
+
+app.get('/api/audit/search', (req, res) => {
+  const q = req.query.q || '';
+  res.json({ success: true, data: db.audit.search(q) });
+});
+
+app.post('/api/audit/clear', (req, res) => {
+  const { olderThanDays } = req.body;
+  db.audit.clear(olderThanDays || null);
+  res.json({ success: true });
+});
+
+app.post('/api/audit', (req, res) => {
+  // Allow frontend to write audit entries (e.g. for UI-only actions)
+  db.audit.add(req.body);
+  res.json({ success: true });
+});
+
+// ==========================================================================
+// SETTINGS — Persistent key/value store
+// ==========================================================================
+app.get('/api/settings', (req, res) => {
+  res.json({ success: true, data: db.settings.getAll() });
+});
+
+app.post('/api/settings', (req, res) => {
+  const { key, value } = req.body;
+  if (!key) return res.json({ success: false, error: 'key required' });
+  db.settings.set(key, value);
+  res.json({ success: true });
+});
+
+// ==========================================================================
+// JOBS — Persistent job history
+// ==========================================================================
+app.get('/api/jobs', (req, res) => {
+  res.json({ success: true, data: db.jobs.list(100) });
+});
+
+// ==========================================================================
+// CREDENTIALS (legacy in-memory store — kept for backward compat)
+// ==========================================================================
+app.post('/api/credentials/legacy', (req, res) => {
   const { name, username, password, domain } = req.body;
   credentialStore[name] = { username, password, domain };
   res.json({ success: true, data: { name, username } });
-});
-
-app.get('/api/credentials', (req, res) => {
-  const list = Object.keys(credentialStore).map(k => ({ name: k, username: credentialStore[k].username }));
-  res.json({ success: true, data: list });
 });
 
 // ==========================================================================
@@ -1000,9 +1164,87 @@ wss.on('connection', (ws) => {
         ws._subscribedJobs = ws._subscribedJobs || new Set();
         ws._subscribedJobs.add(data.jobId);
       }
-    } catch (e) {}
+      // ---- Terminal command execution (VSCode-style bottom panel) ----
+      // User types a PsTools command in the bottom terminal; it arrives here.
+      // We spawn the process and stream stdout/stderr back via the same WS.
+      if (data.type === 'terminal-run') {
+        const { command, host, sessionId } = data;
+        if (!command) {
+          ws.send(JSON.stringify({ type: 'terminal-error', sessionId, error: 'No command provided' }));
+          return;
+        }
+        // Parse the command: "psexec \\pc-01 cmd" → run psexec.exe with args
+        // Also support shorthand: "psinfo pc-01" → expand to "psinfo.exe \\pc-01 -accepteula"
+        const trimmed = String(command).trim();
+        let exe, args;
+        const parts = trimmed.split(/\s+/);
+        const cmd = parts[0].toLowerCase();
+        const toolMap = {
+          psexec: 'psexec.exe', psinfo: 'psinfo.exe', pslist: 'pslist.exe',
+          pskill: 'pskill.exe', psservice: 'psservice.exe', psloggedon: 'psloggedon.exe',
+          psshutdown: 'psshutdown.exe', psfile: 'psfile.exe', psgetsid: 'psgetsid.exe',
+          pssuspend: 'pssuspend.exe'
+        };
+        if (toolMap[cmd]) {
+          exe = path.join(PSTOOLS_PATH, toolMap[cmd]);
+          // Add -accepteula if not already in args
+          args = parts.slice(1);
+          if (!args.includes('-accepteula')) args.push('-accepteula');
+        } else if (cmd === 'ping' || cmd === 'ping.exe') {
+          exe = 'ping.exe';
+          args = parts.slice(1);
+        } else if (cmd === 'powershell' || cmd === 'ps') {
+          exe = 'powershell.exe';
+          args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', parts.slice(1).join(' ')];
+        } else {
+          // Generic — try to run as-is
+          exe = parts[0];
+          args = parts.slice(1);
+        }
+
+        ws.send(JSON.stringify({ type: 'terminal-output', sessionId, line: `\x1b[36m$ ${trimmed}\x1b[0m\r\n`, stream: 'command' }));
+        const proc = spawn(exe, args, { windowsHide: false, shell: false });
+        ws._terminalProcs = ws._terminalProcs || new Map();
+        ws._terminalProcs.set(sessionId, proc);
+
+        proc.stdout.on('data', (d) => {
+          ws.send(JSON.stringify({ type: 'terminal-output', sessionId, line: d.toString(), stream: 'stdout' }));
+        });
+        proc.stderr.on('data', (d) => {
+          ws.send(JSON.stringify({ type: 'terminal-output', sessionId, line: d.toString(), stream: 'stderr' }));
+        });
+        proc.on('close', (code) => {
+          ws.send(JSON.stringify({ type: 'terminal-output', sessionId, line: `\r\n\x1b[33m[Process exited with code ${code}]\x1b[0m\r\n`, stream: 'exit' }));
+          ws.send(JSON.stringify({ type: 'terminal-complete', sessionId, exitCode: code }));
+          if (ws._terminalProcs) ws._terminalProcs.delete(sessionId);
+          db.audit.add({ action: 'terminal.run', category: 'Terminal', result: code === 0 ? 'success' : 'failed', parameters: { command: trimmed }, output: `exit=${code}` });
+        });
+        proc.on('error', (err) => {
+          ws.send(JSON.stringify({ type: 'terminal-error', sessionId, error: err.message }));
+          if (ws._terminalProcs) ws._terminalProcs.delete(sessionId);
+        });
+      }
+
+      // Kill a running terminal session
+      if (data.type === 'terminal-kill' && ws._terminalProcs) {
+        const proc = ws._terminalProcs.get(data.sessionId);
+        if (proc) {
+          try { proc.kill('SIGTERM'); } catch {}
+          ws._terminalProcs.delete(data.sessionId);
+        }
+      }
+    } catch (e) {
+      console.error('WS message error:', e.message);
+    }
   });
-  ws.on('close', () => clients.delete(ws));
+  ws.on('close', () => {
+    // Kill any running terminal processes when client disconnects
+    if (ws._terminalProcs) {
+      ws._terminalProcs.forEach(p => { try { p.kill(); } catch {} });
+      ws._terminalProcs.clear();
+    }
+    clients.delete(ws);
+  });
   ws.send(JSON.stringify({ type: 'connected', message: 'SupportHubLAN WebSocket connected', serverTime: new Date().toISOString() }));
 });
 

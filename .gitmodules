@@ -1,6 +1,0 @@
-[submodule "ThirdParty/UltraVNC"]
-	path = ThirdParty/UltraVNC
-	url = https://github.com/ultravnc/ultravnc.git
-[submodule "ThirdParty/TigerVNC"]
-	path = ThirdParty/TigerVNC
-	url = https://github.com/TigerVNC/tigervnc.git

@@ -1947,19 +1947,28 @@
   };
 
   // ---- Right Drawer INLINE (flexbox sibling, not fixed) — used in v1.4.2+
-  // Desktop (lg+): renders as a 380px flexbox sibling of the workspace.
-  //   The workspace (incl. terminal panel) shrinks to make room.
-  // Mobile (<lg): renders as a full-screen overlay ABOVE the workspace,
-  //   but BELOW the terminal panel so the terminal stays visible at the bottom.
+  // Desktop (lg+): 380px flexbox sibling of the workspace column.
+  //   The workspace (incl. terminal panel) shrinks to make room. Both visible side-by-side.
+  // Mobile (<lg): full-screen overlay (fixed position) that stops ABOVE the terminal panel.
+  //   The terminal stays visible at the bottom. The drawer scrolls independently.
   const RightDrawerInline = ({ open, kind, data }) => {
     const { navigate, closeDrawer } = useApp();
     const [tab, setTab] = useState('overview');
+    // Track terminal height so the mobile drawer can stop above it
+    const [termHeight, setTermHeight] = useState(() => { try { return parseInt(localStorage.getItem('supporthublan:terminal-height') || '80', 10); } catch { return 80; } });
     useEffect(() => { setTab('overview'); }, [data?.id]);
     useEffect(() => {
       const h = (e) => { if (e.key === 'Escape' && open) closeDrawer(); };
       window.addEventListener('keydown', h);
       return () => window.removeEventListener('keydown', h);
     }, [open, closeDrawer]);
+    // Listen for terminal height changes
+    useEffect(() => {
+      const h = () => { try { setTermHeight(parseInt(localStorage.getItem('supporthublan:terminal-height') || '80', 10)); } catch {} };
+      window.addEventListener('storage', h);
+      const interval = setInterval(h, 500); // poll for changes from the TerminalPanel
+      return () => { window.removeEventListener('storage', h); clearInterval(interval); };
+    }, []);
     if (!open || !data) return null;
     const host = kind === 'host' ? data : null;
     const job = kind === 'job' ? data : null;
@@ -1984,51 +1993,50 @@
       { id: 'log', label: 'Live Log', icon: 'Terminal' },
     ];
 
+    const headerAndTabs = (
+      <>
+        <div className="flex items-center justify-between p-3 border-b border-border">
+          <div className="min-w-0 flex items-center gap-2">
+            <IconButton icon="ChevronRight" onClick={closeDrawer} title="Close (Esc)" className="lg:hidden" />
+            <div className="min-w-0">
+              <div className="text-meta text-text-dim uppercase">{kind === 'host' ? 'Host Detail' : 'Job Detail'}</div>
+              <div className="text-sm font-semibold text-text font-mono truncate">{host ? host.hostname : job.name}</div>
+            </div>
+          </div>
+          <IconButton icon="X" onClick={closeDrawer} title="Close (Esc)" className="hidden lg:flex" />
+        </div>
+        <div className="flex items-center gap-1 px-2 border-b border-border overflow-x-auto">
+          {tabs.map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} className={`flex items-center gap-1.5 px-2.5 py-2 text-[11px] font-medium whitespace-nowrap border-b-2 -mb-px ${tab === t.id ? 'border-primary text-primary' : 'border-transparent text-text-dim hover:text-text'}`}>
+              <Icon name={t.icon} size={12} />{t.label}
+            </button>
+          ))}
+        </div>
+      </>
+    );
+
+    const body = (
+      <div className="flex-1 overflow-y-auto p-3">
+        {host && <HostDrawerTab tab={tab} host={host} />}
+        {job && <JobDrawerTab tab={tab} job={job} />}
+      </div>
+    );
+
     return (
       <>
-        {/* Mobile (<lg): full-screen overlay that sits ABOVE workspace but BELOW terminal.
-            The terminal panel is rendered later in the DOM with a higher z-index, so it stays visible. */}
-        <div className="lg:hidden fixed top-14 bottom-0 left-0 right-0 z-30 bg-surface flex flex-col animate-slideIn">
-          <div className="flex items-center justify-between p-3 border-b border-border">
-            <div className="min-w-0">
-              <div className="text-meta text-text-dim uppercase">{kind === 'host' ? 'Host Detail' : 'Job Detail'}</div>
-              <div className="text-sm font-semibold text-text font-mono truncate">{host ? host.hostname : job.name}</div>
-            </div>
-            <IconButton icon="X" onClick={closeDrawer} title="Close (Esc)" />
-          </div>
-          <div className="flex items-center gap-1 px-2 border-b border-border overflow-x-auto">
-            {tabs.map(t => (
-              <button key={t.id} onClick={() => setTab(t.id)} className={`flex items-center gap-1.5 px-2.5 py-2 text-[11px] font-medium whitespace-nowrap border-b-2 -mb-px ${tab === t.id ? 'border-primary text-primary' : 'border-transparent text-text-dim hover:text-text'}`}>
-                <Icon name={t.icon} size={12} />{t.label}
-              </button>
-            ))}
-          </div>
-          <div className="flex-1 overflow-y-auto p-3">
-            {host && <HostDrawerTab tab={tab} host={host} />}
-            {job && <JobDrawerTab tab={tab} job={job} />}
-          </div>
-        </div>
+        {/* Mobile (<lg): fixed overlay that stops ABOVE the terminal panel.
+            Terminal height is read from localStorage and used as the bottom offset.
+            This way the terminal stays visible at the bottom while the drawer covers the workspace. */}
+        <aside className="lg:hidden fixed left-0 right-0 bg-surface border-t border-border flex flex-col animate-slideIn"
+               style={{ top: '56px', bottom: termHeight + 'px', zIndex: 30 }}>
+          {headerAndTabs}
+          {body}
+        </aside>
 
-        {/* Desktop (lg+): inline flexbox sibling — workspace shrinks to make room */}
+        {/* Desktop (lg+): 380px flexbox sibling — workspace shrinks to make room */}
         <aside className="hidden lg:flex w-[380px] bg-surface border-l border-border flex-col flex-shrink-0 animate-slideIn">
-          <div className="flex items-center justify-between p-3 border-b border-border">
-            <div className="min-w-0">
-              <div className="text-meta text-text-dim uppercase">{kind === 'host' ? 'Host Detail' : 'Job Detail'}</div>
-              <div className="text-sm font-semibold text-text font-mono truncate">{host ? host.hostname : job.name}</div>
-            </div>
-            <IconButton icon="X" onClick={closeDrawer} title="Close (Esc)" />
-          </div>
-          <div className="flex items-center gap-1 px-2 border-b border-border overflow-x-auto">
-            {tabs.map(t => (
-              <button key={t.id} onClick={() => setTab(t.id)} className={`flex items-center gap-1.5 px-2.5 py-2 text-[11px] font-medium whitespace-nowrap border-b-2 -mb-px ${tab === t.id ? 'border-primary text-primary' : 'border-transparent text-text-dim hover:text-text'}`}>
-                <Icon name={t.icon} size={12} />{t.label}
-              </button>
-            ))}
-          </div>
-          <div className="flex-1 overflow-y-auto p-3">
-            {host && <HostDrawerTab tab={tab} host={host} />}
-            {job && <JobDrawerTab tab={tab} job={job} />}
-          </div>
+          {headerAndTabs}
+          {body}
         </aside>
       </>
     );
@@ -8673,11 +8681,15 @@
     // from covering the whole screen if a stale value is in localStorage.
     const [height, setHeight] = useState(() => {
       try {
-        const stored = parseInt(localStorage.getItem('supporthublan:terminal-height') || '80', 10);
-        if (isNaN(stored) || stored < 60) return 80; // default if invalid
-        // Cap at 40% of viewport height to prevent the panel from covering the screen
+        let stored = parseInt(localStorage.getItem('supporthublan:terminal-height') || '80', 10);
+        // v1.4.7 migration: reset any stored value > 40% of viewport to the default 80px.
+        // This fixes users who have a stale large value from v1.3 (280px) or accidental drags.
         const maxH = Math.floor(window.innerHeight * 0.4);
-        return Math.min(stored, maxH);
+        if (isNaN(stored) || stored < 60 || stored > maxH) {
+          stored = 80;
+          try { localStorage.setItem('supporthublan:terminal-height', '80'); } catch {}
+        }
+        return stored;
       } catch { return 80; }
     });
     const [resizing, setResizing] = useState(false);
@@ -8912,7 +8924,7 @@
     }
 
     return (
-      <div className="flex-shrink-0 bg-[#0c0e16] border-t-2 border-border flex flex-col relative z-40" style={{ height: height + 'px' }}>
+      <div className="flex-shrink-0 bg-[#0c0e16] border-t-2 border-border flex flex-col relative" style={{ height: height + 'px' }}>
         {/* Resize handle — drag up/down to resize the panel */}
         <div
           onMouseDown={startResize}

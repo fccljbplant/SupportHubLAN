@@ -534,8 +534,10 @@
         killProcess: (hostname, pid, name, credential) => apiCall('/api/processes/' + hostname + '/kill', { pid, name, credential }),
 
         // Power
-        powerAction: (hostnames, action, credential, force) => apiCall('/api/power/action', { hostnames, action, credential, force }),
-        wakeOnLan: (macAddresses) => apiCall('/api/power/wol', { macAddresses }),
+        // Power — pass single hostname (string) per call; backend expects { hostname, action, credential }
+        powerAction: (hostname, action, credential, message) => apiCall('/api/power/action', { hostname, action, credential, message }),
+        // Wake-on-LAN — pass single MAC address (string) per call; backend expects { mac }
+        wakeOnLan: (mac) => apiCall('/api/power/wol', { mac }),
         checkPendingReboot: (hostnames, credential) => apiCall('/api/power/check-pending', { hostnames, credential }),
 
         // Job Queue
@@ -2755,6 +2757,9 @@
     const [selectedIds, setSelectedIds] = useState([]);
     const [density, setDensity] = useState('default');
     const [showAddModal, setShowAddModal] = useState(false);
+    const [addModalMethod, setAddModalMethod] = useState(null); // null | 'single' | 'csv' | 'scan' | 'ad'
+    const [showDeployModal, setShowDeployModal] = useState(false);
+    const [showCommandModal, setShowCommandModal] = useState(false);
     const [showColumnChooser, setShowColumnChooser] = useState(false);
     const [hiddenCols, setHiddenCols] = useState(new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials']));
     const [confirmReboot, setConfirmReboot] = useState(false);
@@ -2994,7 +2999,7 @@
                 URL.revokeObjectURL(url);
                 toast.success(`Exported ${hosts.length} hosts to CSV`);
               }}>Export</ActionButton>
-              <ActionButton variant="primary" icon="Plus" onClick={() => setShowAddModal(true)}>Add Hosts</ActionButton>
+              <ActionButton variant="primary" icon="Plus" onClick={() => { setAddModalMethod(null); setShowAddModal(true); }}>Add Hosts</ActionButton>
             </>
           }
         />
@@ -3133,13 +3138,40 @@
             {/* BatchPatch-style Action Toolbar */}
             <ActionToolbar groups={[
               { label: 'Hosts', items: [
-                { icon: 'Plus', label: 'Add', onClick: () => setShowAddModal(true) },
-                { icon: 'ScanLine', label: 'Scan IP', onClick: () => { setShowAddModal(true); toast.info('Select "IP Range / Subnet Scan" in the wizard.'); } },
+                { icon: 'Plus', label: 'Add', onClick: () => { setAddModalMethod(null); setShowAddModal(true); } },
+                { icon: 'ScanLine', label: 'Scan IP', onClick: () => { setAddModalMethod('scan'); setShowAddModal(true); } },
                 { icon: 'RefreshCw', label: 'Refresh', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; } updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, lastSeen: new Date().toISOString() } : h)); toast.success(`Refreshed ${selectedIds.length} host(s)`); }, disabled: selectedIds.length === 0 },
               ]},
               { label: 'Updates', items: [
                 { icon: 'Search', label: 'Check', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } addJob({ id: 'job-' + Date.now(), name: `Scan — ${selectedIds.length} hosts`, targets: [...selectedIds], step: 'Scanning (1/3)', progress: 5, startedAt: new Date().toISOString(), status: 'running' }); toast.info(`Scanning ${selectedIds.length} hosts…`); }, disabled: selectedIds.length === 0 },
-                { icon: 'ShieldCheck', label: 'Install', variant: 'success', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } addJob({ id: 'job-' + Date.now(), name: `Install Updates — ${selectedIds.length} hosts`, targets: [...selectedIds], step: 'Installing (1/4)', progress: 5, startedAt: new Date().toISOString(), status: 'running' }); setTimeout(() => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, patchState: 'compliant', pendingReboot: false } : h)); toast.success(`${selectedIds.length} host(s) now compliant`); }, 6000); toast.info(`Installing on ${selectedIds.length} hosts…`); }, disabled: selectedIds.length === 0 },
+                { icon: 'ShieldCheck', label: 'Install', variant: 'success', onClick: async () => {
+                  if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; }
+                  const targetHosts = hosts.filter(h => selectedIds.includes(h.id));
+                  const targetNames = targetHosts.map(h => h.hostname);
+                  const jobId = 'job-' + Date.now();
+                  addJob({ id: jobId, name: `Install Updates — ${selectedIds.length} hosts`, targets: [...selectedIds], step: 'Installing (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' });
+                  toast.info(`Installing updates on ${selectedIds.length} host(s)…`);
+                  if (window.SupportHubLANAPI) {
+                    try {
+                      const result = await window.SupportHubLANAPI.installUpdates(targetNames, null, { rebootBehavior: 'if-required' });
+                      if (result && result.success && !result.demo) {
+                        updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, patchState: 'compliant' } : h));
+                        updateJob(jobId, { status: 'completed', progress: 100, step: 'Done', completedAt: new Date().toISOString(), output: result.data || '' });
+                        appendAudit({ action: 'updates.install', actionCategory: 'Updates', targetType: 'Host', targetIds: [...selectedIds], parameters: { hostnames: targetNames }, result: 'success' });
+                        toast.success(`Updates installed on ${selectedIds.length} host(s)`, { duration: 5000 });
+                      } else if (result && result.demo) {
+                        updateJob(jobId, { status: 'failed', progress: 100, step: 'Demo mode — backend not connected' });
+                        toast.warning('Install skipped — backend not connected.', { duration: 8000 });
+                      } else {
+                        updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed', completedAt: new Date().toISOString(), output: result?.error || '' });
+                        toast.error('Install failed', { detail: result?.error, duration: 8000 });
+                      }
+                    } catch (e) {
+                      updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed', output: e.message });
+                      toast.error('Install failed', { detail: e.message, duration: 8000 });
+                    }
+                  }
+                }, disabled: selectedIds.length === 0 },
                 { icon: 'EyeOff', label: 'Hide', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } toast.success(`Hiding updates on ${selectedIds.length} host(s)`); }, disabled: selectedIds.length === 0 },
               ]},
               { label: 'PsTools', items: [
@@ -3150,12 +3182,11 @@
               ]},
               { label: 'Power', items: [
                 { icon: 'Power', label: 'Reboot', variant: 'danger', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } setConfirmReboot(true); }, disabled: selectedIds.length === 0 },
-                { icon: 'Wifi', label: 'WoL', variant: 'warning', onClick: () => { const offline = hosts.filter(h => h.onlineStatus === 'offline' && h.macAddress); if (offline.length === 0) { toast.info('No offline hosts with MAC.'); return; } executePowerAction({ action: 'wol', targetIds: offline.map(h => h.id) }); toast.success(`WoL to ${offline.length} hosts`); } },
+                { icon: 'Wifi', label: 'WoL', variant: 'warning', onClick: () => { const offline = hosts.filter(h => h.onlineStatus === 'offline' && h.macAddress); if (offline.length === 0) { toast.info('No offline hosts with MAC.'); return; } executePowerAction({ action: 'wol', targetIds: offline.map(h => h.id) }); } },
               ]},
               { label: 'Deploy', items: [
-                { icon: 'Package', label: 'Deploy', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } navigate('deployments'); toast.info(`${selectedIds.length} hosts selected — open Deployments`); }, disabled: selectedIds.length === 0 },
-                { icon: 'Terminal', label: 'Script', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } navigate('scripts'); }, disabled: selectedIds.length === 0 },
-                { icon: 'Activity', label: 'Services', onClick: () => navigate('services') },
+                { icon: 'Package', label: 'Install', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } setShowDeployModal(true); }, disabled: selectedIds.length === 0 },
+                { icon: 'Terminal', label: 'Run Cmd', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } setShowCommandModal(true); }, disabled: selectedIds.length === 0 },
               ]},
               { label: 'Row Color', items: [
                 { icon: 'Palette', label: 'None', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: undefined } : h)); toast.info('Row color cleared.'); }, disabled: selectedIds.length === 0 },
@@ -3224,7 +3255,13 @@
         )}
 
         {/* Add Hosts Modal (Wizard) */}
-        <AddHostsModal open={showAddModal} onClose={() => setShowAddModal(false)} />
+        <AddHostsModal open={showAddModal} initialMethod={addModalMethod} onClose={() => { setShowAddModal(false); setAddModalMethod(null); }} />
+
+        {/* Deploy Package Modal */}
+        <DeployPackageModal open={showDeployModal} targetIds={selectedIds} hosts={hosts} onClose={() => setShowDeployModal(false)} />
+
+        {/* Run Command Modal */}
+        <RunCommandModal open={showCommandModal} targetIds={selectedIds} hosts={hosts} onClose={() => setShowCommandModal(false)} />
 
         {/* Encrypted Grid File Export/Import Modal */}
         <GridFileModal
@@ -3283,11 +3320,281 @@
   };
 
   // Add Hosts Modal — Multi-method wizard with IP Scanner and CSV Import with column mapping
-  const AddHostsModal = ({ open, onClose }) => {
+
+  // ============================================================
+  // DEPLOY PACKAGE MODAL — Install MSI/EXE/PS1 on selected hosts
+  // ============================================================
+  const DeployPackageModal = ({ open, onClose, targetIds, hosts }) => {
+    const toast = useToast();
+    const { addJob, updateJob, appendAudit } = useApp();
+    const [packagePath, setPackagePath] = useState('');
+    const [args, setArgs] = useState('');
+    const [rebootBehavior, setRebootBehavior] = useState('never');
+    const [deploying, setDeploying] = useState(false);
+    const [savedPackages, setSavedPackages] = useState(() => { try { return JSON.parse(localStorage.getItem('supporthublan:saved-packages') || '[]'); } catch { return []; } });
+    const [pkgName, setPkgName] = useState('');
+
+    const targetHosts = hosts.filter(h => targetIds.includes(h.id));
+    const targetNames = targetHosts.map(h => h.hostname);
+
+    const deploy = async () => {
+      if (!packagePath.trim()) { toast.warning('Package path required (e.g. C:\\Packages\\chrome.msi)'); return; }
+      if (targetNames.length === 0) { toast.warning('No hosts selected'); return; }
+      setDeploying(true);
+      const jobId = 'job-' + Date.now();
+      addJob({ id: jobId, name: `Deploy ${pkgName || packagePath.split('\\').pop()} → ${targetNames.length} hosts`, targets: [...targetIds], step: 'Copying (1/3)', progress: 10, startedAt: new Date().toISOString(), status: 'running' });
+      toast.info(`Deploying to ${targetNames.length} host(s)…`);
+
+      // Save to package library
+      if (pkgName.trim()) {
+        const newPkg = { name: pkgName, path: packagePath, args, rebootBehavior, savedAt: new Date().toISOString() };
+        const updated = [...savedPackages.filter(p => p.name !== pkgName), newPkg];
+        setSavedPackages(updated);
+        try { localStorage.setItem('supporthublan:saved-packages', JSON.stringify(updated)); } catch {}
+      }
+
+      if (!window.SupportHubLANAPI) {
+        updateJob(jobId, { status: 'failed', step: 'No API client', progress: 100 });
+        toast.error('API client not loaded');
+        setDeploying(false);
+        return;
+      }
+
+      try {
+        const result = await window.SupportHubLANAPI.apiCall('/api/deploy/package', { hostnames: targetNames, packagePath, arguments: args, rebootBehavior });
+        if (result && result.success && !result.demo) {
+          updateJob(jobId, { status: 'completed', step: 'Done', progress: 100, completedAt: new Date().toISOString(), output: result.data || '' });
+          appendAudit({ action: 'deploy.package', actionCategory: 'Deployments', targetType: 'Host', targetIds: [...targetIds], parameters: { packagePath, args, hostnames: targetNames }, result: 'success' });
+          toast.success(`Deployment complete on ${targetNames.length} host(s)`, { duration: 5000 });
+          onClose();
+        } else if (result && result.demo) {
+          updateJob(jobId, { status: 'failed', step: 'Demo mode — backend not connected', progress: 100 });
+          appendAudit({ action: 'deploy.package', actionCategory: 'Deployments', targetType: 'Host', targetIds: [...targetIds], parameters: { packagePath }, result: 'skipped' });
+          toast.warning('Deployment skipped — backend not connected. Run the SupportHubLAN server to deploy for real.', { duration: 8000 });
+        } else {
+          updateJob(jobId, { status: 'failed', step: 'Failed', progress: 100, completedAt: new Date().toISOString(), output: result?.error || '' });
+          appendAudit({ action: 'deploy.package', actionCategory: 'Deployments', targetType: 'Host', targetIds: [...targetIds], parameters: { packagePath }, result: 'failed', error: result?.error });
+          toast.error('Deployment failed', { detail: result?.error, duration: 8000 });
+        }
+      } catch (e) {
+        updateJob(jobId, { status: 'failed', step: 'Failed', progress: 100, output: e.message });
+        toast.error('Deployment failed', { detail: e.message, duration: 8000 });
+      }
+      setDeploying(false);
+    };
+
+    if (!open) return null;
+
+    return (
+      <Modal open={open} onClose={onClose} title="Install Package on Selected Workstations" subtitle={`${targetNames.length} host(s) selected`} size="lg"
+        footer={<>
+          <ActionButton variant="secondary" onClick={onClose} disabled={deploying}>Cancel</ActionButton>
+          <ActionButton variant="primary" icon="Package" onClick={deploy} disabled={deploying}>{deploying ? 'Deploying…' : 'Install Now'}</ActionButton>
+        </>}>
+        <div className="space-y-3">
+          <div className="p-2 bg-info/10 border border-info/30 rounded text-xs text-info">
+            <Icon name="Server" size={12} className="inline mr-1.5" />
+            Targets: {targetNames.slice(0, 5).join(', ')}{targetNames.length > 5 ? ` + ${targetNames.length - 5} more` : ''}
+          </div>
+
+          {savedPackages.length > 0 && (
+            <FormField label="Saved Packages (click to load)">
+              <div className="flex flex-wrap gap-1">
+                {savedPackages.map(p => (
+                  <button key={p.name} onClick={() => { setPkgName(p.name); setPackagePath(p.path); setArgs(p.args || ''); setRebootBehavior(p.rebootBehavior || 'never'); }}
+                    className="px-2 py-1 text-xs bg-surface-raised border border-border rounded hover:border-primary text-text">
+                    {p.name}
+                  </button>
+                ))}
+              </div>
+            </FormField>
+          )}
+
+          <FormField label="Package Name (optional — save to library)" hint="Give this package a friendly name to reuse later">
+            <Input value={pkgName} onChange={e => setPkgName(e.target.value)} placeholder="e.g. Chrome Enterprise v120" />
+          </FormField>
+          <FormField label="Package Path (UNC or local on backend)" hint="MSI, EXE, or PS1 file. Backend copies it to \\host\C$\Temp\ then executes remotely.">
+            <Input value={packagePath} onChange={e => setPackagePath(e.target.value)} placeholder="C:\\Packages\\chrome.msi  or  \\\\fileserver\\share\\chrome.msi" className="font-mono text-[11px]" />
+          </FormField>
+          <FormField label="Install Arguments (silent install flags)" hint="Passed to the installer. MSI uses /qn /norestart, EXE uses /S or --silent">
+            <Input value={args} onChange={e => setArgs(e.target.value)} placeholder="/qn /norestart  — or —  /S /v/qn" className="font-mono text-[11px]" />
+          </FormField>
+          <FormField label="Reboot After Install">
+            <Select value={rebootBehavior} onChange={e => setRebootBehavior(e.target.value)}>
+              <option value="never">Never reboot (default)</option>
+              <option value="if-required">Reboot if required by installer</option>
+              <option value="always">Always reboot after install</option>
+            </Select>
+          </FormField>
+
+          <div className="p-2 bg-warning/10 border border-warning/30 rounded text-xs text-warning">
+            <Icon name="AlertTriangle" size={12} className="inline mr-1.5" />
+            Backend uses <code className="font-mono">Copy-Item</code> + <code className="font-mono">Invoke-Command</code> via SMB. Ensure the backend has read access to the package path.
+          </div>
+        </div>
+      </Modal>
+    );
+  };
+
+  // ============================================================
+  // RUN COMMAND MODAL — Execute PowerShell/CMD on selected hosts
+  // ============================================================
+  const RunCommandModal = ({ open, onClose, targetIds, hosts }) => {
+    const toast = useToast();
+    const { addJob, updateJob, appendAudit } = useApp();
+    const [language, setLanguage] = useState('PowerShell');
+    const [code, setCode] = useState('');
+    const [timeout, setTimeout_] = useState(60);
+    const [running, setRunning] = useState(false);
+    const [output, setOutput] = useState(null);
+    const [savedCommands, setSavedCommands] = useState(() => { try { return JSON.parse(localStorage.getItem('supporthublan:saved-commands') || '[]'); } catch { return []; } });
+    const [cmdName, setCmdName] = useState('');
+
+    const targetHosts = hosts.filter(h => targetIds.includes(h.id));
+    const targetNames = targetHosts.map(h => h.hostname);
+
+    const run = async () => {
+      if (!code.trim()) { toast.warning('Enter a command to run'); return; }
+      if (targetNames.length === 0) { toast.warning('No hosts selected'); return; }
+      setRunning(true);
+      setOutput(null);
+      const jobId = 'job-' + Date.now();
+      addJob({ id: jobId, name: `Run ${language} → ${targetNames.length} hosts`, targets: [...targetIds], step: 'Executing (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' });
+      toast.info(`Executing on ${targetNames.length} host(s)…`);
+
+      if (cmdName.trim()) {
+        const newCmd = { name: cmdName, language, code, savedAt: new Date().toISOString() };
+        const updated = [...savedCommands.filter(c => c.name !== cmdName), newCmd];
+        setSavedCommands(updated);
+        try { localStorage.setItem('supporthublan:saved-commands', JSON.stringify(updated)); } catch {}
+      }
+
+      if (!window.SupportHubLANAPI) {
+        updateJob(jobId, { status: 'failed', step: 'No API client', progress: 100 });
+        toast.error('API client not loaded');
+        setRunning(false);
+        return;
+      }
+
+      try {
+        const result = await window.SupportHubLANAPI.executeScript(targetNames, code, null, language, timeout);
+        if (result && result.success && !result.demo) {
+          let parsed;
+          try { parsed = JSON.parse(result.data); } catch { parsed = result.data; }
+          const arr = Array.isArray(parsed) ? parsed : [parsed];
+          const successCount = arr.filter(r => r.success !== false).length;
+          const outputText = arr.map(r => `=== ${r.hostname} ===\n${r.success === false ? (r.error || 'Failed') : (r.output || 'OK')}`).join('\n\n');
+          setOutput(outputText);
+          updateJob(jobId, { status: 'completed', step: `Done — ${successCount}/${arr.length} OK`, progress: 100, completedAt: new Date().toISOString(), output: outputText });
+          appendAudit({ action: 'scripts.execute', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...targetIds], parameters: { language, code: code.slice(0, 500), hostnames: targetNames }, result: 'success' });
+          toast.success(`Command executed on ${successCount}/${arr.length} host(s)`, { duration: 5000 });
+        } else if (result && result.demo) {
+          updateJob(jobId, { status: 'failed', step: 'Demo mode — backend not connected', progress: 100 });
+          appendAudit({ action: 'scripts.execute', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...targetIds], parameters: { language, code: code.slice(0, 500) }, result: 'skipped' });
+          toast.warning('Command skipped — backend not connected. Run the SupportHubLAN server to execute commands for real.', { duration: 8000 });
+        } else {
+          updateJob(jobId, { status: 'failed', step: 'Failed', progress: 100, completedAt: new Date().toISOString(), output: result?.error || '' });
+          appendAudit({ action: 'scripts.execute', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...targetIds], parameters: { language }, result: 'failed', error: result?.error });
+          toast.error('Command execution failed', { detail: result?.error, duration: 8000 });
+        }
+      } catch (e) {
+        updateJob(jobId, { status: 'failed', step: 'Failed', progress: 100, output: e.message });
+        toast.error('Command execution failed', { detail: e.message, duration: 8000 });
+      }
+      setRunning(false);
+    };
+
+    if (!open) return null;
+
+    const examples = [
+      { lang: 'PowerShell', name: 'Get disk space', code: 'Get-PSDrive C | Select-Object Used,Free' },
+      { lang: 'PowerShell', name: 'Restart Print Spooler', code: 'Restart-Service -Name Spooler -Force\nWrite-Output "Spooler restarted"' },
+      { lang: 'PowerShell', name: 'Get logged-on users', code: 'query user' },
+      { lang: 'PowerShell', name: 'Flush DNS', code: 'ipconfig /flushdns' },
+      { lang: 'PowerShell', name: 'Get pending reboot', code: 'if (Test-Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending") { "PENDING" } else { "NONE" }' },
+      { lang: 'CMD', name: 'List running services', code: 'net start' },
+    ];
+
+    return (
+      <Modal open={open} onClose={onClose} title="Run Command on Selected Workstations" subtitle={`${targetNames.length} host(s) selected`} size="lg"
+        footer={<>
+          <ActionButton variant="secondary" onClick={onClose} disabled={running}>Cancel</ActionButton>
+          <ActionButton variant="primary" icon="Play" onClick={run} disabled={running}>{running ? 'Running…' : 'Run Now'}</ActionButton>
+        </>}>
+        <div className="space-y-3">
+          <div className="p-2 bg-info/10 border border-info/30 rounded text-xs text-info">
+            <Icon name="Server" size={12} className="inline mr-1.5" />
+            Targets: {targetNames.slice(0, 5).join(', ')}{targetNames.length > 5 ? ` + ${targetNames.length - 5} more` : ''}
+          </div>
+
+          {savedCommands.length > 0 && (
+            <FormField label="Saved Commands (click to load)">
+              <div className="flex flex-wrap gap-1">
+                {savedCommands.slice(0, 10).map(c => (
+                  <button key={c.name} onClick={() => { setCmdName(c.name); setLanguage(c.language); setCode(c.code); }}
+                    className="px-2 py-1 text-xs bg-surface-raised border border-border rounded hover:border-primary text-text">
+                    {c.name}
+                  </button>
+                ))}
+              </div>
+            </FormField>
+          )}
+
+          <div className="grid grid-cols-3 gap-2">
+            <FormField label="Language">
+              <Select value={language} onChange={e => setLanguage(e.target.value)}>
+                <option value="PowerShell">PowerShell</option>
+                <option value="CMD">CMD / Batch</option>
+              </Select>
+            </FormField>
+            <FormField label="Timeout (seconds)">
+              <Input type="number" value={timeout} onChange={e => setTimeout_(parseInt(e.target.value) || 60)} />
+            </FormField>
+            <FormField label="Save As (optional)">
+              <Input value={cmdName} onChange={e => setCmdName(e.target.value)} placeholder="My command" />
+            </FormField>
+          </div>
+
+          <FormField label="Command / Script" hint="Executed via Invoke-Command on each target host">
+            <Textarea rows={6} value={code} onChange={e => setCode(e.target.value)} placeholder="Get-Service | Where-Object Status -eq 'Running' | Select-Object -First 10" className="font-mono text-[11px]" />
+          </FormField>
+
+          <div>
+            <div className="text-meta text-text-dim uppercase mb-1">Quick Examples</div>
+            <div className="flex flex-wrap gap-1">
+              {examples.map((ex, i) => (
+                <button key={i} onClick={() => { setLanguage(ex.lang); setCode(ex.code); setCmdName(ex.name); }}
+                  className="px-2 py-1 text-xs bg-surface-raised border border-border rounded hover:border-primary text-text">
+                  {ex.name}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {output && (
+            <div>
+              <div className="text-meta text-text-dim uppercase mb-1">Output</div>
+              <pre className="p-2 bg-[#0c0e16] border border-border rounded text-[11px] text-gray-300 max-h-60 overflow-y-auto font-mono whitespace-pre-wrap">{output}</pre>
+            </div>
+          )}
+        </div>
+      </Modal>
+    );
+  };
+
+  const AddHostsModal = ({ open, onClose, initialMethod }) => {
     const toast = useToast();
     const { addHosts, hosts, appendAudit } = useApp();
     const [step, setStep] = useState(0);
-    const [method, setMethod] = useState('single');
+    const [method, setMethod] = useState(initialMethod || 'single');
+
+    // Update method when initialMethod changes (e.g. user clicks "Scan IP" button)
+    useEffect(() => {
+      if (open && initialMethod) {
+        setMethod(initialMethod);
+        setStep(1); // skip the method-picker step, go straight to the input
+      }
+    }, [open, initialMethod]);
     const [entries, setEntries] = useState([{ hostname: '', ipAddress: '', macAddress: '' }]);
     const [pasteText, setPasteText] = useState('');
     const [tag, setTag] = useState('');
@@ -6940,15 +7247,6 @@
                   <div className="text-[11px] text-text-dim mt-1.5">Current effective theme: <span className="font-mono text-text">{document.documentElement.classList.contains('dark') ? 'dark' : 'light'}</span></div>
                 </FormField>
 
-                <FormField label="Accent Color">
-                  <div className="flex gap-2">
-                    {['#4f83ff', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4'].map(color => (
-                      <button key={color} onClick={() => { document.documentElement.style.setProperty('--c-primary', color); document.documentElement.style.setProperty('--c-primary-hover', color + 'dd'); try { localStorage.setItem('supporthublan:accent-color', color); } catch {} toast.success(`Accent color set`); }}
-                        className="w-8 h-8 rounded-full border-2 border-border hover:scale-110 transition-transform" style={{ backgroundColor: color }} title={color} />
-                    ))}
-                  </div>
-                </FormField>
-
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   <FormField label="Sidebar Default"><Select defaultValue="Expanded"><option>Expanded</option><option>Icon-only</option></Select></FormField>
                   <FormField label="Bottom Terminal Panel"><Select defaultValue={localStorage.getItem('supporthublan:terminal-collapsed') === '1' ? 'Collapsed' : 'Expanded'} onChange={(e) => { try { localStorage.setItem('supporthublan:terminal-collapsed', e.target.value === 'Collapsed' ? '1' : '0'); } catch {} window.location.reload(); }}><option>Expanded</option><option>Collapsed</option></Select></FormField>
@@ -7771,69 +8069,71 @@
     // ---- Power action: flip host.onlineStatus with realistic timing ----
     // When backend is connected, calls real Restart-Computer/Stop-Computer/WoL.
     // When in demo mode, simulates the power action with timers.
-    const executePowerAction = useCallback(({ action, targetIds, mode = 'standard' }) => {
+    const executePowerAction = useCallback(async ({ action, targetIds, mode = 'standard' }) => {
       const jobId = 'job-' + Date.now();
-      const targetNames = hosts.filter(h => targetIds.includes(h.id)).map(h => h.hostname);
-      // Add job entry — running
+      const targetHosts = hosts.filter(h => targetIds.includes(h.id));
+      const targetNames = targetHosts.map(h => h.hostname);
+      const actionLabel = action === 'reboot' ? 'Reboot' : action === 'shutdown' ? 'Shutdown' : action === 'wol' ? 'Wake on LAN' : action;
+
       addJob({
         id: jobId,
-        name: `${action === 'reboot' ? 'Reboot' : action === 'shutdown' ? 'Shutdown' : action === 'wol' ? 'Wake on LAN' : action} — ${targetIds.length} hosts`,
+        name: `${actionLabel} — ${targetIds.length} hosts`,
         targets: [...targetIds],
-        step: action === 'wol' ? 'Sending (1/2)' : 'Sending signal (1/2)',
+        step: action === 'wol' ? 'Sending magic packets (1/2)' : 'Sending power signal (1/2)',
         progress: 30,
         startedAt: new Date().toISOString(),
         status: 'running',
       });
-      appendAudit({
-        action: `power.${action}`, actionCategory: 'Power',
-        targetType: 'Host', targetIds: [...targetIds],
-        parameters: { mode, jobId, hostnames: targetNames },
-        result: 'success',
-      });
+      toast.info(`${actionLabel} on ${targetIds.length} host(s)…`);
 
-      // Try real API call first, fall back to demo simulation
-      if (window.SupportHubLANAPI) {
-        if (action === 'wol') {
-          const macs = hosts.filter(h => targetIds.includes(h.id)).map(h => h.macAddress).filter(Boolean);
-          window.SupportHubLANAPI.wakeOnLan(macs).then(result => {
-            if (result.success && !result.demo) {
-              updateJob(jobId, { progress: 100, step: 'Complete', status: 'complete' });
-              updateHosts(prev => prev.map(h => targetIds.includes(h.id) ? { ...h, onlineStatus: 'online', pingStatus: 'up' } : h));
-            }
-          });
-        } else {
-          window.SupportHubLANAPI.powerAction(targetNames, action === 'reboot' ? 'reboot' : 'shutdown').then(result => {
-            if (result.success && !result.demo) {
-              // Real reboot command sent — PowerShell will handle the rest
-            }
-          });
-        }
+      if (!window.SupportHubLANAPI) {
+        updateJob(jobId, { progress: 100, step: 'Failed (no API client)', status: 'failed', completedAt: new Date().toISOString() });
+        appendAudit({ action: `power.${action}`, actionCategory: 'Power', targetType: 'Host', targetIds: [...targetIds], parameters: { mode, hostnames: targetNames }, result: 'failed' });
+        toast.error('API client not loaded');
+        return jobId;
       }
 
-      // Demo simulation (runs in parallel as fallback / visual feedback)
-      setTimeout(() => {
-        if (action !== 'wol') {
-          updateHosts(prev => prev.map(h => targetIds.includes(h.id) ? { ...h, onlineStatus: 'offline', pingStatus: 'down' } : h));
+      try {
+        let successCount = 0, failCount = 0, demoMode = false;
+        for (const host of targetHosts) {
+          let result;
+          if (action === 'wol') {
+            if (!host.macAddress) { failCount++; continue; }
+            result = await window.SupportHubLANAPI.wakeOnLan(host.macAddress);
+          } else {
+            result = await window.SupportHubLANAPI.powerAction(host.hostname, action === 'reboot' ? 'reboot' : 'shutdown');
+          }
+          if (result && result.success && !result.demo) successCount++;
+          else if (result && result.demo) { demoMode = true; failCount++; }
+          else failCount++;
+        }
+
+        if (successCount > 0 && !demoMode) {
+          updateJob(jobId, { progress: 100, step: `Done — ${successCount}/${targetHosts.length} succeeded`, status: 'completed', completedAt: new Date().toISOString() });
+          appendAudit({ action: `power.${action}`, actionCategory: 'Power', targetType: 'Host', targetIds: [...targetIds], parameters: { mode, hostnames: targetNames }, result: 'success' });
+          toast.success(`${actionLabel} sent to ${successCount}/${targetHosts.length} host(s)`, { duration: 5000 });
+          // Optimistically update host status
+          if (action === 'wol') {
+            updateHosts(prev => prev.map(h => targetIds.includes(h.id) ? { ...h, onlineStatus: 'online', pingStatus: 'up' } : h));
+          } else if (action === 'shutdown') {
+            updateHosts(prev => prev.map(h => targetIds.includes(h.id) ? { ...h, onlineStatus: 'offline', pingStatus: 'down' } : h));
+          } else if (action === 'reboot') {
+            updateHosts(prev => prev.map(h => targetIds.includes(h.id) ? { ...h, onlineStatus: 'offline', pendingReboot: false } : h));
+          }
+        } else if (demoMode) {
+          updateJob(jobId, { progress: 100, step: 'Demo mode — backend not connected', status: 'failed', completedAt: new Date().toISOString() });
+          appendAudit({ action: `power.${action}`, actionCategory: 'Power', targetType: 'Host', targetIds: [...targetIds], parameters: { mode, hostnames: targetNames }, result: 'skipped' });
+          toast.warning(`${actionLabel} skipped — backend not connected. Run the SupportHubLAN server on a Windows admin PC to send real power commands.`, { duration: 8000 });
         } else {
-          updateHosts(prev => prev.map(h => targetIds.includes(h.id) ? { ...h, onlineStatus: 'online', pingStatus: 'up' } : h));
+          updateJob(jobId, { progress: 100, step: `Failed — ${failCount}/${targetHosts.length} failed`, status: 'failed', completedAt: new Date().toISOString() });
+          appendAudit({ action: `power.${action}`, actionCategory: 'Power', targetType: 'Host', targetIds: [...targetIds], parameters: { mode, hostnames: targetNames }, result: 'failed' });
+          toast.error(`${actionLabel} failed on ${failCount} host(s)`, { duration: 8000 });
         }
-        updateJob(jobId, { progress: 60, step: action === 'wol' ? 'Waiting for wake (2/2)' : 'Waiting for offline (2/2)' });
-      }, 1500);
-      setTimeout(() => {
-        if (action === 'reboot') {
-          updateHosts(prev => prev.map(h => targetIds.includes(h.id) ? { ...h, onlineStatus: 'online', pingStatus: 'up', pendingReboot: false, lastBootTime: new Date().toISOString(), uptime: '0d 0h' } : h));
-        }
-        updateJob(jobId, { progress: 100, step: 'Complete', status: 'complete' });
-        addJobLog({
-          id: 'jl-' + Date.now(),
-          queueName: `${action} — ${targetIds.length} hosts`,
-          startedAt: new Date().toISOString(),
-          duration: '6s',
-          steps: 2,
-          targets: targetIds.length,
-          result: 'success',
-        });
-      }, 6000);
+      } catch (e) {
+        updateJob(jobId, { progress: 100, step: 'Failed', status: 'failed', completedAt: new Date().toISOString() });
+        appendAudit({ action: `power.${action}`, actionCategory: 'Power', targetType: 'Host', targetIds: [...targetIds], parameters: { mode, hostnames: targetNames }, result: 'failed', error: e.message });
+        toast.error(`${actionLabel} failed`, { detail: e.message, duration: 8000 });
+      }
       return jobId;
     }, [hosts, addJob, appendAudit, updateHosts, updateJob, addJobLog]);
 
@@ -8039,17 +8339,6 @@
       return () => mq.removeEventListener('change', handler);
     }, [theme, applyTheme]);
 
-    // Restore saved accent color on mount
-    useEffect(() => {
-      try {
-        const accent = localStorage.getItem('supporthublan:accent-color');
-        if (accent) {
-          document.documentElement.style.setProperty('--c-primary', accent);
-          document.documentElement.style.setProperty('--c-primary-hover', accent + 'dd');
-        }
-      } catch {}
-    }, []);
-
     // ---- Keyboard shortcuts ----
     // ? → show shortcuts overlay, g d/i/u/q/s/r/p/e → navigate, Esc → close drawer/overlay
     useEffect(() => {
@@ -8247,6 +8536,9 @@
   const TerminalPanel = () => {
     const { activeJobs, auditEvents } = useApp();
     const [collapsed, setCollapsed] = useState(() => { try { return localStorage.getItem('supporthublan:terminal-collapsed') === '1'; } catch { return false; } });
+    // Default 3 lines tall (~80px) — user can drag to resize
+    const [height, setHeight] = useState(() => { try { return parseInt(localStorage.getItem('supporthublan:terminal-height') || '80', 10); } catch { return 80; } });
+    const [resizing, setResizing] = useState(false);
     const [activeTab, setActiveTab] = useState('all'); // all | current | errors | terminal
     const [lines, setLines] = useState([]);
     const [command, setCommand] = useState('');
@@ -8261,6 +8553,39 @@
 
     // Persist collapsed state
     useEffect(() => { try { localStorage.setItem('supporthublan:terminal-collapsed', collapsed ? '1' : '0'); } catch {} }, [collapsed]);
+
+    // Persist height
+    useEffect(() => { try { localStorage.setItem('supporthublan:terminal-height', String(height)); } catch {} }, [height]);
+
+    // Drag-to-resize handler (mouse + touch)
+    const startResize = (e) => {
+      e.preventDefault();
+      setResizing(true);
+      const startY = (e.touches ? e.touches[0].clientY : e.clientY) ;
+      const startH = height;
+      const onMove = (ev) => {
+        const y = ev.touches ? ev.touches[0].clientY : ev.clientY;
+        const delta = startY - y;
+        // Min 60px (1 line), max 60% of viewport
+        const newH = Math.max(60, Math.min(window.innerHeight * 0.6, startH + delta));
+        setHeight(Math.round(newH));
+      };
+      const onUp = () => {
+        setResizing(false);
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        document.removeEventListener('touchmove', onMove);
+        document.removeEventListener('touchend', onUp);
+        document.body.style.userSelect = '';
+        document.body.style.cursor = '';
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      document.addEventListener('touchmove', onMove);
+      document.addEventListener('touchend', onUp);
+      document.body.style.userSelect = 'none';
+      document.body.style.cursor = 'ns-resize';
+    };
 
     // Keep linesRef in sync
     useEffect(() => { linesRef.current = lines; }, [lines]);
@@ -8417,7 +8742,16 @@
     }
 
     return (
-      <div className="flex-shrink-0 bg-[#0c0e16] border-t-2 border-border flex flex-col" style={{ height: '280px' }}>
+      <div className="flex-shrink-0 bg-[#0c0e16] border-t-2 border-border flex flex-col relative" style={{ height: height + 'px' }}>
+        {/* Resize handle — drag up/down to resize the panel */}
+        <div
+          onMouseDown={startResize}
+          onTouchStart={startResize}
+          className="absolute top-0 left-0 right-0 h-1 cursor-ns-resize hover:bg-primary/50 transition-colors group"
+          title="Drag to resize"
+        >
+          <div className="absolute top-0 left-1/2 -translate-x-1/2 w-12 h-1 bg-border group-hover:bg-primary rounded-b" />
+        </div>
         {/* Tab bar */}
         <div className="flex items-center justify-between border-b border-[#1f2230] bg-[#0f1117] px-1">
           <div className="flex">

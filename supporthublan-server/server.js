@@ -1113,6 +1113,40 @@ app.post('/api/pstools/pssuspend', async (req, res) => {
 });
 
 // ==========================================================================
+// PC EVENT LOG — Retrieve Windows Event Logs from a remote host
+// ==========================================================================
+app.post('/api/hosts/:hostname/eventlog', async (req, res) => {
+  const { hostname } = req.params;
+  const { logName = 'System', maxEvents = 50, severity, credential } = req.body;
+  const safeHost = sanitizeHost(hostname);
+  const safeLog = String(logName).replace(/[^a-zA-Z0-9]/g, '');
+  const safeMax = Math.min(parseInt(maxEvents, 10) || 50, 500);
+  const credBlock = credential ? buildCredentialBlock(credential) : '';
+
+  // Severity filter: All, Error, Warning, Information
+  let levelFilter = '';
+  if (severity === 'Error') levelFilter = '-Level 2';
+  else if (severity === 'Warning') levelFilter = '-Level 3';
+  else if (severity === 'Information') levelFilter = '-Level 4';
+
+  const script = `
+    ${credBlock}
+    try {
+      $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
+      ${credential ? '$params.Credential = $cred' : ''}
+      $events = Get-WinEvent -FilterHashtable @{ LogName = '${safeLog}'; StartTime = (Get-Date).AddDays(-7) } ${levelFilter} -MaxEvents ${safeMax} @params -ErrorAction SilentlyContinue
+      if (-not $events) { $events = @() }
+      $results = $events | Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message | ConvertTo-Json -Depth 3 -Compress
+      $results
+    } catch {
+      @{ error = $_.Exception.Message; events = @() } | ConvertTo-Json -Compress
+    }
+  `;
+  const result = await runPowerShell(script, 30000);
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
+});
+
+// ==========================================================================
 // REMOTE DESKTOP — Launch VNC/RDP viewer on the backend machine
 // ==========================================================================
 app.post('/api/remote/connect', async (req, res) => {

@@ -565,6 +565,10 @@
         // Remote desktop
         launchRemote: (hostname, ip, protocol, port) => apiCall('/api/remote/connect', { hostname, ip, protocol, port }),
 
+        // PC Event Log
+        getEventLog: (hostname, logName, maxEvents, severity, credential) =>
+          apiCall('/api/hosts/' + hostname + '/eventlog', { logName, maxEvents, severity, credential }),
+
         // Health check (force re-check by resetting _available)
         recheckBackend: () => { _available = null; return checkBackend(); },
       };
@@ -2760,6 +2764,7 @@
     const [addModalMethod, setAddModalMethod] = useState(null); // null | 'single' | 'csv' | 'scan' | 'ad'
     const [showDeployModal, setShowDeployModal] = useState(false);
     const [showCommandModal, setShowCommandModal] = useState(false);
+    const [logHost, setLogHost] = useState(null); // host object for PC Log modal
     const [showColumnChooser, setShowColumnChooser] = useState(false);
     const [hiddenCols, setHiddenCols] = useState(new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials']));
     const [confirmReboot, setConfirmReboot] = useState(false);
@@ -2935,14 +2940,23 @@
       } },
       { key: 'notes', label: 'Notes', render: (h) => h.notes ? <span className="text-text-dim truncate block max-w-[150px]" title={h.notes}>{h.notes}</span> : <span className="text-text-dim">—</span> },
       { key: 'lastSeen', label: 'Last Seen', render: (h) => <span className="text-text-dim">{fmtRel(h.lastSeen)}</span> },
-      { key: 'connect', label: 'Connect', sortable: false, render: (h) => (
-        <button
-          onClick={(e) => { e.stopPropagation(); launchRemoteDesktop(h); }}
-          title={`Open ${remoteDesktopProtocol} session to ${h.hostname}`}
-          className="inline-flex items-center justify-center w-7 h-7 rounded border border-border bg-surface-raised hover:border-primary hover:bg-primary/10 hover:text-primary text-text-dim transition-colors"
-        >
-          <Icon name={remoteDesktopProtocol === 'VNC' ? 'Monitor' : 'MonitorSmartphone'} size={14} />
-        </button>
+      { key: 'actions', label: 'Actions', sortable: false, render: (h) => (
+        <div className="flex items-center gap-1">
+          <button
+            onClick={(e) => { e.stopPropagation(); launchRemoteDesktop(h); }}
+            title={`Open ${remoteDesktopProtocol} session to ${h.hostname}`}
+            className="inline-flex items-center justify-center w-7 h-7 rounded border border-border bg-surface-raised hover:border-primary hover:bg-primary/10 hover:text-primary text-text-dim transition-colors"
+          >
+            <Icon name={remoteDesktopProtocol === 'VNC' ? 'Monitor' : 'MonitorSmartphone'} size={14} />
+          </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); setLogHost(h); }}
+            title={`View PC event log for ${h.hostname}`}
+            className="inline-flex items-center justify-center w-7 h-7 rounded border border-border bg-surface-raised hover:border-primary hover:bg-primary/10 hover:text-primary text-text-dim transition-colors"
+          >
+            <Icon name="FileText" size={14} />
+          </button>
+        </div>
       ) },
     ];
 
@@ -3120,15 +3134,55 @@
             />
 
             {showColumnChooser && (
-              <div className="absolute right-4 z-30 w-56 p-2 bg-surface border border-border rounded-lg shadow-raised">
-                <div className="text-meta text-text-dim uppercase px-1 pb-1">Toggle Columns</div>
-                <div className="max-h-72 overflow-y-auto">
-                  {allColumns.map(c => (
-                    <label key={c.key} className="flex items-center gap-2 px-1 py-1 text-xs text-text hover:bg-surface-raised rounded">
-                      <input type="checkbox" checked={!hiddenCols.has(c.key)} onChange={() => setHiddenCols(s => { const ns = new Set(s); if (ns.has(c.key)) ns.delete(c.key); else ns.add(c.key); return ns; })} className="accent-primary" />
-                      {c.label}
-                    </label>
-                  ))}
+              <div className="absolute right-4 z-30 w-72 p-3 bg-surface border border-border rounded-lg shadow-raised">
+                <div className="flex items-center justify-between mb-2 pb-2 border-b border-border">
+                  <div className="text-meta text-text-dim uppercase">Toggle Columns</div>
+                  <div className="flex gap-1">
+                    <button onClick={() => setHiddenCols(new Set())} className="text-[10px] px-1.5 py-0.5 text-text-dim hover:text-primary" title="Show all">All</button>
+                    <span className="text-text-dim text-[10px]">·</span>
+                    <button onClick={() => setHiddenCols(new Set(allColumns.map(c => c.key).filter(k => k !== 'hostname' && k !== 'actions')))} className="text-[10px] px-1.5 py-0.5 text-text-dim hover:text-primary" title="Hide all except Hostname & Actions">None</button>
+                    <span className="text-text-dim text-[10px]">·</span>
+                    <button onClick={() => setHiddenCols(new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials']))} className="text-[10px] px-1.5 py-0.5 text-text-dim hover:text-primary" title="Restore defaults">Reset</button>
+                  </div>
+                </div>
+                <div className="max-h-72 overflow-y-auto space-y-0.5">
+                  {allColumns.map(c => {
+                    const isVisible = !hiddenCols.has(c.key);
+                    const isLocked = c.key === 'hostname' || c.key === 'actions'; // these stay visible
+                    return (
+                      <button
+                        key={c.key}
+                        onClick={() => !isLocked && setHiddenCols(s => { const ns = new Set(s); if (ns.has(c.key)) ns.delete(c.key); else ns.add(c.key); return ns; })}
+                        disabled={isLocked}
+                        className={`w-full flex items-center justify-between gap-2 px-2 py-1.5 text-xs rounded border transition-colors ${
+                          isLocked
+                            ? 'border-border bg-surface-raised text-text-dim cursor-not-allowed opacity-60'
+                            : isVisible
+                              ? 'border-primary/40 bg-primary/5 text-text hover:bg-primary/10'
+                              : 'border-border bg-surface text-text-dim hover:bg-surface-raised'
+                        }`}
+                        title={isLocked ? 'This column is always visible' : (isVisible ? 'Click to hide' : 'Click to show')}
+                      >
+                        <span className="flex items-center gap-2">
+                          <span className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 ${
+                            isLocked ? 'border-border bg-surface' :
+                            isVisible ? 'border-primary bg-primary text-white' : 'border-border bg-surface'
+                          }`}>
+                            {isVisible && <Icon name="Check" size={10} />}
+                          </span>
+                          {c.label}
+                        </span>
+                        <span className="text-[9px] uppercase tracking-wider">
+                          {isLocked ? <span className="text-text-dim">Locked</span> :
+                           isVisible ? <span className="text-success">On</span> : <span className="text-text-dim">Off</span>}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="mt-2 pt-2 border-t border-border text-[10px] text-text-dim flex items-center justify-between">
+                  <span>{allColumns.length - hiddenCols.size} of {allColumns.length} visible</span>
+                  <button onClick={() => setShowColumnChooser(false)} className="text-text-dim hover:text-text">Done</button>
                 </div>
               </div>
             )}
@@ -3238,6 +3292,7 @@
                       { icon: 'Server', text: 'PsService — Services', onClick: () => runPsToolOnHost('psservice', h.hostname, h.id, { label: 'PsService' }) },
                       { icon: 'FileText', text: 'PsFile — Open Files', onClick: () => runPsToolOnHost('psfile', h.hostname, h.id, { label: 'PsFile' }) },
                       { icon: 'Hash', text: 'PsGetSid — Get SID', onClick: () => runPsToolOnHost('psgetsid', h.hostname, h.id, { label: 'PsGetSid' }) },
+                      { icon: 'FileText', text: 'View PC Event Log', onClick: () => setLogHost(h) },
                       { icon: 'Power', text: 'PsShutdown — Reboot', danger: true, onClick: () => { executePowerAction({ action: 'reboot', targetIds: [h.id] }); toast.success(`PsShutdown reboot sent to ${h.hostname}`); } },
                       { icon: 'RefreshCw', text: 'Check Pending Reboot + Reboot if Req', onClick: () => { if (h.pendingReboot) { executePowerAction({ action: 'reboot', targetIds: [h.id] }); toast.success(`${h.hostname} had pending reboot — rebooting now.`); } else { toast.info(`${h.hostname} does not have a pending reboot flag.`); } } },
                       { icon: 'MessageSquare', text: 'Send Message to User', onClick: () => { const msg = prompt('Enter message to display on remote screen:', 'IT Maintenance: Please save your work.'); if (msg) { addJob({ id: 'job-' + Date.now(), name: `Message — ${h.hostname}`, targets: [h.id], step: 'Sending (1/1)', progress: 50, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.message', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: { message: msg }, result: 'success' }); toast.success(`Message sent to ${h.hostname}`); } } },
@@ -3262,6 +3317,9 @@
 
         {/* Run Command Modal */}
         <RunCommandModal open={showCommandModal} targetIds={selectedIds} hosts={hosts} onClose={() => setShowCommandModal(false)} />
+
+        {/* PC Log Modal — opened from row action button */}
+        <PCLogModal open={!!logHost} host={logHost} onClose={() => setLogHost(null)} />
 
         {/* Encrypted Grid File Export/Import Modal */}
         <GridFileModal
@@ -3320,6 +3378,149 @@
   };
 
   // Add Hosts Modal — Multi-method wizard with IP Scanner and CSV Import with column mapping
+
+  // ============================================================
+  // PC LOG MODAL — View Windows Event Logs from a single host
+  // ============================================================
+  const PCLogModal = ({ open, onClose, host }) => {
+    const toast = useToast();
+    const { appendAudit } = useApp();
+    const [logName, setLogName] = useState('System');
+    const [severity, setSeverity] = useState('All');
+    const [maxEvents, setMaxEvents] = useState(50);
+    const [events, setEvents] = useState([]);
+    const [loading, setLoading] = useState(false);
+    const [selectedEvent, setSelectedEvent] = useState(null);
+
+    const load = async () => {
+      if (!host) return;
+      setLoading(true);
+      setSelectedEvent(null);
+      try {
+        if (window.SupportHubLANAPI) {
+          const result = await window.SupportHubLANAPI.getEventLog(host.hostname, logName, maxEvents, severity, null);
+          if (result && result.success && !result.demo) {
+            let parsed;
+            try { parsed = JSON.parse(result.data); } catch { parsed = result.data; }
+            const arr = Array.isArray(parsed) ? parsed : (parsed && parsed.events ? parsed.events : [parsed]);
+            setEvents(arr.filter(e => e && (e.TimeCreated || e.error)));
+            appendAudit({ action: 'hosts.eventlog', actionCategory: 'Inventory', targetType: 'Host', targetIds: [host.id], parameters: { hostname: host.hostname, logName, severity, count: arr.length }, result: 'success' });
+            toast.success(`Loaded ${arr.length} event(s) from ${host.hostname}`);
+          } else if (result && result.demo) {
+            setEvents([]);
+            toast.warning(`Event log skipped — backend not connected`, { duration: 8000 });
+          } else {
+            setEvents([]);
+            toast.error('Failed to load event log', { detail: result?.error, duration: 8000 });
+          }
+        } else {
+          toast.error('API client not loaded');
+        }
+      } catch (e) {
+        setEvents([]);
+        toast.error('Failed to load event log', { detail: e.message, duration: 8000 });
+      }
+      setLoading(false);
+    };
+
+    useEffect(() => { if (open && host) { load(); } }, [open, host, logName, severity]);
+
+    if (!open || !host) return null;
+
+    return (
+      <Modal open={open} onClose={onClose} title={`PC Log — ${host.hostname}`} subtitle={`${host.ipAddress || '—'} · Windows Event Log`} size="xl"
+        footer={<>
+          <ActionButton variant="secondary" onClick={load} icon="RefreshCw" disabled={loading}>{loading ? 'Loading…' : 'Refresh'}</ActionButton>
+          <ActionButton variant="primary" onClick={onClose}>Close</ActionButton>
+        </>}>
+        <div className="space-y-3">
+          <div className="grid grid-cols-3 gap-2">
+            <FormField label="Log Name">
+              <Select value={logName} onChange={e => setLogName(e.target.value)}>
+                <option value="System">System</option>
+                <option value="Application">Application</option>
+                <option value="Security">Security</option>
+                <option value="Setup">Setup</option>
+                <option value="HardwareEvents">Hardware Events</option>
+                <option value="Windows PowerShell">PowerShell</option>
+              </Select>
+            </FormField>
+            <FormField label="Severity">
+              <Select value={severity} onChange={e => setSeverity(e.target.value)}>
+                <option value="All">All Levels</option>
+                <option value="Error">Error Only</option>
+                <option value="Warning">Warning Only</option>
+                <option value="Information">Information Only</option>
+              </Select>
+            </FormField>
+            <FormField label="Max Events">
+              <Select value={maxEvents} onChange={e => setMaxEvents(parseInt(e.target.value))}>
+                <option value={50}>Last 50</option>
+                <option value={100}>Last 100</option>
+                <option value={250}>Last 250</option>
+                <option value={500}>Last 500</option>
+              </Select>
+            </FormField>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3" style={{ minHeight: '320px' }}>
+            <div className="border border-border rounded overflow-y-auto" style={{ maxHeight: '380px' }}>
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-surface-raised border-b border-border">
+                  <tr>
+                    <th className="px-2 py-1.5 text-left text-meta text-text-dim uppercase">Time</th>
+                    <th className="px-2 py-1.5 text-left text-meta text-text-dim uppercase">Level</th>
+                    <th className="px-2 py-1.5 text-left text-meta text-text-dim uppercase">Source</th>
+                    <th className="px-2 py-1.5 text-left text-meta text-text-dim uppercase">ID</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {loading && (
+                    <tr><td colSpan="4" className="p-4 text-center text-text-dim">Loading…</td></tr>
+                  )}
+                  {!loading && events.length === 0 && (
+                    <tr><td colSpan="4" className="p-4 text-center text-text-dim">No events found.</td></tr>
+                  )}
+                  {!loading && events.map((e, i) => (
+                    <tr key={i} onClick={() => setSelectedEvent(e)} className={`border-b border-border/50 cursor-pointer hover:bg-surface-raised ${selectedEvent === e ? 'bg-primary/10' : ''}`}>
+                      <td className="px-2 py-1 text-text-dim text-[10px] whitespace-nowrap font-mono">{e.TimeCreated ? new Date(e.TimeCreated).toLocaleString() : '—'}</td>
+                      <td className="px-2 py-1">
+                        <span className={`px-1.5 py-0.5 text-[10px] rounded font-medium ${
+                          e.LevelDisplayName === 'Error' ? 'bg-danger/15 text-danger' :
+                          e.LevelDisplayName === 'Warning' ? 'bg-warning/15 text-warning' :
+                          e.LevelDisplayName === 'Information' ? 'bg-info/15 text-info' :
+                          'bg-surface-raised text-text-dim'
+                        }`}>{e.LevelDisplayName || '—'}</span>
+                      </td>
+                      <td className="px-2 py-1 text-text truncate max-w-[180px]" title={e.ProviderName}>{e.ProviderName || '—'}</td>
+                      <td className="px-2 py-1 text-text-dim font-mono text-[10px]">{e.Id || '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="border border-border rounded p-3 overflow-y-auto bg-surface-raised" style={{ maxHeight: '380px' }}>
+              {selectedEvent ? (
+                <div className="space-y-2 text-xs">
+                  <div><span className="text-text-dim">Time:</span> <span className="font-mono text-text">{selectedEvent.TimeCreated ? new Date(selectedEvent.TimeCreated).toLocaleString() : '—'}</span></div>
+                  <div><span className="text-text-dim">Level:</span> <span className="text-text">{selectedEvent.LevelDisplayName || '—'}</span></div>
+                  <div><span className="text-text-dim">Source:</span> <span className="text-text">{selectedEvent.ProviderName || '—'}</span></div>
+                  <div><span className="text-text-dim">Event ID:</span> <span className="font-mono text-text">{selectedEvent.Id || '—'}</span></div>
+                  <div className="pt-2 border-t border-border">
+                    <div className="text-text-dim mb-1">Message:</div>
+                    <pre className="text-text whitespace-pre-wrap font-mono text-[11px]">{selectedEvent.Message || '(no message)'}</pre>
+                  </div>
+                </div>
+              ) : (
+                <div className="text-text-dim text-xs italic flex items-center justify-center h-full">Select an event from the list to view its details</div>
+              )}
+            </div>
+          </div>
+        </div>
+      </Modal>
+    );
+  };
 
   // ============================================================
   // DEPLOY PACKAGE MODAL — Install MSI/EXE/PS1 on selected hosts

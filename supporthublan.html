@@ -1643,7 +1643,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v1.4.9';
+  const APP_VERSION = 'v1.4.10';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -1698,18 +1698,22 @@
 
     return (
       <header className="flex items-center justify-between gap-3 px-3 h-14 bg-surface border-b border-border flex-shrink-0">
-        {/* Left: Logo + Name */}
+        {/* Left: Logo + Name — clicking the logo navigates to the dashboard */}
         <div className="flex items-center gap-2">
           <IconButton icon="Menu" onClick={onMenuToggle} title="Toggle sidebar" />
-          <div className="flex items-center gap-2">
+          <button
+            onClick={() => navigate('dashboard')}
+            title="Go to Dashboard"
+            className="flex items-center gap-2 hover:opacity-80 transition-opacity rounded"
+          >
             <div className="w-8 h-8 rounded-md bg-primary flex items-center justify-center">
               <Icon name="Grid3x3" size={18} className="text-white" />
             </div>
-            <div className="hidden sm:block">
+            <div className="hidden sm:block text-left">
               <div className="text-sm font-bold text-text leading-tight">SupportHubLAN</div>
               <div className="text-[10px] text-text-dim leading-tight">Windows Endpoint Administration</div>
             </div>
-          </div>
+          </button>
         </div>
 
         {/* Center: Global Search */}

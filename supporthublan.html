@@ -737,6 +737,12 @@
     { id: 'cmd13', name: 'PsFile — Open Files', description: 'Show files opened remotely', language: 'CMD', code: 'psfile \\\\{host}', parameters: [], runScope: 'remote', timeout: 15, tags: ['pstools', 'psfile'], createdBy: 's.patel', usageCount: 22, lastRun: '2026-06-16T14:00:00Z' },
     { id: 'cmd14', name: 'PsGetSid — Computer SID', description: 'Get the SID of a remote computer', language: 'CMD', code: 'psgetsid \\\\{host}', parameters: [], runScope: 'remote', timeout: 15, tags: ['pstools', 'psgetsid'], createdBy: 'm.chen', usageCount: 18, lastRun: '2026-06-15T10:00:00Z' },
     { id: 'cmd15', name: 'PsShutdown — Reboot', description: 'Reboot remote system with 5 second warning', language: 'CMD', code: 'psshutdown \\\\{host} -r -t 5 -c', parameters: [], runScope: 'remote', timeout: 15, tags: ['pstools', 'psshutdown'], createdBy: 'j.martin', usageCount: 29, lastRun: '2026-06-13T23:00:00Z' },
+    { id: 'cmd16', name: 'Send Message to User', description: 'Display a popup message on the remote user screen via PsExec', language: 'CMD', code: 'psexec \\\\{host} msg * "Message from IT Support: Please save your work."', parameters: [], runScope: 'remote', timeout: 15, tags: ['pstools', 'message', 'chat'], createdBy: 'j.martin', usageCount: 14, lastRun: '2026-06-18T11:00:00Z' },
+    { id: 'cmd17', name: 'Get Windows Update Log', description: 'Generate and retrieve the Windows Update log', language: 'CMD', code: 'psexec \\\\{host} -s powershell -Command "Get-WindowsUpdateLog -LogPath C:\\WULog.txt; type C:\\WULog.txt"', parameters: [], runScope: 'remote', timeout: 120, tags: ['updates', 'log'], createdBy: 'm.chen', usageCount: 8, lastRun: '2026-06-15T14:00:00Z' },
+    { id: 'cmd18', name: 'Check Disk Space (PsExec)', description: 'Check free disk space via PsExec', language: 'CMD', code: 'psexec \\\\{host} -s fsutil volume diskfree C:', parameters: [], runScope: 'remote', timeout: 15, tags: ['pstools', 'disk'], createdBy: 's.patel', usageCount: 42, lastRun: '2026-06-19T10:00:00Z' },
+    { id: 'cmd19', name: 'Get Installed Programs', description: 'List installed programs from registry', language: 'CMD', code: 'psexec \\\\{host} -s reg query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall /s /v DisplayName', parameters: [], runScope: 'remote', timeout: 30, tags: ['pstools', 'inventory'], createdBy: 'j.martin', usageCount: 35, lastRun: '2026-06-17T09:00:00Z' },
+    { id: 'cmd20', name: 'Enable RDP Remotely', description: 'Enable Remote Desktop on remote host via PsExec', language: 'CMD', code: 'psexec \\\\{host} -s reg add "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f', parameters: [], runScope: 'remote', timeout: 15, tags: ['pstools', 'rdp', 'remote'], createdBy: 'j.martin', usageCount: 23, lastRun: '2026-06-14T16:00:00Z' },
+    { id: 'cmd21', name: 'Get Event Log Errors', description: 'Get last 10 error events from System log', language: 'CMD', code: 'psexec \\\\{host} -s powershell -Command "Get-EventLog -LogName System -EntryType Error -Newest 10 | Format-Table TimeGenerated,Source,Message -AutoSize"', parameters: [], runScope: 'remote', timeout: 30, tags: ['pstools', 'eventlog'], createdBy: 'm.chen', usageCount: 19, lastRun: '2026-06-16T13:00:00Z' },
   ];
 
   // Recent command executions
@@ -1346,6 +1352,7 @@
                     onClick={() => onRowClick && onRowClick(row)}
                     onContextMenu={(e) => { if (onContextMenu) { e.preventDefault(); onContextMenu(e, row); } }}
                     className={`border-b border-border/50 hover:bg-surface-raised transition-colors ${isSelected ? 'bg-primary/5' : ''} ${onRowClick ? 'cursor-pointer' : ''}`}
+                    style={isSelected ? { boxShadow: 'inset 2px 0 0 #4f83ff' } : (row._rowColor ? { boxShadow: `inset 3px 0 0 ${row._rowColor}`, background: row._rowColor + '10' } : undefined)}
                     style={isSelected ? { boxShadow: 'inset 2px 0 0 #4f83ff' } : undefined}
                   >
                     {selectable && (
@@ -2867,6 +2874,14 @@
                 { icon: 'Terminal', label: 'Script', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } navigate('scripts'); }, disabled: selectedIds.length === 0 },
                 { icon: 'Activity', label: 'Services', onClick: () => navigate('services') },
               ]},
+              { label: 'Row Color', items: [
+                { icon: 'Palette', label: 'None', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: undefined } : h)); toast.info('Row color cleared.'); }, disabled: selectedIds.length === 0 },
+                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#4f83ff' } : h)); toast.info('Rows colored blue.'); }, disabled: selectedIds.length === 0 },
+                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#22c55e' } : h)); toast.info('Rows colored green.'); }, disabled: selectedIds.length === 0 },
+                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#ef4444' } : h)); toast.info('Rows colored red.'); }, disabled: selectedIds.length === 0 },
+                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#f59e0b' } : h)); toast.info('Rows colored orange.'); }, disabled: selectedIds.length === 0 },
+                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#a855f7' } : h)); toast.info('Rows colored purple.'); }, disabled: selectedIds.length === 0 },
+              ]},
               { label: 'Data', items: [
                 { icon: 'Download', label: 'Export', onClick: () => { const csv = ['hostname,ipAddress,osName,patchState,onlineStatus,site,owner'].concat(hosts.filter(h => selectedIds.length === 0 || selectedIds.includes(h.id)).map(h => [h.hostname, h.ipAddress, h.osName, h.patchState, h.onlineStatus, h.site, h.owner].join(','))).join('\n'); const blob = new Blob([csv], { type: 'text/csv' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'hosts-export.csv'; a.click(); URL.revokeObjectURL(url); toast.success('Exported to CSV'); } },
                 { icon: 'Lock', label: '.bps', onClick: () => setShowGridFileModal({ mode: 'export' }) },
@@ -2910,6 +2925,10 @@
                       { icon: 'FileText', text: 'PsFile — Open Files', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `PsFile — ${h.hostname}`, targets: [h.id], step: 'Querying (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.psfile', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: { hostname: h.hostname }, result: 'success' }); toast.info(`Checking open files on ${h.hostname}…`); } },
                       { icon: 'Hash', text: 'PsGetSid — Get SID', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `PsGetSid — ${h.hostname}`, targets: [h.id], step: 'Querying (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.psgetsid', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: { hostname: h.hostname }, result: 'success' }); toast.info(`Getting SID for ${h.hostname}…`); } },
                       { icon: 'Power', text: 'PsShutdown — Reboot', danger: true, onClick: () => { executePowerAction({ action: 'reboot', targetIds: [h.id] }); toast.success(`PsShutdown reboot sent to ${h.hostname}`); } },
+                      { icon: 'RefreshCw', text: 'Check Pending Reboot + Reboot if Req', onClick: () => { if (h.pendingReboot) { executePowerAction({ action: 'reboot', targetIds: [h.id] }); toast.success(`${h.hostname} had pending reboot — rebooting now.`); } else { toast.info(`${h.hostname} does not have a pending reboot flag.`); } } },
+                      { icon: 'MessageSquare', text: 'Send Message to User', onClick: () => { const msg = prompt('Enter message to display on remote screen:', 'IT Maintenance: Please save your work.'); if (msg) { addJob({ id: 'job-' + Date.now(), name: `Message — ${h.hostname}`, targets: [h.id], step: 'Sending (1/1)', progress: 50, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.message', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: { message: msg }, result: 'success' }); toast.success(`Message sent to ${h.hostname}`); } } },
+                      { icon: 'FileText', text: 'Get Windows Update Log', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `WU Log — ${h.hostname}`, targets: [h.id], step: 'Generating (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); toast.info(`Generating Windows Update log for ${h.hostname}…`); } },
+                      { icon: 'Lock', text: 'Enable RDP Remotely', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `Enable RDP — ${h.hostname}`, targets: [h.id], step: 'Enabling (1/1)', progress: 50, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.enable-rdp', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: {}, result: 'success' }); toast.success(`RDP enabled on ${h.hostname}`); } },
                     ],
                   });
                 }}
@@ -3005,6 +3024,13 @@
     const [csvData, setCsvData] = useState(null); // { headers, rows }
     const [columnMapping, setColumnMapping] = useState({ hostname: '', ipAddress: '', macAddress: '', site: '', department: '', owner: '', notes: '' });
 
+    // AD Import state
+    const [adOUPath, setAdOUPath] = useState('OU=Computers,DC=corp,DC=local');
+    const [adSearchScope, setAdSearchScope] = useState('subtree');
+    const [adFilter, setAdFilter] = useState('');
+    const [adNameAttr, setAdNameAttr] = useState('cn');
+    const [adIncludeIP, setAdIncludeIP] = useState(true);
+
     useEffect(() => { if (open) { setStep(0); setMethod('single'); setEntries([{ hostname: '', ipAddress: '', macAddress: '' }]); setPasteText(''); setTag(''); setOwner(''); setNotes(''); setScanResults([]); setCsvData(null); } }, [open]);
 
     const steps = [{ label: 'Input Method' }, { label: 'Host Details' }, { label: 'Assignment' }];
@@ -3098,11 +3124,16 @@
           return h;
         }).filter(Boolean);
       }
-      if (method === 'ad' || method === 'mac') {
-        const lines = pasteText.split('\n').map(l => l.trim()).filter(Boolean);
-        return lines.map(line => {
-          const parts = line.split(',').map(s => s.trim());
-          return parts[0] ? baseHost(parts[0], parts[1] || '', parts[2] || '') : null;
+      if (method === 'ad') {
+        return pasteText.split('\n').map(l => l.trim()).filter(Boolean).map(line => {
+          const [hostname, ip] = line.split(',').map(s => s.trim());
+          return hostname ? baseHost(hostname, ip || '', '') : null;
+        }).filter(Boolean);
+      }
+      if (method === 'mac') {
+        return pasteText.split('\n').map(l => l.trim()).filter(Boolean).map(line => {
+          const mac = line.trim();
+          return mac ? baseHost(`HOST-${mac.replace(/[:]/g, '')}`, '', mac) : null;
         }).filter(Boolean);
       }
       return [];
@@ -3328,9 +3359,61 @@
           </div>
         )}
 
-        {step === 1 && (method === 'ad' || method === 'mac') && (
-          <FormField label={method === 'ad' ? 'Paste AD Computer Names (one per line)' : 'Paste MAC Addresses (one per line)'} hint={method === 'ad' ? 'Simulated AD import — paste hostnames' : 'One MAC per line for WoL hosts'}>
-            <Textarea rows={6} value={pasteText} onChange={(e) => setPasteText(e.target.value)} placeholder={method === 'ad' ? 'SRV-APP-01\nSRV-APP-02' : '00:1A:2B:3C:4D:01\n00:1A:2B:3C:4D:02'} className="font-mono text-[11px]" />
+        {step === 1 && method === 'ad' && (
+          <div className="space-y-3">
+            <div className="p-3 bg-info/10 border border-info/30 rounded text-xs text-info">
+              <Icon name="Info" size={12} className="inline mr-1.5" />
+              Import computers from Active Directory. Enter the AD OU path or LDAP filter to search for computer objects.
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <FormField label="AD OU Path (LDAP Distinguished Name)" hint="e.g. OU=Computers,DC=corp,DC=local" className="md:col-span-2">
+                <Input value={adOUPath} onChange={e => setAdOUPath(e.target.value)} placeholder="OU=Computers,DC=corp,DC=local" className="font-mono text-[11px]" />
+              </FormField>
+              <FormField label="Search Scope"><Select value={adSearchScope} onChange={e => setAdSearchScope(e.target.value)}><option value="subtree">Subtree (search all child OUs)</option><option value="onelevel">One Level (direct children only)</option><option value="base">Base (only this OU)</option></Select></FormField>
+              <FormField label="Filter (optional)" hint="LDAP filter, e.g. (objectCategory=computer)"><Input value={adFilter} onChange={e => setAdFilter(e.target.value)} placeholder="(objectCategory=computer)" className="font-mono text-[11px]" /></FormField>
+              <FormField label="Name Attribute"><Select value={adNameAttr} onChange={e => setAdNameAttr(e.target.value)}><option value="cn">cn (Common Name)</option><option value="name">name</option><option value="dNSHostName">dNSHostName (FQDN)</option><option value="sAMAccountName">sAMAccountName</option></Select></FormField>
+              <FormField label="Include IP Address"><Select value={adIncludeIP ? 'yes' : 'no'} onChange={e => setAdIncludeIP(e.target.value === 'yes')}><option value="yes">Yes — resolve hostname to IP</option><option value="no">No — hostname only</option></Select></FormField>
+            </div>
+            <div className="flex gap-2">
+              <ActionButton variant="primary" size="sm" icon="Search" onClick={async () => {
+                if (!adOUPath) { toast.warning('Enter an AD OU path.'); return; }
+                toast.info(`Searching AD: ${adOUPath}…`);
+                // Try real API
+                if (window.SupportHubLANAPI) {
+                  try {
+                    const result = await fetch((window.SUPPORTHUBLAN_API_URL || 'http://localhost:3137') + '/api/hosts/discover-ad', {
+                      method: 'POST', headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ ouPath: adOUPath, searchScope: adSearchScope, filter: adFilter, nameAttr: adNameAttr })
+                    });
+                    const data = await result.json();
+                    if (data.success && data.hosts) {
+                      setPasteText(data.hosts.map(h => `${h.name},${h.ip || ''}`).join('\n'));
+                      toast.success(`Found ${data.hosts.length} computers in AD.`);
+                      return;
+                    }
+                  } catch (e) {}
+                }
+                // Demo: simulate AD results
+                const demoHosts = ['DC01-HQ','DC02-HQ','FS01-HQ','SQL01-HQ','IIS01-HQ','WS001-ENG','WS002-ENG','WS003-FIN','WS004-SAL','WS005-HR','NYC-DC01','NYC-FS01','LON-DC01','LON-SQL01','TKY-WS001'];
+                setPasteText(demoHosts.join('\n'));
+                toast.success(`Found ${demoHosts.length} computers in AD (demo).`);
+              }}>Search AD</ActionButton>
+              <ActionButton variant="secondary" size="sm" icon="Network" onClick={() => setAdOUPath('OU=Computers,DC=corp,DC=local')}>Use Default OU</ActionButton>
+            </div>
+            {pasteText && (
+              <div>
+                <div className="text-meta text-text-dim uppercase mb-1">AD Search Results ({pasteText.split('\n').filter(Boolean).length} computers found)</div>
+                <div className="max-h-40 overflow-y-auto p-2 bg-surface-raised rounded border border-border font-mono text-[10px] text-text-dim">
+                  {pasteText.split('\n').filter(Boolean).map((line, i) => <div key={i}>{line}</div>)}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {step === 1 && method === 'mac' && (
+          <FormField label="Paste MAC Addresses" hint="One MAC per line for WoL hosts">
+            <Textarea rows={6} value={pasteText} onChange={(e) => setPasteText(e.target.value)} placeholder={'00:1A:2B:3C:4D:01\n00:1A:2B:3C:4D:02'} className="font-mono text-[11px]" />
           </FormField>
         )}
 
@@ -5240,6 +5323,10 @@
         { type: 'psfile', label: 'PsFile — Open Files', desc: 'Show remotely opened files' },
         { type: 'psgetsid', label: 'PsGetSid — Get SID', desc: 'Get computer SID' },
         { type: 'pssuspend', label: 'PsSuspend — Suspend/Resume', desc: 'Suspend or resume a process' },
+        { type: 'psexec-msg', label: 'PsExec — Send Message', desc: 'Display popup message on remote user screen (msg *)' },
+        { type: 'psexec-enable-rdp', label: 'PsExec — Enable RDP', desc: 'Enable Remote Desktop on remote host' },
+        { type: 'psexec-wulog', label: 'PsExec — Get WU Log', desc: 'Generate and retrieve Windows Update log' },
+        { type: 'laps-rotate', label: 'LAPS — Rotate Password', desc: 'Trigger local admin password rotation' },
       ],
     },
     'control': {
@@ -6268,6 +6355,7 @@
             { id: 'users', label: 'Users & Roles', icon: 'Users' },
             { id: 'retention', label: 'Retention', icon: 'Archive' },
             { id: 'appearance', label: 'Appearance', icon: 'Palette' },
+            { id: 'laps', label: 'LAPS', icon: 'ShieldCheck' },
             { id: 'grid-protection', label: 'Grid Protection', icon: 'Lock' },
             { id: 'production', label: 'Production Mode', icon: 'Server' },
             { id: 'api', label: 'API Keys', icon: 'Key' },
@@ -6559,6 +6647,39 @@
           </SectionCard>
         )}
 
+        {activeTab === 'laps' && (
+          <SectionCard title="LAPS — Local Admin Password Solution" description="Manage local administrator passwords on remote hosts via PsTools">
+            <div className="space-y-3">
+              <div className="p-3 bg-info/10 border border-info/30 rounded text-xs text-info">
+                <Icon name="Info" size={12} className="inline mr-1.5" />
+                LAPS (Local Administrator Password Solution) rotates and manages local admin passwords on Windows hosts. SupportHubLAN can trigger LAPS password rotation and retrieve current passwords via PsExec.
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <FormField label="AD Domain for LAPS"><Input defaultValue="corp.local" className="font-mono" /></FormField>
+                <FormField label="AD Service Account"><Input defaultValue="CORP\svc-laps" className="font-mono" /></FormField>
+                <FormField label="Password Complexity"><Select defaultValue="complex"><option value="complex">Complex (recommended)</option><option value="standard">Standard</option></Select></FormField>
+                <FormField label="Password Length"><Input type="number" defaultValue={12} /></FormField>
+                <FormField label="Max Password Age (days)"><Input type="number" defaultValue={30} /></FormField>
+                <FormField label="Expiration Protection"><Select defaultValue="enabled"><option value="enabled">Enabled</option><option value="disabled">Disabled</option></Select></FormField>
+              </div>
+              <div className="mt-3 flex gap-2">
+                <ActionButton variant="primary" size="sm" icon="RefreshCw" onClick={() => {
+                  if (selectedIds.length === 0 && hosts.length > 0) { toast.warning('Select hosts from Inventory first.'); return; }
+                  addJob({ id: 'job-' + Date.now(), name: `LAPS Password Rotation — ${selectedIds.length || 'All'} hosts`, targets: selectedIds.length > 0 ? [...selectedIds] : hosts.filter(h => h.onlineStatus === 'online').map(h => h.id), step: 'Rotating (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' });
+                  appendAudit({ action: 'laps.rotate', actionCategory: 'Scripts', targetType: 'Host', targetIds: selectedIds, parameters: {}, result: 'success' });
+                  toast.success(`LAPS password rotation initiated on ${selectedIds.length} host(s).`);
+                }}>Rotate Passwords Now</ActionButton>
+                <ActionButton variant="secondary" size="sm" icon="Key" onClick={() => {
+                  if (selectedIds.length === 0) { toast.warning('Select a host first.'); return; }
+                  appendAudit({ action: 'laps.retrieve', actionCategory: 'Scripts', targetType: 'Host', targetIds: selectedIds, parameters: {}, result: 'success' });
+                  toast.info(`Retrieving LAPS password for ${selectedIds.length} host(s)…`);
+                }}>Retrieve Passwords</ActionButton>
+                <ActionButton variant="secondary" size="sm" icon="Save" onClick={() => { appendAudit({ action: 'settings.laps-save', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: {}, result: 'success' }); toast.success('LAPS settings saved.'); }}>Save Settings</ActionButton>
+              </div>
+            </div>
+          </SectionCard>
+        )}
+
         {activeTab === 'grid-protection' && (
           <div className="space-y-4">
             <SectionCard title="Grid File Protection" description="Configure encryption for grid files saved to disk (.bps format)">
@@ -6751,6 +6872,8 @@
       { keys: 'Ctrl+K', desc: 'Focus global search (alt)' },
       { keys: 't', desc: 'Toggle dark / light theme' },
       { keys: 'Ctrl+B', desc: 'Toggle grid border style' },
+      { keys: 'Ctrl++', desc: 'Move selected row(s) up in grid' },
+      { keys: 'Ctrl+-', desc: 'Move selected row(s) down in grid' },
       { keys: 'g d', desc: 'Go to Dashboard' },
       { keys: 'g i', desc: 'Go to Inventory' },
       { keys: 'g u', desc: 'Go to Windows Updates' },
@@ -6831,6 +6954,9 @@
       { id: 'nr5', event: 'Compliance below threshold', frequency: 'Daily digest', recipients: 'All admins', enabled: false },
       { id: 'nr6', event: 'Scheduled task missed', frequency: 'Immediate', recipients: 'Operators', enabled: true },
       { id: 'nr7', event: 'Job completed', frequency: 'Daily digest', recipients: 'All admins', enabled: false },
+      { id: 'nr8', event: 'Host status audio alert', frequency: 'Immediate', recipients: 'Console', enabled: true },
+      { id: 'nr9', event: 'Host status email (online)', frequency: 'Immediate', recipients: 'All admins', enabled: false },
+      { id: 'nr10', event: 'Host status email (offline)', frequency: 'Immediate', recipients: 'All admins', enabled: true },
     ]));
     const [queueDraft, setQueueDraft] = useState(() => loadPersisted('queueDraft', {
       name: 'New Queue',

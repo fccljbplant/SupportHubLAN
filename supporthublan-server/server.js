@@ -112,6 +112,27 @@ app.get('/api/credentials', (req, res) => {
 });
 
 // ==========================================================================
+// ACTIVE DIRECTORY IMPORT — Discover computers from AD OU
+app.post('/api/hosts/discover-ad', async (req, res) => {
+  const { ouPath, searchScope, filter, nameAttr } = req.body;
+  const script = `
+    Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+    $searchBase = '${ouPath || 'OU=Computers,DC=corp,DC=local'}'
+    $scope = '${searchScope || 'subtree'}'
+    $filter = '${filter || 'objectCategory=computer'}'
+    $nameAttr = '${nameAttr || 'cn'}'
+    try {
+      $computers = Get-ADComputer -Filter $filter -SearchBase $searchBase -SearchScope $scope -Properties Name, DNSHostName, IPAddress, OperatingSystem
+      $results = $computers | Select-Object @{N='name';E={$_.$nameAttr}}, @{N='fqdn';E={$_.DNSHostName}}, @{N='ip';E={$_.IPAddress}}, @{N='os';E={$_.OperatingSystem}} | ConvertTo-Json -Compress
+      $results
+    } catch {
+      @{ error = $_.Exception.Message } | ConvertTo-Json -Compress
+    }
+  `;
+  const result = await runPowerShell(script, 30000);
+  res.json({ success: result.success, hosts: result.stdout, error: result.stderr });
+});
+
 // HOST OPERATIONS — Real system queries to remote hosts
 // ==========================================================================
 

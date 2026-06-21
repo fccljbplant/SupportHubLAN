@@ -84,26 +84,23 @@ module.exports = function(db) {
   // HARDWARE INFO — Pure PsTools approach using psinfo + psloggedon.
   //
   // PsTools commands used:
-  //   1. psinfo.exe -d -h -s \\HOST  → system info + disk volumes + hotfixes + software
-  //   2. psloggedon.exe \\HOST       → currently logged-on user
+  //   1. psinfo.exe -d -h -s -c \\HOST  → system info + disk volumes + hotfixes + software (CSV format)
+  //   2. psloggedon.exe \\HOST          → currently logged-on user
   //
-  // psinfo provides:
-  //   - System manufacturer, model, type
-  //   - OS name, version, build, install date
-  //   - Processor name, speed, count
-  //   - Total physical memory
-  //   - Video driver (GPU name)
-  //   - Disk volumes (drive, type, format, label, size, free)
-  //   - Installed hotfixes (KB numbers)
-  //   - Installed software (names)
+  // psinfo flags:
+  //   -d  Display disk volume details (drive, format, size, free)
+  //   -h  List installed Windows hotfixes
+  //   -s  List installed software applications
+  //   -c  Output in CSV format (MUCH easier to parse than column-aligned text)
   //
-  // No wmic, no PowerShell, no ipconfig — just native PsTools.
+  // CSV format handles commas in values via quoting, so we don't have to guess
+  // field boundaries. No wmic, no PowerShell — just native PsTools.
   // ===========================================================================
   router.post('/:hostname/hardware', async (req, res) => {
     const safeHost = sanitizeHost(req.params.hostname);
     try {
       const [psinfoRes, loggedOnRes] = await Promise.all([
-        runPsToolDirect('psinfo.exe', ['-d', '-h', '-s', '\\\\' + safeHost], 30000),
+        runPsToolDirect('psinfo.exe', ['-d', '-h', '-s', '-c', '\\\\' + safeHost], 30000),
         runPsToolDirect('psloggedon.exe', ['\\\\' + safeHost], 15000),
       ]);
 
@@ -514,87 +511,154 @@ function parseRegUninstall(raw) {
 }
 
 // ---------------------------------------------------------------------------
-// parsePsInfoOutput — parse `psinfo -d -h -s \\HOST` output into a structured
-// hardware object.
+// parsePsInfoOutput — parse `psinfo -d -h -s -c \\HOST` CSV output into a
+// structured hardware object.
 //
-// ACTUAL PsInfo v1.79 output format (from user's machine):
+// With the -c flag, PsInfo outputs CSV format. Fields containing commas
+// (like "Windows 10 Enterprise, Multipoint Free") are quoted.
+//
+// CSV output structure (sections separated by blank lines):
 //
 //   PsInfo v1.79 - Local and remote system information viewer
 //   Copyright (C) 2001-2023 Mark Russinovich
 //   Sysinternals - www.sysinternals.com
 //
-//   System information for \\DESKTOP-TFF7VU4:
-//   Uptime:                    0 days 5 hours 9 minutes 31 seconds
-//   Kernel version:            Windows 10 Enterprise, Multipoint Free
-//   Product type:              Professional
-//   Product version:           6.3
-//   Service pack:              0
-//   Kernel build number:       26100
-//   Registered organization:
-//   Registered owner:          Nauman
-//   IE version:                9.0000
-//   System root:               C:\Windows
-//   Processors:                8
-//   Processor speed:           2.1 GHz
-//   Processor type:            Intel(R) Core(TM) i7-8650U CPU @
-//   Physical memory:           3940 MB
-//   Video driver:              Intel(R) UHD Graphics 620
-//   Volume Type       Format     Label                      Size       Free   Free
-//       C: Fixed      NTFS       Windows               199.79 GB   68.52 GB  34.3%
-//       D: Fixed      NTFS                             276.93 GB  196.72 GB  71.0%
+//   Field,Value
+//   "System information for","\\DESKTOP-TFF7VU4"
+//   "Uptime","0 days 5 hours 9 minutes 31 seconds"
+//   "Kernel version","Windows 10 Enterprise, Multipoint Free"
+//   "Product type","Professional"
+//   ...
+//   "Processors","8"
+//   "Processor speed","2.1 GHz"
+//   "Processor type","Intel(R) Core(TM) i7-8650U CPU @"
+//   "Physical memory","3940 MB"
+//   "Video driver","Intel(R) UHD Graphics 620"
 //
-//   Installed     HotFix
-//   n/a           Internet Explorer - 0
-//   Applications:
+//   Volume,Type,Format,Label,Size,Free,Free%
+//   "C:","Fixed","NTFS","Windows","199.79 GB","68.52 GB","34.3%"
+//   "D:","Fixed","NTFS","","276.93 GB","196.72 GB","71.0%"
+//
+//   Hotfix
+//   KB5031356
+//
+//   Application
 //   Adobe Refresh Manager 1.8.0
 //   CADReader v3.7.4.21
-//   ...
-//
-// KEY DIFFERENCES from the old (wrong) assumptions:
-//   1. Key-value lines are NOT indented (start at column 0)
-//   2. Disk sizes use DECIMALS: "199.79 GB" not "475 GB"
-//   3. There is NO "Disk Volumes:" header — the volume table starts with
-//      a "Volume Type Format Label Size Free Free" header line
-//   4. Software section is labeled "Applications:" not "Software:"
-//   5. Hotfix section is labeled "Installed HotFix" not "Hotfixes:"
-//   6. "Processors: 8" is actually the THREAD count (logical processors),
-//      not the physical processor count
 // ---------------------------------------------------------------------------
+
+// Helper: parse a single CSV line, handling quoted fields with commas.
+function parseCsvLine(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') {
+      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
+      else { inQuotes = !inQuotes; }
+    } else if (c === ',' && !inQuotes) {
+      result.push(current);
+      current = '';
+    } else {
+      current += c;
+    }
+  }
+  result.push(current);
+  return result.map(s => s.trim());
+}
+
 function parsePsInfoOutput(raw, fallbackHost) {
   const out = (raw || '').replace(/\r/g, '');
   const lines = out.split('\n');
-  const kv = {};
 
-  // Parse key-value pairs. PsInfo lines look like:
-  //   "Kernel version:            Windows 10 Enterprise, Multipoint Free"
-  //   "Registered owner:          Nauman"
-  // Key is at start of line (no leading whitespace), followed by ":", then
-  // whitespace, then value. Allow optional leading whitespace just in case.
-  for (const line of lines) {
-    // Match: "Key:    Value" — key starts at column 0 (or after whitespace),
-    // key can contain letters, spaces, parentheses, digits
-    const m = /^\s*([A-Za-z][A-Za-z ()0-9./]+?):\s+(.*)$/.exec(line);
-    if (m) {
-      const key = m[1].trim().toLowerCase();
-      const val = m[2].trim();
-      if (val !== '' && !(key in kv)) kv[key] = val;
+  const kv = {};        // key-value pairs from the "Field,Value" section
+  const logicalDisks = []; // volume entries
+  const hotfixes = [];     // KB numbers
+  const software = [];     // application names
+
+  // State machine: track which CSV section we're in
+  let section = 'header'; // 'header' | 'kv' | 'volumes' | 'hotfixes' | 'software'
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    // Skip empty lines and PsInfo banner
+    if (!trimmed) { continue; }
+    if (/^PsInfo v/i.test(trimmed)) { continue; }
+    if (/^Copyright/i.test(trimmed)) { continue; }
+    if (/^Sysinternals/i.test(trimmed)) { continue; }
+
+    // Detect section transitions
+    // Key-value section: header row "Field,Value"
+    if (/^Field\s*,\s*Value/i.test(line)) { section = 'kv'; continue; }
+    // Volume section: header row "Volume,Type,Format,..."
+    if (/^Volume\s*,\s*Type\s*,\s*Format/i.test(line)) { section = 'volumes'; continue; }
+    // Hotfix section: header "Hotfix" or "Installed,HotFix"
+    if (/^Hotfix\s*$/i.test(trimmed) || /^Installed\s*,?\s*HotFix/i.test(line)) { section = 'hotfixes'; continue; }
+    // Software section: header "Application" or "Applications:"
+    if (/^Application/i.test(trimmed) && !/,/.test(line)) { section = 'software'; continue; }
+
+    // Parse line based on current section
+    if (section === 'kv') {
+      const fields = parseCsvLine(line);
+      if (fields.length >= 2 && fields[0]) {
+        const key = fields[0].toLowerCase();
+        const val = fields[1] || '';
+        if (val && !(key in kv)) kv[key] = val;
+      }
+    } else if (section === 'volumes') {
+      const fields = parseCsvLine(line);
+      // Expected: Volume, Type, Format, Label, Size, Free, Free%
+      if (fields.length >= 6 && /^[A-Z]:/i.test(fields[0])) {
+        const sizeMatch = /([\d.]+)\s*(GB|MB|TB)/i.exec(fields[4] || '');
+        const freeMatch = /([\d.]+)\s*(GB|MB|TB)/i.exec(fields[5] || '');
+        let sizeGB = 0, freeGB = 0;
+        if (sizeMatch) {
+          const n = parseFloat(sizeMatch[1]);
+          const u = sizeMatch[2].toUpperCase();
+          sizeGB = u === 'TB' ? n * 1024 : n;
+        }
+        if (freeMatch) {
+          const n = parseFloat(freeMatch[1]);
+          const u = freeMatch[2].toUpperCase();
+          freeGB = u === 'TB' ? n * 1024 : n;
+        }
+        logicalDisks.push({
+          drive: fields[0],
+          sizeGB: Math.round(sizeGB * 100) / 100,
+          freeGB: Math.round(freeGB * 100) / 100,
+          fileSystem: fields[2] || '',
+          volumeName: fields[3] || '',
+        });
+      }
+    } else if (section === 'hotfixes') {
+      // Each line is a KB number (or "n/a,Description" for some entries)
+      const kbMatches = trimmed.match(/KB\d+/gi);
+      if (kbMatches) {
+        kbMatches.forEach(kb => hotfixes.push(kb.toUpperCase()));
+      }
+    } else if (section === 'software') {
+      // Each line is an application name (possibly CSV with extra fields)
+      const fields = parseCsvLine(line);
+      const name = fields[0] || trimmed;
+      if (name) software.push({ name });
     }
   }
 
-  // Extract hostname from "System information for \\HOST:"
+  // Extract hostname from "System information for" value
   let hostname = fallbackHost;
-  const hostLine = lines.find(l => /System information for/i.test(l));
-  if (hostLine) {
-    const m = /System information for\s+\\+([^\s:]+)/i.exec(hostLine);
-    if (m) hostname = m[1];
-  }
+  const sysInfo = kv['system information for'] || '';
+  const hostMatch = /\\+([^\s,]+)/.exec(sysInfo);
+  if (hostMatch) hostname = hostMatch[1];
 
   // Parse processor speed (e.g. "2.1 GHz")
   const procSpeed = kv['processor speed'] || '';
   const speedMatch = /([\d.]+)\s*GHz/i.exec(procSpeed);
   const maxSpeedMHz = speedMatch ? Math.round(parseFloat(speedMatch[1]) * 1000) : 0;
 
-  // Parse total RAM (e.g. "3940 MB" or "16384 MB")
+  // Parse total RAM (e.g. "3940 MB")
   const ramMatch = /(\d+)\s*(MB|GB|TB)/i.exec(kv['physical memory'] || '');
   let totalRamMB = 0;
   if (ramMatch) {
@@ -603,7 +667,7 @@ function parsePsInfoOutput(raw, fallbackHost) {
     totalRamMB = u === 'GB' ? n * 1024 : u === 'TB' ? n * 1024 * 1024 : n;
   }
 
-  // "Processors: 8" is actually the logical processor / thread count
+  // "Processors" = thread count (logical processors)
   const processorCount = parseInt(kv['processors'] || '0', 10);
 
   // Determine CPU manufacturer from processor type name
@@ -611,76 +675,6 @@ function parsePsInfoOutput(raw, fallbackHost) {
   let cpuManufacturer = '';
   if (/Intel/i.test(procName)) cpuManufacturer = 'Intel';
   else if (/AMD|Advanced Micro/i.test(procName)) cpuManufacturer = 'AMD';
-
-  // Parse disk volumes. The volume table starts AFTER the header line:
-  //   "Volume Type       Format     Label                      Size       Free   Free"
-  // Each volume line looks like:
-  //   "    C: Fixed      NTFS       Windows               199.79 GB   68.52 GB  34.3%"
-  // Note: sizes can be DECIMALS (199.79 GB). The label can be empty.
-  const logicalDisks = [];
-  let inVolumes = false;
-  for (const line of lines) {
-    // Detect the volume table header line
-    if (/^\s*Volume\s+Type\s+Format/i.test(line)) {
-      inVolumes = true;
-      continue;
-    }
-    // End of volume table: blank line, or start of another section
-    if (inVolumes) {
-      if (/^\s*$/.test(line)) { inVolumes = false; continue; }
-      if (/^\s*Installed\s+HotFix/i.test(line)) { inVolumes = false; continue; }
-      if (/^\s*Applications:/i.test(line)) { inVolumes = false; continue; }
-
-      // Match volume line with DECIMAL sizes:
-      //   "    C: Fixed      NTFS       Windows               199.79 GB   68.52 GB  34.3%"
-      //   "    D: Fixed      NTFS                             276.93 GB  196.72 GB  71.0%"
-      // Groups: 1=drive, 2=type, 3=format, 4=label(optional), 5=size, 6=sizeUnit, 7=free, 8=freeUnit
-      const m = /^\s*([A-Z]:)\s+(\S+)\s+(\S+)\s+(.*?)\s+([\d.]+)\s*(GB|MB|TB)\s+([\d.]+)\s*(GB|MB|TB)\s+([\d.]+)%/i.exec(line);
-      if (m) {
-        const sizeNum = parseFloat(m[5]);
-        const sizeUnit = m[6].toUpperCase();
-        const freeNum = parseFloat(m[7]);
-        const freeUnit = m[8].toUpperCase();
-        const sizeGB = sizeUnit === 'TB' ? sizeNum * 1024 : sizeNum;
-        const freeGB = freeUnit === 'TB' ? freeNum * 1024 : freeNum;
-        logicalDisks.push({
-          drive: m[1],
-          sizeGB: Math.round(sizeGB * 100) / 100,
-          freeGB: Math.round(freeGB * 100) / 100,
-          fileSystem: m[3],
-          volumeName: (m[4] || '').trim(),
-        });
-      }
-    }
-  }
-
-  // Parse hotfixes. The section starts with "Installed     HotFix" header
-  // and may contain lines like "n/a Internet Explorer - 0" or KB numbers.
-  const hotfixes = [];
-  let inHotfixes = false;
-  for (const line of lines) {
-    if (/^\s*Installed\s+HotFix/i.test(line)) { inHotfixes = true; continue; }
-    if (/^\s*Applications:/i.test(line)) { inHotfixes = false; continue; }
-    if (inHotfixes) {
-      // Look for KB numbers anywhere in the line
-      const kbMatches = line.match(/KB\d+/gi);
-      if (kbMatches) {
-        kbMatches.forEach(kb => hotfixes.push(kb.toUpperCase()));
-      }
-    }
-  }
-
-  // Parse software/applications. Section starts with "Applications:" header
-  // and continues to end of output.
-  const software = [];
-  let inSoftware = false;
-  for (const line of lines) {
-    if (/^\s*Applications:\s*$/i.test(line)) { inSoftware = true; continue; }
-    if (inSoftware) {
-      const trimmed = line.trim();
-      if (trimmed) software.push({ name: trimmed });
-    }
-  }
 
   // Build GPU array from video driver field
   const gpu = [];
@@ -690,7 +684,6 @@ function parsePsInfoOutput(raw, fallbackHost) {
     });
   }
 
-  // Build the structured hardware object matching the frontend's expectations
   return {
     hostname,
     scannedAt: new Date().toISOString(),
@@ -704,24 +697,24 @@ function parsePsInfoOutput(raw, fallbackHost) {
       totalRamMB,
     },
 
-    motherboard: {},  // psinfo doesn't provide this
-    bios: {},          // psinfo doesn't provide this
+    motherboard: {},
+    bios: {},
 
     processor: procName ? {
       name: procName,
       manufacturer: cpuManufacturer,
-      cores: 0,   // psinfo doesn't provide physical core count
-      threads: processorCount,  // "Processors: 8" = logical processors = threads
+      cores: 0,
+      threads: processorCount,
       maxSpeedMHz,
       currentSpeedMHz: maxSpeedMHz,
       socket: '',
       socketCount: 1,
     } : null,
 
-    memory: [],     // psinfo doesn't provide individual sticks
-    disks: [],      // psinfo doesn't provide physical disk details
+    memory: [],
+    disks: [],
     logicalDisks,
-    network: [],    // need ipconfig for this
+    network: [],
     gpu,
 
     os: {
@@ -738,8 +731,8 @@ function parsePsInfoOutput(raw, fallbackHost) {
 
     hotfixes,
     software,
-    loggedInUser: null, // filled by parsePsLoggedOnOutput
-    _source: 'psinfo+psloggedon',
+    loggedInUser: null,
+    _source: 'psinfo-csv+psloggedon',
   };
 }
 

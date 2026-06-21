@@ -1,7 +1,7 @@
 {
   "name": "supporthublan-server",
-  "version": "2.0.0",
-  "description": "SupportHubLAN Backend — Windows endpoint management via PsTools. Encrypted JSON storage, no native dependencies.",
+  "version": "4.0.0",
+  "description": "SupportHubLAN Backend — Modular Windows endpoint management via PsTools",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

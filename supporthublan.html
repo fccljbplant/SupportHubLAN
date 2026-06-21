@@ -1675,6 +1675,7 @@
 
   // ---- Top Header (56px) ----
   const TopHeader = ({ onMenuToggle, onLogout, currentUser }) => {
+    const toast = useToast();
     const { navigate, search, setSearch, hosts, activeJobs, theme, toggleTheme } = useApp();
     const [searchFocused, setSearchFocused] = useState(false);
     const searchRef = useRef(null);
@@ -2059,7 +2060,7 @@
 
   // Host drawer tab content
   const HostDrawerTab = ({ tab, host }) => {
-    const { activeJobs, hosts, updateHosts, addJob, appendAudit, executePowerAction, toast: _toast } = useApp();
+    const { activeJobs, hosts, updateHosts, addJob, appendAudit, executePowerAction } = useApp();
     const toast = useToast();
     const liveHost = hosts.find(h => h.id === host.id) || host;
     const [drawerData, setDrawerData] = useState(null);
@@ -2388,6 +2389,7 @@
 
   // ---- Status Bar (28px) ----
   const StatusBar = () => {
+    const toast = useToast();
     const { lastRefresh, setLastRefresh, activeJobs, updateJob, appendAudit } = useApp();
     const [backendStatus, setBackendStatus] = useState('checking');
     const [backendInfo, setBackendInfo] = useState(null);

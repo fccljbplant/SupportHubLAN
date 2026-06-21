@@ -1399,7 +1399,6 @@
                     onClick={() => onRowClick && onRowClick(row)}
                     onContextMenu={(e) => { if (onContextMenu) { e.preventDefault(); onContextMenu(e, row); } }}
                     className={`border-b border-border/50 hover:bg-surface-raised transition-colors ${isSelected ? 'bg-primary/5' : ''} ${onRowClick ? 'cursor-pointer' : ''}`}
-                    style={isSelected ? { boxShadow: 'inset 2px 0 0 #4f83ff' } : (row._rowColor ? { boxShadow: `inset 3px 0 0 ${row._rowColor}`, background: row._rowColor + '10' } : undefined)}
                     style={isSelected ? { boxShadow: 'inset 2px 0 0 #4f83ff' } : undefined}
                   >
                     {selectable && (
@@ -1587,10 +1586,11 @@
   ------------------------------------------------------------------------ */
   const ContextMenu = ({ x, y, items, onClose }) => {
     useEffect(() => {
-      const handler = () => onClose();
-      window.addEventListener('click', handler);
-      window.addEventListener('contextmenu', handler);
-      return () => { window.removeEventListener('click', handler); window.removeEventListener('contextmenu', handler); };
+      const clickHandler = () => onClose();
+      const contextHandler = (e) => { e.preventDefault(); onClose(); };
+      window.addEventListener('click', clickHandler);
+      window.addEventListener('contextmenu', contextHandler);
+      return () => { window.removeEventListener('click', clickHandler); window.removeEventListener('contextmenu', contextHandler); };
     }, [onClose]);
     // Adjust position if near edge
     const adjustedX = Math.min(x, window.innerWidth - 220);
@@ -3399,13 +3399,9 @@
                 { icon: 'Package', label: 'Install', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } setShowDeployModal(true); }, disabled: selectedIds.length === 0 },
                 { icon: 'Terminal', label: 'Run Cmd', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } setShowCommandModal(true); }, disabled: selectedIds.length === 0 },
               ]},
-              { label: 'Row Color', items: [
-                { icon: 'Palette', label: 'None', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: undefined } : h)); toast.info('Row color cleared.'); }, disabled: selectedIds.length === 0 },
-                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#4f83ff' } : h)); toast.info('Rows colored blue.'); }, disabled: selectedIds.length === 0 },
-                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#22c55e' } : h)); toast.info('Rows colored green.'); }, disabled: selectedIds.length === 0 },
-                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#ef4444' } : h)); toast.info('Rows colored red.'); }, disabled: selectedIds.length === 0 },
-                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#f59e0b' } : h)); toast.info('Rows colored orange.'); }, disabled: selectedIds.length === 0 },
-                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#a855f7' } : h)); toast.info('Rows colored purple.'); }, disabled: selectedIds.length === 0 },
+              { label: 'Manage', items: [
+                { icon: 'Edit', label: 'Edit', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select a host first.'); return; } if (selectedIds.length > 1) { toast.warning('Select only one host to edit.'); return; } const h = hosts.find(x => x.id === selectedIds[0]); if (h) setEditHost(h); }, disabled: selectedIds.length === 0 },
+                { icon: 'Trash', label: 'Delete', variant: 'danger', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } if (!confirm('Delete ' + selectedIds.length + ' host(s)? This cannot be undone.')) return; selectedIds.forEach(id => { const h = hosts.find(x => x.id === id); if (h) deleteHost(h); }); setSelectedIds([]); }, disabled: selectedIds.length === 0 },
               ]},
               { label: 'Data', items: [
                 { icon: 'Download', label: 'Export', onClick: () => { const csv = ['hostname,ipAddress,osName,patchState,onlineStatus,site,owner'].concat(hosts.filter(h => selectedIds.length === 0 || selectedIds.includes(h.id)).map(h => [h.hostname, h.ipAddress, h.osName, h.patchState, h.onlineStatus, h.site, h.owner].join(','))).join('\n'); const blob = new Blob([csv], { type: 'text/csv' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'hosts-export.csv'; a.click(); URL.revokeObjectURL(url); toast.success('Exported to CSV'); } },

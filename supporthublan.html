@@ -1993,15 +1993,13 @@
     let tabs = [];
     if (host) tabs = [
       { id: 'overview', label: 'Overview', icon: 'Info' },
-      { id: 'updates', label: 'Updates', icon: 'ShieldCheck' },
-      { id: 'deployments', label: 'Deployments', icon: 'Package' },
-      { id: 'jobs', label: 'Jobs', icon: 'ListOrdered' },
       { id: 'services', label: 'Services', icon: 'Activity' },
       { id: 'processes', label: 'Processes', icon: 'Cpu' },
       { id: 'logs', label: 'Event Logs', icon: 'FileText' },
+      { id: 'updates', label: 'Updates', icon: 'ShieldCheck' },
       { id: 'network', label: 'Network', icon: 'Network' },
-      { id: 'apps', label: 'Installed Apps', icon: 'Boxes' },
-      { id: 'audit', label: 'Audit Trail', icon: 'History' },
+      { id: 'apps', label: 'Apps', icon: 'Boxes' },
+      { id: 'audit', label: 'Audit', icon: 'History' },
     ];
     if (job) tabs = [
       { id: 'overview', label: 'Overview', icon: 'Info' },
@@ -2061,9 +2059,47 @@
 
   // Host drawer tab content
   const HostDrawerTab = ({ tab, host }) => {
-    const { activeJobs, hosts, updateHosts, addJob, appendAudit, executePowerAction } = useApp();
-    // Always read the freshest version of this host from state (so drawer updates after mutations)
+    const { activeJobs, hosts, updateHosts, addJob, appendAudit, executePowerAction, toast: _toast } = useApp();
+    const toast = useToast();
     const liveHost = hosts.find(h => h.id === host.id) || host;
+    const [drawerData, setDrawerData] = useState(null);
+    const [drawerLoading, setDrawerLoading] = useState(false);
+
+    // Generic fetch helper for drawer tabs
+    const fetchDrawerData = async (apiCall) => {
+      if (!window.SupportHubLANAPI) { setDrawerData(null); return; }
+      setDrawerLoading(true);
+      setDrawerData(null);
+      try {
+        const result = await apiCall();
+        if (result && result.success && !result.demo) {
+          let parsed = null;
+          if (result.data) { try { parsed = JSON.parse(result.data); } catch { parsed = result.data; } }
+          setDrawerData(Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []));
+        } else if (result && result.demo) {
+          setDrawerData([]);
+        } else {
+          setDrawerData([]);
+        }
+      } catch (e) { setDrawerData([]); }
+      setDrawerLoading(false);
+    };
+
+    useEffect(() => {
+      if (!liveHost?.hostname) return;
+      if (tab === 'services') fetchDrawerData(() => window.SupportHubLANAPI.getServices(liveHost.hostname, null));
+      else if (tab === 'processes') fetchDrawerData(() => window.SupportHubLANAPI.getProcesses(liveHost.hostname, null));
+      else if (tab === 'logs') fetchDrawerData(() => window.SupportHubLANAPI.getEventLog(liveHost.hostname, 'System', 30, 'All', null));
+      else if (tab === 'apps') fetchDrawerData(() => window.SupportHubLANAPI.pstoolsExecute('psexec', liveHost.hostname, '-s powershell -NoProfile -Command "Get-ItemProperty HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* | Where-Object DisplayName | Select-Object DisplayName,DisplayVersion,Publisher | ConvertTo-Json -Compress"'));
+      else if (tab === 'audit') fetchDrawerData(async () => {
+        const resp = await fetch(window.SUPPORTHUBLAN_API_URL + '/api/audit/search?q=' + encodeURIComponent(liveHost.hostname));
+        const json = await resp.json();
+        return { success: true, demo: false, data: JSON.stringify(json.data || []) };
+      });
+      else if (tab === 'updates') fetchDrawerData(() => window.SupportHubLANAPI.scanUpdates([liveHost.hostname], null));
+    }, [tab, liveHost?.hostname]);
+
+    // ---- OVERVIEW ----
     if (tab === 'overview') {
       const hw = liveHost._hardwareInfo;
       return (
@@ -2073,276 +2109,214 @@
             <StatusBadge variant={liveHost.patchState} />
             {liveHost.pendingReboot && <StatusBadge variant="reboot-pending" />}
           </div>
-
-          {/* Basic info */}
           <div className="grid grid-cols-2 gap-2 text-xs">
             {[
               ['Hostname', liveHost.hostname, true], ['FQDN', liveHost.fqdn, true],
               ['IP Address', liveHost.ipAddress, true], ['MAC Address', liveHost.macAddress, true],
               ['OS', liveHost.osName], ['OS Build', liveHost.osBuild],
               ['Site', liveHost.site], ['Department', liveHost.department],
-              ['Owner', liveHost.owner], ['Tags', liveHost.tags.map(t => <TagChip key={t} name={t} />)],
+              ['Owner', liveHost.owner], ['Tags', (liveHost.tags || []).map(t => <TagChip key={t} name={t} />)],
             ].map(([label, value, mono], i) => (
               <div key={i} className={label === 'Tags' ? 'col-span-2' : ''}>
                 <div className="text-meta text-text-dim uppercase">{label}</div>
-                <div className={`text-text ${mono ? 'font-mono' : ''} ${label === 'Tags' ? 'flex flex-wrap gap-1 mt-1' : ''}`}>{value || '—'}</div>
+                <div className={`text-text ${mono ? 'font-mono' : ''} ${label === 'Tags' ? 'flex flex-wrap gap-1 mt-1' : ''}`}>{value || '\u2014'}</div>
               </div>
             ))}
           </div>
-
-          {/* Full hardware info (if available) */}
           {hw ? (
             <div className="space-y-2">
-              <div className="text-meta text-text-dim uppercase">Hardware Details</div>
-
-              {/* System */}
-              <div className="p-2 bg-surface-raised rounded border border-border">
-                <div className="text-[10px] font-semibold text-text mb-1">System</div>
-                <div className="grid grid-cols-2 gap-1 text-[10px]">
-                  <div><span className="text-text-dim">Manufacturer:</span> <span className="text-text">{hw.system?.manufacturer || '—'}</span></div>
-                  <div><span className="text-text-dim">Model:</span> <span className="text-text">{hw.system?.model || '—'}</span></div>
-                  <div><span className="text-text-dim">Serial:</span> <span className="text-text font-mono">{hw.system?.serial || '—'}</span></div>
-                  <div><span className="text-text-dim">BIOS:</span> <span className="text-text">{hw.system?.biosVersion || '—'}</span></div>
-                  <div><span className="text-text-dim">Domain:</span> <span className="text-text">{hw.system?.domain || '—'}</span></div>
-                  <div><span className="text-text-dim">Managed by:</span> <span className="text-text">{hw.managedBy || '—'}</span></div>
-                </div>
+              <div className="text-meta text-text-dim uppercase">Hardware</div>
+              <div className="p-2 bg-surface-raised rounded border border-border text-[10px] space-y-1">
+                <div><span className="text-text-dim">System:</span> <span className="text-text">{hw.system?.manufacturer || '\u2014'} {hw.system?.model || ''}</span></div>
+                <div><span className="text-text-dim">Serial:</span> <span className="text-text font-mono">{hw.system?.serial || '\u2014'}</span></div>
+                <div><span className="text-text-dim">BIOS:</span> <span className="text-text">{hw.system?.biosVersion || '\u2014'}</span></div>
+                {hw.processors?.map((cpu, i) => <div key={i}><span className="text-text-dim">CPU{i+1}:</span> <span className="text-text">{cpu.name} ({cpu.cores}C/{cpu.logicalCores}T)</span></div>)}
+                {hw.memory?.length > 0 && <div><span className="text-text-dim">RAM:</span> <span className="text-text">{hw.memory.reduce((s,m) => s + (m.capacity||0), 0)} GB ({hw.memory.length} sticks)</span></div>}
+                {hw.disks?.map((d, i) => <div key={i}><span className="text-text-dim">Disk{i}:</span> <span className="text-text">{d.model} ({d.sizeGB}GB)</span></div>)}
+                <div><span className="text-text-dim">Logged in:</span> <span className="text-text">{hw.loggedInUser || 'None'}</span></div>
+                <div><span className="text-text-dim">Managed by:</span> <span className="text-text">{hw.managedBy || 'Not set'}</span></div>
               </div>
-
-              {/* Processors */}
-              {hw.processors && hw.processors.length > 0 && (
-                <div className="p-2 bg-surface-raised rounded border border-border">
-                  <div className="text-[10px] font-semibold text-text mb-1">Processors ({hw.processors.length})</div>
-                  {hw.processors.map((cpu, i) => (
-                    <div key={i} className="text-[10px] space-y-0.5">
-                      <div><span className="text-text">{cpu.name}</span></div>
-                      <div className="text-text-dim">{cpu.manufacturer} · {cpu.cores}C/{cpu.logicalCores}T · {cpu.maxSpeedMHz}MHz · {cpu.socket || 'N/A'}</div>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Memory */}
-              {hw.memory && hw.memory.length > 0 && (
-                <div className="p-2 bg-surface-raised rounded border border-border">
-                  <div className="text-[10px] font-semibold text-text mb-1">Memory ({hw.memory.length} sticks, {hw.memory.reduce((s, m) => s + (m.capacity || 0), 0)} GB total)</div>
-                  {hw.memory.map((ram, i) => (
-                    <div key={i} className="text-[10px] text-text-dim">
-                      {ram.capacity}GB · {ram.manufacturer || 'Unknown'} · {ram.partNumber || 'N/A'} · {ram.speed}MHz · {ram.deviceLocator || 'N/A'}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Disks */}
-              {hw.disks && hw.disks.length > 0 && (
-                <div className="p-2 bg-surface-raised rounded border border-border">
-                  <div className="text-[10px] font-semibold text-text mb-1">Disk Drives ({hw.disks.length})</div>
-                  {hw.disks.map((disk, i) => (
-                    <div key={i} className="text-[10px] text-text-dim">
-                      {disk.model} · {disk.sizeGB}GB · {disk.interface || 'N/A'} · FW: {disk.firmware || 'N/A'} · SN: {disk.serialNumber || 'N/A'}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Logical Disks */}
-              {hw.logicalDisks && hw.logicalDisks.length > 0 && (
-                <div className="p-2 bg-surface-raised rounded border border-border">
-                  <div className="text-[10px] font-semibold text-text mb-1">Partitions</div>
-                  {hw.logicalDisks.map((ld, i) => (
-                    <div key={i} className="text-[10px] text-text-dim">
-                      {ld.drive} · {ld.sizeGB}GB ({ld.freeGB}GB free) · {ld.fileSystem || 'N/A'} · {ld.volumeName || 'N/A'}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* CD/DVD */}
-              {hw.cdDvd && hw.cdDvd.length > 0 && (
-                <div className="p-2 bg-surface-raised rounded border border-border">
-                  <div className="text-[10px] font-semibold text-text mb-1">CD/DVD Drives ({hw.cdDvd.length})</div>
-                  {hw.cdDvd.map((cd, i) => (
-                    <div key={i} className="text-[10px] text-text-dim">{cd.name} · {cd.manufacturer || 'N/A'}</div>
-                  ))}
-                </div>
-              )}
-
-              {/* GPU */}
-              {hw.gpu && hw.gpu.length > 0 && (
-                <div className="p-2 bg-surface-raised rounded border border-border">
-                  <div className="text-[10px] font-semibold text-text mb-1">Graphics ({hw.gpu.length})</div>
-                  {hw.gpu.map((g, i) => (
-                    <div key={i} className="text-[10px] text-text-dim">
-                      {g.name} · {g.manufacturer || 'N/A'} · {g.ramMB}MB · Driver: {g.driverVersion || 'N/A'} · {g.resolution || 'N/A'}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Network */}
-              {hw.network && hw.network.length > 0 && (
-                <div className="p-2 bg-surface-raised rounded border border-border">
-                  <div className="text-[10px] font-semibold text-text mb-1">Network Adapters ({hw.network.length})</div>
-                  {hw.network.map((n, i) => (
-                    <div key={i} className="text-[10px] text-text-dim">
-                      {n.description}<br />IP: {n.ipAddress} · MAC: {n.macAddress} · DHCP: {n.dhcpEnabled ? 'Yes' : 'No'} · GW: {n.defaultGateway}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Logged-in user */}
-              <div className="p-2 bg-surface-raised rounded border border-border">
-                <div className="text-[10px] font-semibold text-text mb-1">User Info</div>
-                <div className="text-[10px] text-text-dim">
-                  Logged in: <span className="text-text">{hw.loggedInUser || 'None'}</span><br />
-                  Managed by: <span className="text-text">{hw.managedBy || 'Not set in AD'}</span>
-                </div>
-              </div>
-
-              <div className="text-[9px] text-muted text-center">Last scanned: {hw.scannedAt ? new Date(hw.scannedAt).toLocaleString() : 'Never'}</div>
             </div>
           ) : (
-            <div className="text-center text-text-dim text-xs py-4">
-              <Icon name="Cpu" size={20} className="mx-auto mb-2 opacity-50" />
-              No hardware info collected yet. Click "Scan Hardware" to fetch full details.
-            </div>
+            <div className="text-center text-text-dim text-xs py-3">No hardware info. Click Scan Hardware below.</div>
           )}
-
-          <FormField label="Notes">
-            <Textarea rows={2} defaultValue={liveHost.notes} />
-          </FormField>
-          <div className="flex gap-2 flex-wrap">
-            <ActionButton variant="primary" size="sm" icon="RefreshCw" onClick={async () => { toast.info('Refreshing ' + liveHost.hostname + '…'); if (window.SupportHubLANAPI) { const r = await window.SupportHubLANAPI.pingHost(liveHost.hostname); if (r && r.success && !r.demo) { updateHosts(prev => prev.map(h => h.id === liveHost.id ? { ...h, onlineStatus: r.data?.online ? 'online' : 'offline', lastSeen: new Date().toISOString() } : h)); toast.success(liveHost.hostname + ' refreshed'); } else { toast.warning('Backend not connected'); } } }}>Refresh</ActionButton>
-            <ActionButton variant="secondary" size="sm" icon="Cpu" onClick={async () => { toast.info('Scanning hardware on ' + liveHost.hostname + '…'); if (window.SupportHubLANAPI) { const r = await window.SupportHubLANAPI.getHardwareInfo(liveHost.hostname); if (r && r.success && !r.demo) { updateHosts(prev => prev.map(h => h.id === liveHost.id ? { ...h, _hardwareInfo: r.data } : h)); toast.success('Hardware scan complete for ' + liveHost.hostname); if (r.changes && r.changes.length > 0) { r.changes.forEach(c => toast.warning('Hardware change: ' + c.field, { detail: c.oldValue + ' -> ' + c.newValue, duration: 10000 })); } } else if (r && r.demo) { toast.warning('Backend not connected'); } else { toast.error('Hardware scan failed', { detail: r?.error }); } } }}>Scan Hardware</ActionButton>
-            <ActionButton variant="secondary" size="sm" icon="ShieldCheck" onClick={async () => { toast.info('Scanning ' + liveHost.hostname + ' for updates…'); if (window.SupportHubLANAPI) { const result = await window.SupportHubLANAPI.scanUpdates([liveHost.hostname], null); if (result && result.success && !result.demo) { toast.success('Scan complete for ' + liveHost.hostname); } else if (result && result.demo) { toast.warning('Backend not connected'); } else { toast.error('Scan failed', { detail: result?.error }); } } }}>Scan Updates</ActionButton>
-            <ActionButton variant="secondary" size="sm" icon="Power" onClick={() => { executePowerAction({ action: 'reboot', targetIds: [liveHost.id] }); }}>Reboot</ActionButton>
+          <div className="flex gap-1 flex-wrap">
+            <ActionButton variant="primary" size="sm" icon="RefreshCw" onClick={async () => { toast.info('Pinging ' + liveHost.hostname + '...'); if (window.SupportHubLANAPI) { const r = await window.SupportHubLANAPI.pingHost(liveHost.hostname); if (r && r.success && !r.demo) { updateHosts(prev => prev.map(h => h.id === liveHost.id ? { ...h, onlineStatus: r.data?.online ? 'online' : 'offline', pingStatus: r.data?.online ? 'up' : 'down', lastSeen: new Date().toISOString() } : h)); toast.success(liveHost.hostname + ' is ' + (r.data?.online ? 'online' : 'offline')); } else if (r && r.demo) { toast.warning('Backend not connected'); } else { toast.error('Ping failed'); } } }}>Refresh</ActionButton>
+            <ActionButton variant="secondary" size="sm" icon="Cpu" onClick={async () => { toast.info('Scanning hardware on ' + liveHost.hostname + '...'); if (window.SupportHubLANAPI) { const r = await window.SupportHubLANAPI.getHardwareInfo(liveHost.hostname); if (r && r.success && !r.demo) { updateHosts(prev => prev.map(h => h.id === liveHost.id ? { ...h, _hardwareInfo: r.data, osName: r.data?.os?.name || h.osName, cpuModel: r.data?.processors?.[0]?.name || h.cpuModel, ramGb: r.data?.system?.totalRamMB ? Math.round(r.data.system.totalRamMB / 1024) : h.ramGb, ipAddress: r.data?.network?.[0]?.ipAddress?.split(',')[0]?.trim() || h.ipAddress, macAddress: r.data?.network?.[0]?.macAddress || h.macAddress } : h)); toast.success('Hardware scan complete'); if (r.changes?.length > 0) r.changes.forEach(c => toast.warning('Change: ' + c.field, { detail: c.oldValue + ' -> ' + c.newValue, duration: 10000 })); } else if (r && r.demo) { toast.warning('Backend not connected'); } else { toast.error('Scan failed', { detail: r?.error }); } } }}>Scan Hardware</ActionButton>
+            <ActionButton variant="secondary" size="sm" icon="ShieldCheck" onClick={async () => { toast.info('Scanning ' + liveHost.hostname + ' for updates...'); if (window.SupportHubLANAPI) { const r = await window.SupportHubLANAPI.scanUpdates([liveHost.hostname], null); if (r && r.success && !r.demo) { toast.success('Update scan complete'); } else if (r && r.demo) { toast.warning('Backend not connected'); } else { toast.error('Scan failed'); } } }}>Scan Updates</ActionButton>
+            <ActionButton variant="secondary" size="sm" icon="Power" onClick={() => { if (confirm('Reboot ' + liveHost.hostname + '?')) { executePowerAction({ action: 'reboot', targetIds: [liveHost.id] }); } }}>Reboot</ActionButton>
           </div>
         </div>
       );
     }
+
+    // ---- SERVICES ----
+    if (tab === 'services') {
+      return (
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-meta text-text-dim uppercase">Services</span>
+            <IconButton icon="RefreshCw" size="sm" title="Refresh" onClick={() => fetchDrawerData(() => window.SupportHubLANAPI.getServices(liveHost.hostname, null))} />
+          </div>
+          {drawerLoading ? <div className="text-text-dim text-xs py-4 text-center">Loading services...</div> :
+           !drawerData || drawerData.length === 0 ? <div className="text-text-dim text-xs py-4 text-center">No services found.</div> :
+           drawerData.slice(0, 50).map((s, i) => (
+            <div key={i} className="flex items-center gap-2 p-1.5 bg-surface-raised rounded border border-border text-xs">
+              <Icon name={(s.State || s.status) === 'Running' ? 'Circle' : 'CircleOff'} size={10} className={(s.State || s.status) === 'Running' ? 'text-success' : 'text-danger'} />
+              <div className="flex-1 min-w-0">
+                <div className="font-mono text-text truncate">{s.Name || s.name}</div>
+                <div className="text-[10px] text-text-dim truncate">{s.DisplayName || s.display || ''}</div>
+              </div>
+              <div className="flex gap-0.5">
+                <IconButton icon="Play" size="sm" variant="success" title="Start" disabled={(s.State || s.status) === 'Running'} onClick={async () => { if (window.SupportHubLANAPI) { await window.SupportHubLANAPI.serviceAction(liveHost.hostname, s.Name || s.name, 'start', null); fetchDrawerData(() => window.SupportHubLANAPI.getServices(liveHost.hostname, null)); toast.success('Started ' + (s.Name || s.name)); } }} />
+                <IconButton icon="Square" size="sm" variant="danger" title="Stop" disabled={(s.State || s.status) === 'Stopped'} onClick={async () => { if (window.SupportHubLANAPI) { await window.SupportHubLANAPI.serviceAction(liveHost.hostname, s.Name || s.name, 'stop', null); fetchDrawerData(() => window.SupportHubLANAPI.getServices(liveHost.hostname, null)); toast.warning('Stopped ' + (s.Name || s.name)); } }} />
+                <IconButton icon="RotateCw" size="sm" title="Restart" onClick={async () => { if (window.SupportHubLANAPI) { await window.SupportHubLANAPI.serviceAction(liveHost.hostname, s.Name || s.name, 'restart', null); fetchDrawerData(() => window.SupportHubLANAPI.getServices(liveHost.hostname, null)); toast.info('Restarted ' + (s.Name || s.name)); } }} />
+              </div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // ---- PROCESSES ----
+    if (tab === 'processes') {
+      return (
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-meta text-text-dim uppercase">Processes</span>
+            <IconButton icon="RefreshCw" size="sm" title="Refresh" onClick={() => fetchDrawerData(() => window.SupportHubLANAPI.getProcesses(liveHost.hostname, null))} />
+          </div>
+          {drawerLoading ? <div className="text-text-dim text-xs py-4 text-center">Loading processes...</div> :
+           !drawerData || drawerData.length === 0 ? <div className="text-text-dim text-xs py-4 text-center">No processes found.</div> :
+           drawerData.slice(0, 50).map((p, i) => (
+            <div key={i} className="flex items-center gap-2 p-1.5 bg-surface-raised rounded border border-border text-xs">
+              <span className="text-text-dim tnum w-10">{p.ProcessId || p.pid}</span>
+              <span className="flex-1 font-mono text-text truncate">{p.Name || p.name}</span>
+              {p.MemMB && <span className="text-text-dim tnum text-[10px]">{p.MemMB}MB</span>}
+              <IconButton icon="X" size="sm" variant="danger" title="Kill" onClick={async () => { if (window.SupportHubLANAPI && confirm('Kill ' + (p.Name || p.name) + ' (PID ' + (p.ProcessId || p.pid) + ')?')) { await window.SupportHubLANAPI.killProcess(liveHost.hostname, p.ProcessId || p.pid, p.Name || p.name, null); fetchDrawerData(() => window.SupportHubLANAPI.getProcesses(liveHost.hostname, null)); toast.warning('Killed ' + (p.Name || p.name)); } }} />
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // ---- EVENT LOGS ----
+    if (tab === 'logs') {
+      return (
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-meta text-text-dim uppercase">Event Log (System, last 30)</span>
+            <IconButton icon="RefreshCw" size="sm" title="Refresh" onClick={() => fetchDrawerData(() => window.SupportHubLANAPI.getEventLog(liveHost.hostname, 'System', 30, 'All', null))} />
+          </div>
+          {drawerLoading ? <div className="text-text-dim text-xs py-4 text-center">Loading events...</div> :
+           !drawerData || drawerData.length === 0 ? <div className="text-text-dim text-xs py-4 text-center">No events found.</div> :
+           drawerData.slice(0, 30).map((e, i) => (
+            <div key={i} className="p-1.5 bg-surface-raised rounded border border-border text-xs">
+              <div className="flex items-center justify-between">
+                <span className="font-mono text-text-dim text-[10px]">{e.TimeCreated ? new Date(e.TimeCreated).toLocaleString() : ''}</span>
+                <span className={`px-1 text-[9px] rounded ${e.LevelDisplayName === 'Error' ? 'bg-danger/15 text-danger' : e.LevelDisplayName === 'Warning' ? 'bg-warning/15 text-warning' : 'bg-info/15 text-info'}`}>{e.LevelDisplayName}</span>
+              </div>
+              <div className="text-text mt-0.5">{e.ProviderName || ''}</div>
+              <div className="text-[10px] text-text-dim">{e.Message ? e.Message.substring(0, 120) : ''}</div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // ---- UPDATES ----
     if (tab === 'updates') {
-      const pending = []; // Real update data requires a scan — run Scan Updates to populate
       return (
         <div className="space-y-3">
           <div className="grid grid-cols-2 gap-2">
             <div className="p-2 bg-surface-raised rounded border border-border">
-              <div className="text-meta text-text-dim uppercase">Compliance</div>
-              <div className="text-sm font-semibold capitalize text-text mt-0.5">{liveHost.patchState.replace('-', ' ')}</div>
+              <div className="text-meta text-text-dim uppercase">Status</div>
+              <div className="text-sm font-semibold capitalize text-text mt-0.5">{liveHost.patchState ? liveHost.patchState.replace('-', ' ') : 'unknown'}</div>
             </div>
             <div className="p-2 bg-surface-raised rounded border border-border">
-              <div className="text-meta text-text-dim uppercase">Last Scan</div>
-              <div className="text-sm font-semibold text-text mt-0.5">{fmtRel(liveHost.lastSeen)}</div>
+              <div className="text-meta text-text-dim uppercase">Pending Reboot</div>
+              <div className="text-sm font-semibold text-text mt-0.5">{liveHost.pendingReboot ? 'Yes' : 'No'}</div>
             </div>
           </div>
-          <div>
-            <div className="text-meta text-text-dim uppercase mb-1.5">Pending Updates ({pending.length})</div>
-            {pending.length === 0 ? <EmptyState icon="ShieldCheck" title="All compliant" description="No pending updates for this host." /> : (
-              <div className="space-y-1.5">
-                {pending.map(kb => (
-                  <div key={kb.kb} className="p-2 bg-surface-raised rounded border border-border">
-                    <div className="flex items-center justify-between">
-                      <span className="font-mono text-xs text-text">{kb.kb}</span>
-                      <Badge color={kb.severity === 'Critical' ? 'danger' : 'warning'}>{kb.severity}</Badge>
-                    </div>
-                    <div className="text-[11px] text-text-dim mt-0.5">{kb.title}</div>
-                    <div className="flex items-center justify-between mt-1">
-                      <span className="text-[10px] text-muted">{kb.classification} · {kb.size} MB</span>
-                      <ActionButton size="xs" variant="ghost" icon="Download">Download</ActionButton>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
+          <ActionButton variant="primary" size="sm" icon="ShieldCheck" className="w-full" onClick={async () => { toast.info('Scanning ' + liveHost.hostname + ' for updates...'); if (window.SupportHubLANAPI) { const r = await window.SupportHubLANAPI.scanUpdates([liveHost.hostname], null); if (r && r.success && !r.demo) { toast.success('Scan complete for ' + liveHost.hostname); } else if (r && r.demo) { toast.warning('Backend not connected'); } else { toast.error('Scan failed'); } } }}>Scan for Updates</ActionButton>
+          <ActionButton variant="success" size="sm" icon="Download" className="w-full" onClick={async () => { toast.info('Installing updates on ' + liveHost.hostname + '...'); if (window.SupportHubLANAPI) { const r = await window.SupportHubLANAPI.installUpdates([liveHost.hostname], null, { rebootBehavior: 'if-required' }); if (r && r.success && !r.demo) { updateHosts(prev => prev.map(h => h.id === liveHost.id ? { ...h, patchState: 'compliant' } : h)); toast.success('Updates installed on ' + liveHost.hostname); } else if (r && r.demo) { toast.warning('Backend not connected'); } else { toast.error('Install failed'); } } }}>Install All Updates</ActionButton>
+          <div className="text-[10px] text-text-dim text-center">Run a scan to see available updates.</div>
         </div>
       );
     }
-    if (tab === 'deployments') {
-      return <div className="text-text-dim text-xs py-4 text-center">Deployment history is available in Reports & Logs.</div>;
-    }
-    if (tab === 'jobs') {
-      return <div className="space-y-1.5">{activeJobs.filter(j => j.targets.includes(liveHost.id)).map(j => (
-        <div key={j.id} className="p-2 bg-surface-raised rounded border border-border">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-text">{j.name}</span>
-            <StatusBadge variant={j.status} size="xs" />
-          </div>
-          <div className="text-[10px] text-text-dim mt-0.5">{j.step}</div>
-          <ProgressBar value={j.progress} color="info" className="mt-1.5" />
-        </div>
-      ))}{activeJobs.filter(j => j.targets.includes(liveHost.id)).length === 0 && <EmptyState icon="ListOrdered" title="No active jobs" />}</div>;
-    }
-    if (tab === 'services') {
-      return <div className="text-text-dim text-xs py-4 text-center">
-        <Icon name="Activity" size={20} className="mx-auto mb-2 opacity-50" />
-        Go to the <strong>Services</strong> screen to view and manage services on this host.
-      </div>;
-    }
-    if (tab === 'processes') {
-      return <div className="text-text-dim text-xs py-4 text-center">
-        <Icon name="Cpu" size={20} className="mx-auto mb-2 opacity-50" />
-        Use the terminal panel to run: <code className="font-mono text-text">pslist \\{liveHost?.hostname}</code>
-      </div>;
-    }
-    if (tab === 'logs') {
-      return <div className="text-text-dim text-xs py-4 text-center">
-        <Icon name="FileText" size={20} className="mx-auto mb-2 opacity-50" />
-        Click the <strong>PC Log</strong> button (FileText icon) in the inventory row to view event logs.
-      </div>;
-    }
+
+    // ---- NETWORK ----
     if (tab === 'network') {
-      return <div className="space-y-2 text-xs">
-        {[['IP Address', liveHost.ipAddress || '—'], ['MAC Address', liveHost.macAddress || '—'], ['FQDN', liveHost.fqdn || '—']].map(([k,v]) => (
-          <div key={k} className="flex justify-between p-2 bg-surface-raised rounded border border-border">
-            <span className="text-text-dim">{k}</span>
-            <span className="font-mono text-text">{v}</span>
-          </div>
-        ))}
-      </div>;
-    }
-    if (tab === 'apps') {
-      return <div className="text-text-dim text-xs py-4 text-center">
-        <Icon name="Boxes" size={20} className="mx-auto mb-2 opacity-50" />
-        Use the terminal panel to run: <code className="font-mono text-text">psexec \\{liveHost?.hostname} -s powershell "Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Select DisplayName,DisplayVersion"</code>
-      </div>;
-    }
-    if (tab === 'remote') {
+      const hw = liveHost._hardwareInfo;
+      const netAdapters = hw?.network || [];
       return (
-        <div className="space-y-3">
-          <SectionCard title="Quick Connect">
-            <div className="space-y-2">
-              <Select defaultValue="VNC"><option>VNC</option><option>RDP</option></Select>
-              <div className="flex gap-2">
-                <Input defaultValue={liveHost.ipAddress} className="font-mono" />
-                <Input defaultValue="5900" className="w-20" />
+        <div className="space-y-2 text-xs">
+          {netAdapters.length > 0 ? netAdapters.map((n, i) => (
+            <div key={i} className="p-2 bg-surface-raised rounded border border-border space-y-1">
+              <div className="font-medium text-text">{n.description || 'Adapter ' + (i+1)}</div>
+              <div className="grid grid-cols-2 gap-1 text-[10px]">
+                <div><span className="text-text-dim">IP:</span> <span className="text-text font-mono">{n.ipAddress || '\u2014'}</span></div>
+                <div><span className="text-text-dim">MAC:</span> <span className="text-text font-mono">{n.macAddress || '\u2014'}</span></div>
+                <div><span className="text-text-dim">DHCP:</span> <span className="text-text">{n.dhcpEnabled ? 'Yes' : 'No'}</span></div>
+                <div><span className="text-text-dim">Gateway:</span> <span className="text-text font-mono">{n.defaultGateway || '\u2014'}</span></div>
+                <div className="col-span-2"><span className="text-text-dim">DNS:</span> <span className="text-text font-mono">{n.dnsServers || '\u2014'}</span></div>
               </div>
-              <ActionButton variant="primary" size="sm" icon="ExternalLink" className="w-full">Launch VNC Viewer</ActionButton>
-              <ActionButton variant="secondary" size="sm" icon="Copy" className="w-full">Copy connection string</ActionButton>
             </div>
-          </SectionCard>
-          <SectionCard title="Connection History">
-            <div className="space-y-1 text-xs">{CONNECTION_HISTORY.slice(0,2).map(c => (
-              <div key={c.id} className="flex justify-between p-1.5 bg-surface-raised rounded">
-                <span className="text-text-dim">{fmtRel(c.timestamp)}</span>
-                <span className="text-text">{c.duration}</span>
-              </div>
-            ))}</div>
-          </SectionCard>
+          )) : (
+            <div className="space-y-1">
+              {[['IP Address', liveHost.ipAddress || '\u2014'], ['MAC Address', liveHost.macAddress || '\u2014'], ['FQDN', liveHost.fqdn || '\u2014']].map(([k,v]) => (
+                <div key={k} className="flex justify-between p-2 bg-surface-raised rounded border border-border">
+                  <span className="text-text-dim">{k}</span>
+                  <span className="font-mono text-text">{v}</span>
+                </div>
+              ))}
+              <div className="text-[10px] text-text-dim text-center pt-1">Click Scan Hardware in Overview for full network details.</div>
+            </div>
+          )}
         </div>
       );
     }
-    if (tab === 'audit') {
-      return <div className="space-y-1.5">{AUDIT_EVENTS.filter(e => e.targetIds.includes(liveHost.id)).map(e => (
-        <div key={e.id} className="p-2 bg-surface-raised rounded border border-border">
-          <div className="flex items-center justify-between">
-            <span className="font-mono text-xs text-text">{e.action}</span>
-            <StatusBadge variant={e.result} size="xs" />
+
+    // ---- INSTALLED APPS ----
+    if (tab === 'apps') {
+      return (
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-meta text-text-dim uppercase">Installed Software</span>
+            <IconButton icon="RefreshCw" size="sm" title="Refresh" onClick={() => fetchDrawerData(() => window.SupportHubLANAPI.pstoolsExecute('psexec', liveHost.hostname, '-s powershell -NoProfile -Command "Get-ItemProperty HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* | Where-Object DisplayName | Select-Object DisplayName,DisplayVersion,Publisher | ConvertTo-Json -Compress"'))} />
           </div>
-          <div className="text-[10px] text-text-dim mt-0.5">{e.userName} · {fmtRel(e.timestamp)}</div>
+          {drawerLoading ? <div className="text-text-dim text-xs py-4 text-center">Loading apps...</div> :
+           !drawerData || drawerData.length === 0 ? <div className="text-text-dim text-xs py-4 text-center">No apps found. Ensure backend is connected.</div> :
+           drawerData.map((a, i) => (
+            <div key={i} className="p-1.5 bg-surface-raised rounded border border-border text-xs">
+              <div className="text-text">{a.DisplayName || a.name || 'Unknown'}</div>
+              <div className="text-[10px] text-text-dim">{a.DisplayVersion || a.version || ''} {a.Publisher ? '\u00b7 ' + a.Publisher : ''}</div>
+            </div>
+          ))}
         </div>
-      ))}</div>;
+      );
     }
+
+    // ---- AUDIT TRAIL ----
+    if (tab === 'audit') {
+      return (
+        <div className="space-y-1.5">
+          <span className="text-meta text-text-dim uppercase">Audit Trail for {liveHost.hostname}</span>
+          {drawerLoading ? <div className="text-text-dim text-xs py-4 text-center">Loading audit...</div> :
+           !drawerData || drawerData.length === 0 ? <div className="text-text-dim text-xs py-4 text-center">No audit entries found for this host.</div> :
+           drawerData.slice(0, 30).map((e, i) => (
+            <div key={i} className="p-1.5 bg-surface-raised rounded border border-border text-xs">
+              <div className="flex items-center justify-between">
+                <span className="font-mono text-text">{e.action || ''}</span>
+                <span className={`px-1 text-[9px] rounded ${e.result === 'success' ? 'bg-success/15 text-success' : e.result === 'failed' ? 'bg-danger/15 text-danger' : 'bg-warning/15 text-warning'}`}>{e.result}</span>
+              </div>
+              <div className="text-[10px] text-text-dim">{e.timestamp ? new Date(e.timestamp).toLocaleString() : ''} {e.user ? '\u00b7 ' + e.user : ''}</div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
     return null;
   };
 

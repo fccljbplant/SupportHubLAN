@@ -1275,36 +1275,169 @@ app.post('/api/pstools/pssuspend', async (req, res) => {
 // PC EVENT LOG — Retrieve Windows Event Logs from a remote host
 // ==========================================================================
 // ==========================================================================
-// HARDWARE INFO — Get hardware details via PsInfo, store for change detection
+// HARDWARE INFO — Full hardware inventory via PsExec + PowerShell CIM
+// Collects: OS, all processors, all RAM sticks, all disks, CD/DVD drives,
+//           network adapters (IP/MAC), logged-in user, managed-by from AD
 // ==========================================================================
 app.post('/api/hosts/:hostname/hardware', async (req, res) => {
   const { hostname } = req.params;
   const safeHost = sanitizeHost(hostname);
   const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
-  const script = `
-    $raw = & "${pstools}psinfo.exe" \\\\${safeHost} -accepteula 2>&1 | Out-String
-    $info = @{ hostname = '${safeHost}' }
-    foreach ($line in ($raw -split "\\r?\\n")) {
-      if ($line -match '^\\s*OS type:\\s+(.+)') { $info.osType = $matches[1].Trim() }
-      elseif ($line -match '^\\s*OS version:\\s+(.+)') { $info.osVersion = $matches[1].Trim() }
-      elseif ($line -match '^\\s*Kernel version:\\s+(.+)') { $info.kernelVersion = $matches[1].Trim() }
-      elseif ($line -match '^\\s*System type:\\s+(.+)') { $info.systemType = $matches[1].Trim() }
-      elseif ($line -match '^\\s*Processor type:\\s+(.+)') { $info.cpuModel = $matches[1].Trim() }
-      elseif ($line -match '^\\s*Processor speed:\\s+(.+)') { $info.cpuSpeed = $matches[1].Trim() }
-      elseif ($line -match '^\\s*Processors:\\s+(.+)') { $info.cpuCount = $matches[1].Trim() }
-      elseif ($line -match '^\\s*Physical memory:\\s+(.+)') { $info.ram = $matches[1].Trim() }
-      elseif ($line -match '^\\s*System uptime:\\s+(.+)') { $info.uptime = $matches[1].Trim() }
-      elseif ($line -match '^\\s*System manufacturer:\\s+(.+)') { $info.manufacturer = $matches[1].Trim() }
-      elseif ($line -match '^\\s*System model:\\s+(.+)') { $info.model = $matches[1].Trim() }
+
+  // Build a comprehensive PowerShell script that runs on the remote host via PsExec
+  // Collects everything in one pass and returns as JSON
+  const psScript = `
+    $ErrorActionPreference = 'SilentlyContinue'
+    $hw = @{}
+
+    # --- OS ---
+    $os = Get-CimInstance Win32_OperatingSystem
+    $hw.os = @{
+      name = $os.Caption
+      version = $os.Version
+      build = $os.BuildNumber
+      architecture = $os.OSArchitecture
+      installDate = $os.InstallDate
+      lastBoot = $os.LastBootUpTime
+      serial = $os.SerialNumber
     }
-    # Also get disk info via psexec
-    $diskRaw = & "${pstools}psexec.exe" \\\\${safeHost} -accepteula -s powershell -NoProfile -Command "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Select-Object DeviceID,@{N='SizeGB';E={[math]::Round($_.Size/1GB)}},@{N='FreeGB';E={[math]::Round($_.FreeSpace/1GB)}} | ConvertTo-Json -Compress" 2>&1 | Out-String
-    $info.disks = $diskRaw.Trim()
-    $info.scannedAt = (Get-Date).ToString('o')
-    $info | ConvertTo-Json -Depth 3 -Compress
+
+    # --- System (manufacturer, model, serial) ---
+    $cs = Get-CimInstance Win32_ComputerSystem
+    $hw.system = @{
+      manufacturer = $cs.Manufacturer
+      model = $cs.Model
+      serial = (Get-CimInstance Win32_BIOS).SerialNumber
+      biosVersion = (Get-CimInstance Win32_BIOS).SMBIOSBIOSVersion
+      biosDate = (Get-CimInstance Win32_BIOS).ReleaseDate
+      totalRamMB = [math]::Round($cs.TotalPhysicalMemory / 1MB)
+      domain = $cs.Domain
+      workgroup = if (-not $cs.PartOfDomain) { $cs.Workgroup } else { $null }
+    }
+
+    # --- All Processors ---
+    $hw.processors = @(Get-CimInstance Win32_Processor | ForEach-Object {
+      @{
+        name = $_.Name
+        manufacturer = $_.Manufacturer
+        cores = $_.NumberOfCores
+        logicalCores = $_.NumberOfLogicalProcessors
+        maxSpeedMHz = $_.MaxClockSpeed
+        currentSpeedMHz = $_.CurrentClockSpeed
+        socket = $_.SocketDesignation
+        deviceId = $_.DeviceID
+      }
+    })
+
+    # --- All RAM sticks ---
+    $hw.memory = @(Get-CimInstance Win32_PhysicalMemory | ForEach-Object {
+      @{
+        capacity = [math]::Round($_.Capacity / 1GB, 1)
+        manufacturer = $_.Manufacturer
+        partNumber = $_.PartNumber
+        speed = $_.Speed
+        bankLabel = $_.BankLabel
+        deviceLocator = $_.DeviceLocator
+        serialNumber = $_.SerialNumber
+      }
+    })
+
+    # --- All Disk Drives (physical) ---
+    $hw.disks = @(Get-CimInstance Win32_DiskDrive | ForEach-Object {
+      @{
+        model = $_.Model
+        sizeGB = [math]::Round($_.Size / 1GB, 1)
+        interface = $_.InterfaceType
+        firmware = $_.FirmwareRevision
+        serialNumber = $_.SerialNumber
+        partitions = $_.Partitions
+        index = $_.Index
+      }
+    })
+
+    # --- Logical Disks (partitions) ---
+    $hw.logicalDisks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
+      @{
+        drive = $_.DeviceID
+        sizeGB = [math]::Round($_.Size / 1GB, 1)
+        freeGB = [math]::Round($_.FreeSpace / 1GB, 1)
+        fileSystem = $_.FileSystem
+        volumeName = $_.VolumeName
+      }
+    })
+
+    # --- CD/DVD Drives ---
+    $hw.cdDvd = @(Get-CimInstance Win32_CDROMDrive | ForEach-Object {
+      @{
+        name = $_.Name
+        drive = $_.Drive
+        mediaLoaded = $_.MediaLoaded
+        manufacturer = $_.Manufacturer
+      }
+    })
+
+    # --- Network Adapters (IP + MAC) ---
+    $hw.network = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=true' | ForEach-Object {
+      @{
+        description = $_.Description
+        ipAddress = ($_.IPAddress -join ', ')
+        macAddress = $_.MACAddress
+        dhcpEnabled = $_.DHCPEnabled
+        defaultGateway = ($_.DefaultIPGateway -join ', ')
+        dnsServers = ($_.DNSServerSearchOrder -join ', ')
+      }
+    })
+
+    # --- Logged-in user ---
+    $hw.loggedInUser = (Get-CimInstance Win32_ComputerSystem).UserName
+    $hw.loggedOnUsers = @(& query user 2>$null | ForEach-Object { $_.Trim() }) -join '\\n'
+
+    # --- Managed by (from AD if domain-joined) ---
+    $hw.managedBy = $null
+    if ($cs.PartOfDomain) {
+      try {
+        $computer = Get-ADComputer $cs.Name -Properties ManagedBy -ErrorAction SilentlyContinue
+        if ($computer.ManagedBy) {
+          $manager = Get-ADObject $computer.ManagedBy -Properties cn -ErrorAction SilentlyContinue
+          $hw.managedBy = $manager.cn
+        }
+      } catch {}
+    }
+
+    # --- Graphics cards ---
+    $hw.gpu = @(Get-CimInstance Win32_VideoController | ForEach-Object {
+      @{
+        name = $_.Name
+        manufacturer = $_.AdapterCompatibility
+        ramMB = [math]::Round($_.AdapterRAM / 1MB)
+        driverVersion = $_.DriverVersion
+        driverDate = $_.DriverDate
+        resolution = $_.CurrentHorizontalResolution.ToString() + 'x' + $_.CurrentVerticalResolution.ToString()
+      }
+    })
+
+    # --- Sound devices ---
+    $hw.sound = @(Get-CimInstance Win32_SoundDevice | ForEach-Object {
+      @{ name = $_.Name; manufacturer = $_.Manufacturer }
+    })
+
+    # --- USB devices ---
+    $hw.usb = @(Get-CimInstance Win32_USBHub | ForEach-Object {
+      @{ name = $_.Name; deviceId = $_.DeviceID }
+    })
+
+    $hw.hostname = $cs.Name
+    $hw.scannedAt = (Get-Date).ToString('o')
+
+    $hw | ConvertTo-Json -Depth 4 -Compress
   `;
-  const result = await runPowerShell(script, 30000);
-  if (result.success) {
+
+  // Encode the script and run via PsExec
+  const encodedScript = Buffer.from(psScript, 'utf16le').toString('base64');
+  const cmd = `"${pstools}psexec.exe" \\\\${safeHost} -accepteula -s -h powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encodedScript}`;
+  const result = await runPowerShell(cmd, 60000);
+
+  if (result.success && result.stdout) {
     try {
       const hwInfo = JSON.parse(result.stdout);
       // Store in settings for change detection
@@ -1313,20 +1446,36 @@ app.post('/api/hosts/:hostname/hardware', async (req, res) => {
       let changes = [];
       if (previous) {
         const prev = JSON.parse(previous);
-        // Compare key fields
-        ['cpuModel', 'cpuCount', 'ram', 'manufacturer', 'model', 'osType', 'osVersion'].forEach(field => {
-          if (prev[field] && hwInfo[field] && prev[field] !== hwInfo[field]) {
-            changes.push({ field, oldValue: prev[field], newValue: hwInfo[field] });
+        // Compare key hardware components
+        const compareFields = ['system.manufacturer', 'system.model', 'system.serial', 'system.biosVersion'];
+        compareFields.forEach(field => {
+          const getNested = (obj, path) => path.split('.').reduce((o, k) => o?.[k], obj);
+          const oldVal = getNested(prev, field);
+          const newVal = getNested(hwInfo, field);
+          if (oldVal && newVal && oldVal !== newVal) {
+            changes.push({ field, oldValue: oldVal, newValue: newVal });
           }
         });
+        // Compare processor count
+        if (prev.processors && hwInfo.processors && prev.processors.length !== hwInfo.processors.length) {
+          changes.push({ field: 'processorCount', oldValue: prev.processors.length, newValue: hwInfo.processors.length });
+        }
+        // Compare RAM stick count
+        if (prev.memory && hwInfo.memory && prev.memory.length !== hwInfo.memory.length) {
+          changes.push({ field: 'memoryStickCount', oldValue: prev.memory.length, newValue: hwInfo.memory.length });
+        }
+        // Compare disk count
+        if (prev.disks && hwInfo.disks && prev.disks.length !== hwInfo.disks.length) {
+          changes.push({ field: 'diskCount', oldValue: prev.disks.length, newValue: hwInfo.disks.length });
+        }
       }
       db.settings.set(key, JSON.stringify(hwInfo));
       res.json({ success: true, data: hwInfo, changes, isFirstScan: !previous });
     } catch (e) {
-      res.json({ success: false, error: 'Failed to parse PsInfo output', stdout: result.stdout?.substring(0, 500) });
+      res.json({ success: false, error: 'Failed to parse hardware output', stdout: result.stdout?.substring(0, 1000) });
     }
   } else {
-    res.json({ success: false, error: result.stderr || result.stdout });
+    res.json({ success: false, error: result.stderr || result.stdout || 'PsExec failed' });
   }
 });
 

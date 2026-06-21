@@ -2065,6 +2065,7 @@
     // Always read the freshest version of this host from state (so drawer updates after mutations)
     const liveHost = hosts.find(h => h.id === host.id) || host;
     if (tab === 'overview') {
+      const hw = liveHost._hardwareInfo;
       return (
         <div className="space-y-3">
           <div className="flex items-center gap-2">
@@ -2072,15 +2073,14 @@
             <StatusBadge variant={liveHost.patchState} />
             {liveHost.pendingReboot && <StatusBadge variant="reboot-pending" />}
           </div>
+
+          {/* Basic info */}
           <div className="grid grid-cols-2 gap-2 text-xs">
             {[
-              ['FQDN', liveHost.fqdn, true], ['IP Address', liveHost.ipAddress, true],
-              ['MAC Address', liveHost.macAddress, true], ['OS', liveHost.osName],
-              ['OS Version', `${liveHost.osVersion} (Build ${liveHost.osBuild})`], ['CPU', liveHost.cpuModel],
-              ['RAM', `${liveHost.ramGb} GB`], ['Disk', `${liveHost.diskUsedGb} / ${liveHost.diskUsedGb + liveHost.diskFreeGb} GB`],
-              ['Uptime', liveHost.uptime], ['Last Boot', fmtAbs(liveHost.lastBootTime)],
-              ['Last Seen', fmtRel(liveHost.lastSeen)], ['Site', liveHost.site],
-              ['Location', liveHost.location], ['Department', liveHost.department],
+              ['Hostname', liveHost.hostname, true], ['FQDN', liveHost.fqdn, true],
+              ['IP Address', liveHost.ipAddress, true], ['MAC Address', liveHost.macAddress, true],
+              ['OS', liveHost.osName], ['OS Build', liveHost.osBuild],
+              ['Site', liveHost.site], ['Department', liveHost.department],
               ['Owner', liveHost.owner], ['Tags', liveHost.tags.map(t => <TagChip key={t} name={t} />)],
             ].map(([label, value, mono], i) => (
               <div key={i} className={label === 'Tags' ? 'col-span-2' : ''}>
@@ -2089,13 +2089,134 @@
               </div>
             ))}
           </div>
+
+          {/* Full hardware info (if available) */}
+          {hw ? (
+            <div className="space-y-2">
+              <div className="text-meta text-text-dim uppercase">Hardware Details</div>
+
+              {/* System */}
+              <div className="p-2 bg-surface-raised rounded border border-border">
+                <div className="text-[10px] font-semibold text-text mb-1">System</div>
+                <div className="grid grid-cols-2 gap-1 text-[10px]">
+                  <div><span className="text-text-dim">Manufacturer:</span> <span className="text-text">{hw.system?.manufacturer || '—'}</span></div>
+                  <div><span className="text-text-dim">Model:</span> <span className="text-text">{hw.system?.model || '—'}</span></div>
+                  <div><span className="text-text-dim">Serial:</span> <span className="text-text font-mono">{hw.system?.serial || '—'}</span></div>
+                  <div><span className="text-text-dim">BIOS:</span> <span className="text-text">{hw.system?.biosVersion || '—'}</span></div>
+                  <div><span className="text-text-dim">Domain:</span> <span className="text-text">{hw.system?.domain || '—'}</span></div>
+                  <div><span className="text-text-dim">Managed by:</span> <span className="text-text">{hw.managedBy || '—'}</span></div>
+                </div>
+              </div>
+
+              {/* Processors */}
+              {hw.processors && hw.processors.length > 0 && (
+                <div className="p-2 bg-surface-raised rounded border border-border">
+                  <div className="text-[10px] font-semibold text-text mb-1">Processors ({hw.processors.length})</div>
+                  {hw.processors.map((cpu, i) => (
+                    <div key={i} className="text-[10px] space-y-0.5">
+                      <div><span className="text-text">{cpu.name}</span></div>
+                      <div className="text-text-dim">{cpu.manufacturer} · {cpu.cores}C/{cpu.logicalCores}T · {cpu.maxSpeedMHz}MHz · {cpu.socket || 'N/A'}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Memory */}
+              {hw.memory && hw.memory.length > 0 && (
+                <div className="p-2 bg-surface-raised rounded border border-border">
+                  <div className="text-[10px] font-semibold text-text mb-1">Memory ({hw.memory.length} sticks, {hw.memory.reduce((s, m) => s + (m.capacity || 0), 0)} GB total)</div>
+                  {hw.memory.map((ram, i) => (
+                    <div key={i} className="text-[10px] text-text-dim">
+                      {ram.capacity}GB · {ram.manufacturer || 'Unknown'} · {ram.partNumber || 'N/A'} · {ram.speed}MHz · {ram.deviceLocator || 'N/A'}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Disks */}
+              {hw.disks && hw.disks.length > 0 && (
+                <div className="p-2 bg-surface-raised rounded border border-border">
+                  <div className="text-[10px] font-semibold text-text mb-1">Disk Drives ({hw.disks.length})</div>
+                  {hw.disks.map((disk, i) => (
+                    <div key={i} className="text-[10px] text-text-dim">
+                      {disk.model} · {disk.sizeGB}GB · {disk.interface || 'N/A'} · FW: {disk.firmware || 'N/A'} · SN: {disk.serialNumber || 'N/A'}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Logical Disks */}
+              {hw.logicalDisks && hw.logicalDisks.length > 0 && (
+                <div className="p-2 bg-surface-raised rounded border border-border">
+                  <div className="text-[10px] font-semibold text-text mb-1">Partitions</div>
+                  {hw.logicalDisks.map((ld, i) => (
+                    <div key={i} className="text-[10px] text-text-dim">
+                      {ld.drive} · {ld.sizeGB}GB ({ld.freeGB}GB free) · {ld.fileSystem || 'N/A'} · {ld.volumeName || 'N/A'}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* CD/DVD */}
+              {hw.cdDvd && hw.cdDvd.length > 0 && (
+                <div className="p-2 bg-surface-raised rounded border border-border">
+                  <div className="text-[10px] font-semibold text-text mb-1">CD/DVD Drives ({hw.cdDvd.length})</div>
+                  {hw.cdDvd.map((cd, i) => (
+                    <div key={i} className="text-[10px] text-text-dim">{cd.name} · {cd.manufacturer || 'N/A'}</div>
+                  ))}
+                </div>
+              )}
+
+              {/* GPU */}
+              {hw.gpu && hw.gpu.length > 0 && (
+                <div className="p-2 bg-surface-raised rounded border border-border">
+                  <div className="text-[10px] font-semibold text-text mb-1">Graphics ({hw.gpu.length})</div>
+                  {hw.gpu.map((g, i) => (
+                    <div key={i} className="text-[10px] text-text-dim">
+                      {g.name} · {g.manufacturer || 'N/A'} · {g.ramMB}MB · Driver: {g.driverVersion || 'N/A'} · {g.resolution || 'N/A'}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Network */}
+              {hw.network && hw.network.length > 0 && (
+                <div className="p-2 bg-surface-raised rounded border border-border">
+                  <div className="text-[10px] font-semibold text-text mb-1">Network Adapters ({hw.network.length})</div>
+                  {hw.network.map((n, i) => (
+                    <div key={i} className="text-[10px] text-text-dim">
+                      {n.description}<br />IP: {n.ipAddress} · MAC: {n.macAddress} · DHCP: {n.dhcpEnabled ? 'Yes' : 'No'} · GW: {n.defaultGateway}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Logged-in user */}
+              <div className="p-2 bg-surface-raised rounded border border-border">
+                <div className="text-[10px] font-semibold text-text mb-1">User Info</div>
+                <div className="text-[10px] text-text-dim">
+                  Logged in: <span className="text-text">{hw.loggedInUser || 'None'}</span><br />
+                  Managed by: <span className="text-text">{hw.managedBy || 'Not set in AD'}</span>
+                </div>
+              </div>
+
+              <div className="text-[9px] text-muted text-center">Last scanned: {hw.scannedAt ? new Date(hw.scannedAt).toLocaleString() : 'Never'}</div>
+            </div>
+          ) : (
+            <div className="text-center text-text-dim text-xs py-4">
+              <Icon name="Cpu" size={20} className="mx-auto mb-2 opacity-50" />
+              No hardware info collected yet. Click "Scan Hardware" to fetch full details.
+            </div>
+          )}
+
           <FormField label="Notes">
             <Textarea rows={2} defaultValue={liveHost.notes} />
           </FormField>
-          <div className="flex gap-2">
-            <ActionButton variant="primary" size="sm" icon="RefreshCw" onClick={() => { updateHosts(prev => prev.map(h => h.id === liveHost.id ? { ...h, lastSeen: new Date().toISOString() } : h)); appendAudit({ action: 'hosts.refresh', actionCategory: 'Inventory', targetType: 'Host', targetIds: [liveHost.id], parameters: {}, result: 'success' }); toast.success(`${liveHost.hostname} refreshed.`); }}>Refresh</ActionButton>
-            <ActionButton variant="secondary" size="sm" icon="ShieldCheck" onClick={async () => { toast.info(`Scanning ${liveHost.hostname} for updates…`); if (window.SupportHubLANAPI) { const result = await window.SupportHubLANAPI.scanUpdates([liveHost.hostname], null); if (result && result.success && !result.demo) { toast.success(`Scan complete for ${liveHost.hostname}`); } else if (result && result.demo) { toast.warning('Backend not connected.', { duration: 8000 }); } else { toast.error('Scan failed', { detail: result?.error, duration: 8000 }); } } }}>Scan Updates</ActionButton>
-            <ActionButton variant="secondary" size="sm" icon="Power" onClick={() => { executePowerAction({ action: 'reboot', targetIds: [liveHost.id] }); toast.success(`Reboot initiated on ${liveHost.hostname}.`); }}>Reboot</ActionButton>
+          <div className="flex gap-2 flex-wrap">
+            <ActionButton variant="primary" size="sm" icon="RefreshCw" onClick={async () => { toast.info('Refreshing ' + liveHost.hostname + '…'); if (window.SupportHubLANAPI) { const r = await window.SupportHubLANAPI.pingHost(liveHost.hostname); if (r && r.success && !r.demo) { updateHosts(prev => prev.map(h => h.id === liveHost.id ? { ...h, onlineStatus: r.data?.online ? 'online' : 'offline', lastSeen: new Date().toISOString() } : h)); toast.success(liveHost.hostname + ' refreshed'); } else { toast.warning('Backend not connected'); } } }}>Refresh</ActionButton>
+            <ActionButton variant="secondary" size="sm" icon="Cpu" onClick={async () => { toast.info('Scanning hardware on ' + liveHost.hostname + '…'); if (window.SupportHubLANAPI) { const r = await window.SupportHubLANAPI.getHardwareInfo(liveHost.hostname); if (r && r.success && !r.demo) { updateHosts(prev => prev.map(h => h.id === liveHost.id ? { ...h, _hardwareInfo: r.data } : h)); toast.success('Hardware scan complete for ' + liveHost.hostname); if (r.changes && r.changes.length > 0) { r.changes.forEach(c => toast.warning('Hardware change: ' + c.field, { detail: c.oldValue + ' -> ' + c.newValue, duration: 10000 })); } } else if (r && r.demo) { toast.warning('Backend not connected'); } else { toast.error('Hardware scan failed', { detail: r?.error }); } } }}>Scan Hardware</ActionButton>
+            <ActionButton variant="secondary" size="sm" icon="ShieldCheck" onClick={async () => { toast.info('Scanning ' + liveHost.hostname + ' for updates…'); if (window.SupportHubLANAPI) { const result = await window.SupportHubLANAPI.scanUpdates([liveHost.hostname], null); if (result && result.success && !result.demo) { toast.success('Scan complete for ' + liveHost.hostname); } else if (result && result.demo) { toast.warning('Backend not connected'); } else { toast.error('Scan failed', { detail: result?.error }); } } }}>Scan Updates</ActionButton>
+            <ActionButton variant="secondary" size="sm" icon="Power" onClick={() => { executePowerAction({ action: 'reboot', targetIds: [liveHost.id] }); }}>Reboot</ActionButton>
           </div>
         </div>
       );
@@ -7971,21 +8092,28 @@
         const result = await window.SupportHubLANAPI.getHardwareInfo(hostname);
         if (result && result.success && !result.demo && result.data) {
           const hw = result.data;
+          // Map the new comprehensive hardware data to host fields
           setHosts(prev => prev.map(h => {
             if (h.hostname !== hostname) return h;
             return {
               ...h,
-              osName: hw.osType || h.osName,
-              osVersion: hw.osVersion || h.osVersion,
-              cpuModel: hw.cpuModel || h.cpuModel,
-              ramGb: hw.ram ? parseInt(hw.ram) : h.ramGb,
+              osName: hw.os?.name || h.osName,
+              osVersion: hw.os?.version || h.osVersion,
+              osBuild: hw.os?.build || h.osBuild,
+              cpuModel: hw.processors?.[0]?.name || h.cpuModel,
+              ramGb: hw.system?.totalRamMB ? Math.round(hw.system.totalRamMB / 1024) : h.ramGb,
+              ipAddress: hw.network?.[0]?.ipAddress?.split(',')[0]?.trim() || h.ipAddress,
+              macAddress: hw.network?.[0]?.macAddress || h.macAddress,
+              fqdn: hw.system?.domain ? h.hostname + '.' + hw.system.domain : h.fqdn,
               _hardwareInfo: hw,
             };
           }));
           if (result.changes && result.changes.length > 0) {
-            toast.warning(`Hardware change detected on ${hostname}!`, {
-              detail: result.changes.map(c => `${c.field}: ${c.oldValue} → ${c.newValue}`).join(', '),
-              duration: 10000
+            result.changes.forEach(c => {
+              toast.warning(`Hardware change on ${hostname}: ${c.field}`, {
+                detail: `${c.oldValue} → ${c.newValue}`,
+                duration: 10000
+              });
             });
           }
         }

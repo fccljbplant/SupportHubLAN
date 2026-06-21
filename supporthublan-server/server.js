@@ -1274,6 +1274,136 @@ app.post('/api/pstools/pssuspend', async (req, res) => {
 // ==========================================================================
 // PC EVENT LOG — Retrieve Windows Event Logs from a remote host
 // ==========================================================================
+// ==========================================================================
+// HARDWARE INFO — Get hardware details via PsInfo, store for change detection
+// ==========================================================================
+app.post('/api/hosts/:hostname/hardware', async (req, res) => {
+  const { hostname } = req.params;
+  const safeHost = sanitizeHost(hostname);
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
+  const script = `
+    $raw = & "${pstools}psinfo.exe" \\\\${safeHost} -accepteula 2>&1 | Out-String
+    $info = @{ hostname = '${safeHost}' }
+    foreach ($line in ($raw -split "\\r?\\n")) {
+      if ($line -match '^\\s*OS type:\\s+(.+)') { $info.osType = $matches[1].Trim() }
+      elseif ($line -match '^\\s*OS version:\\s+(.+)') { $info.osVersion = $matches[1].Trim() }
+      elseif ($line -match '^\\s*Kernel version:\\s+(.+)') { $info.kernelVersion = $matches[1].Trim() }
+      elseif ($line -match '^\\s*System type:\\s+(.+)') { $info.systemType = $matches[1].Trim() }
+      elseif ($line -match '^\\s*Processor type:\\s+(.+)') { $info.cpuModel = $matches[1].Trim() }
+      elseif ($line -match '^\\s*Processor speed:\\s+(.+)') { $info.cpuSpeed = $matches[1].Trim() }
+      elseif ($line -match '^\\s*Processors:\\s+(.+)') { $info.cpuCount = $matches[1].Trim() }
+      elseif ($line -match '^\\s*Physical memory:\\s+(.+)') { $info.ram = $matches[1].Trim() }
+      elseif ($line -match '^\\s*System uptime:\\s+(.+)') { $info.uptime = $matches[1].Trim() }
+      elseif ($line -match '^\\s*System manufacturer:\\s+(.+)') { $info.manufacturer = $matches[1].Trim() }
+      elseif ($line -match '^\\s*System model:\\s+(.+)') { $info.model = $matches[1].Trim() }
+    }
+    # Also get disk info via psexec
+    $diskRaw = & "${pstools}psexec.exe" \\\\${safeHost} -accepteula -s powershell -NoProfile -Command "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Select-Object DeviceID,@{N='SizeGB';E={[math]::Round($_.Size/1GB)}},@{N='FreeGB';E={[math]::Round($_.FreeSpace/1GB)}} | ConvertTo-Json -Compress" 2>&1 | Out-String
+    $info.disks = $diskRaw.Trim()
+    $info.scannedAt = (Get-Date).ToString('o')
+    $info | ConvertTo-Json -Depth 3 -Compress
+  `;
+  const result = await runPowerShell(script, 30000);
+  if (result.success) {
+    try {
+      const hwInfo = JSON.parse(result.stdout);
+      // Store in settings for change detection
+      const key = 'hardware:' + safeHost;
+      const previous = db.settings.get(key, null);
+      let changes = [];
+      if (previous) {
+        const prev = JSON.parse(previous);
+        // Compare key fields
+        ['cpuModel', 'cpuCount', 'ram', 'manufacturer', 'model', 'osType', 'osVersion'].forEach(field => {
+          if (prev[field] && hwInfo[field] && prev[field] !== hwInfo[field]) {
+            changes.push({ field, oldValue: prev[field], newValue: hwInfo[field] });
+          }
+        });
+      }
+      db.settings.set(key, JSON.stringify(hwInfo));
+      res.json({ success: true, data: hwInfo, changes, isFirstScan: !previous });
+    } catch (e) {
+      res.json({ success: false, error: 'Failed to parse PsInfo output', stdout: result.stdout?.substring(0, 500) });
+    }
+  } else {
+    res.json({ success: false, error: result.stderr || result.stdout });
+  }
+});
+
+// ==========================================================================
+// HARDWARE CHANGE CHECK — Scan all hosts and detect changes
+// ==========================================================================
+app.post('/api/hardware/check-changes', async (req, res) => {
+  const { hostnames } = req.body;
+  const hostList = hostnames.map(sanitizeHost);
+  const results = [];
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
+
+  for (const hostname of hostList) {
+    try {
+      const script = `
+        $raw = & "${pstools}psinfo.exe" \\\\${hostname} -accepteula 2>&1 | Out-String
+        $info = @{ hostname = '${hostname}' }
+        foreach ($line in ($raw -split "\\r?\\n")) {
+          if ($line -match '^\\s*OS type:\\s+(.+)') { $info.osType = $matches[1].Trim() }
+          elseif ($line -match '^\\s*Processor type:\\s+(.+)') { $info.cpuModel = $matches[1].Trim() }
+          elseif ($line -match '^\\s*Processors:\\s+(.+)') { $info.cpuCount = $matches[1].Trim() }
+          elseif ($line -match '^\\s*Physical memory:\\s+(.+)') { $info.ram = $matches[1].Trim() }
+          elseif ($line -match '^\\s*System model:\\s+(.+)') { $info.model = $matches[1].Trim() }
+        }
+        $info.scannedAt = (Get-Date).ToString('o')
+        $info | ConvertTo-Json -Compress
+      `;
+      const result = await runPowerShell(script, 30000);
+      if (result.success && result.stdout) {
+        const hwInfo = JSON.parse(result.stdout);
+        const key = 'hardware:' + hostname;
+        const previous = db.settings.get(key, null);
+        let changes = [];
+        if (previous) {
+          const prev = JSON.parse(previous);
+          ['cpuModel', 'cpuCount', 'ram', 'model', 'osType'].forEach(field => {
+            if (prev[field] && hwInfo[field] && prev[field] !== hwInfo[field]) {
+              changes.push({ field, oldValue: prev[field], newValue: hwInfo[field] });
+            }
+          });
+        }
+        db.settings.set(key, JSON.stringify(hwInfo));
+        results.push({ hostname, success: true, changes, isFirstScan: !previous });
+      } else {
+        results.push({ hostname, success: false, error: result.stderr || 'PsInfo failed' });
+      }
+    } catch (e) {
+      results.push({ hostname, success: false, error: e.message });
+    }
+  }
+
+  const allChanges = results.filter(r => r.changes && r.changes.length > 0);
+  if (allChanges.length > 0) {
+    db.audit.add({ action: 'hardware.changes-detected', category: 'Inventory', result: 'success', parameters: { hostsChanged: allChanges.map(r => r.hostname), changeCount: allChanges.reduce((sum, r) => sum + r.changes.length, 0) } });
+  }
+
+  res.json({ success: true, data: results, changesDetected: allChanges.length });
+});
+
+// ==========================================================================
+// HOST STATUS CHECK — Ping multiple hosts and return online/offline status
+// ==========================================================================
+app.post('/api/hosts/status-check', async (req, res) => {
+  const { hostnames } = req.body;
+  const hostList = hostnames.map(sanitizeHost);
+  const script = `
+    $results = @()
+    foreach ($h in @('${hostList.join("','")}')) {
+      $online = Test-Connection -ComputerName $h -Count 1 -Quiet -ErrorAction SilentlyContinue
+      $results += @{ hostname = $h; online = $online; status = if ($online) { 'online' } else { 'offline' } }
+    }
+    $results | ConvertTo-Json -Compress
+  `;
+  const result = await runPowerShell(script, Math.max(30000, hostList.length * 3000));
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
+});
+
 app.post('/api/hosts/:hostname/eventlog', async (req, res) => {
   const { hostname } = req.params;
   const { logName = 'System', maxEvents = 50, severity } = req.body;

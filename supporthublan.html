@@ -529,6 +529,13 @@
 
         // Health check (force re-check by resetting _available)
         recheckBackend: () => { _available = null; return checkBackend(); },
+
+        // Hardware info + change detection
+        getHardwareInfo: (hostname) => apiCall('/api/hosts/' + hostname + '/hardware', {}),
+        checkHardwareChanges: (hostnames) => apiCall('/api/hardware/check-changes', { hostnames }),
+        checkHostStatus: (hostnames) => apiCall('/api/hosts/status-check', { hostnames }),
+        resolveNetbios: (ip) => apiCall('/api/hosts/resolve-netbios', { ip }),
+        resolveHostname: (ip) => apiCall('/api/hosts/resolve-hostname', { ip }),
       };
     })();
   </script>
@@ -1644,7 +1651,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v3.1.0';
+  const APP_VERSION = 'v3.3.0';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -3823,7 +3830,7 @@
 
     const steps = [{ label: 'Input Method' }, { label: 'Host Details' }, { label: 'Assignment' }];
 
-    // ---- IP Scanner: ping sweep a range/subnet ----
+    // ---- IP Scanner: ping sweep + hostname resolution via NetBIOS/PsTools ----
     const runScan = async () => {
       const ips = window.SupportHubLANScanner.parseScanInput(scanInput);
       if (ips.length === 0) { toast.warning('Enter a valid IP range (10.10.1.1-50), CIDR (10.10.1.0/24), or comma-separated IPs.'); return; }
@@ -3834,15 +3841,36 @@
       for (let i = 0; i < ips.length; i++) {
         const ip = ips[i];
         const isAlive = await window.SupportHubLANScanner.pingIP(ip);
-        results.push({ ip, alive: isAlive, hostname: isAlive ? `HOST-${ip.split('.').slice(2).join('')}` : '' });
+        let hostname = '';
+        if (isAlive) {
+          // Try to resolve hostname: DNS first, then NetBIOS (nbtstat), then PsExec
+          if (window.SupportHubLANAPI) {
+            try {
+              // Method 1: DNS reverse lookup
+              const dnsResult = await window.SupportHubLANAPI.resolveHostname(ip);
+              if (dnsResult && dnsResult.success && dnsResult.hostname) {
+                hostname = dnsResult.hostname.split('.')[0].toUpperCase();
+              }
+              // Method 2: NetBIOS via nbtstat + PsExec fallback
+              if (!hostname) {
+                const nbResult = await window.SupportHubLANAPI.resolveNetbios(ip);
+                if (nbResult && nbResult.success && nbResult.hostname) {
+                  hostname = nbResult.hostname;
+                }
+              }
+            } catch (e) {}
+          }
+          if (!hostname) hostname = ip; // Use IP as hostname if resolution fails
+        }
+        results.push({ ip, alive: isAlive, hostname });
         setScanProgress(Math.round(((i + 1) / ips.length) * 100));
         setScanResults([...results]);
       }
       setScanning(false);
-      // Auto-select alive hosts
       const aliveSet = new Set(results.filter(r => r.alive).map(r => r.ip));
       setSelectedScanIPs(aliveSet);
-      toast.success(`Scan complete: ${aliveSet.size} of ${ips.length} hosts responded.`);
+      const resolvedCount = results.filter(r => r.alive && r.hostname && r.hostname !== r.ip).length;
+      toast.success(`Scan complete: ${aliveSet.size} of ${ips.length} hosts responded. ${resolvedCount} hostnames resolved.`);
     };
 
     // ---- CSV Import: parse pasted/loaded CSV and show column mapping ----
@@ -3989,12 +4017,10 @@
         {step === 0 && (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
             {[
-              { id: 'single', icon: 'Plus', label: 'Single Entry', desc: 'Add one host at a time' },
-              { id: 'paste', icon: 'Clipboard', label: 'Paste List', desc: 'Paste hostnames/IPs, one per line' },
-              { id: 'csv', icon: 'FileUp', label: 'CSV Import Wizard', desc: 'Upload or paste CSV — map columns to fields' },
-              { id: 'scan', icon: 'ScanLine', label: 'IP Range / Subnet Scan', desc: 'Ping sweep to discover live hosts' },
-              { id: 'ad', icon: 'Network', label: 'Import from AD', desc: 'Pull computers from AD OU (simulated)' },
-              { id: 'mac', icon: 'Cpu', label: 'By MAC Address', desc: 'Add WoL-enabled hosts by MAC' },
+              { id: 'single', icon: 'Plus', label: 'Add by IP / Hostname', desc: 'Enter hostname or IP manually' },
+              { id: 'scan', icon: 'ScanLine', label: 'IP Range / Subnet Scan', desc: 'Ping sweep — auto-resolves hostnames via NetBIOS/PsTools' },
+              { id: 'csv', icon: 'FileUp', label: 'CSV Import Wizard', desc: 'Upload CSV — map columns to fields' },
+              { id: 'ad', icon: 'Network', label: 'Import from Active Directory', desc: 'Pull computers from AD OU via Get-ADComputer' },
             ].map(m => (
               <button key={m.id} onClick={() => setMethod(m.id)} className={`flex items-start gap-3 p-3 rounded-lg border text-left ${method === m.id ? 'bg-primary/10 border-primary' : 'bg-surface-raised border-border hover:border-text-dim'}`}>
                 <Icon name={m.icon} size={18} className={method === m.id ? 'text-primary' : 'text-text-dim'} />
@@ -7901,6 +7927,122 @@
       return () => { cancelled = true; clearInterval(interval); };
     }, [liveHostsLoaded]);
 
+    // ---- Online/offline status polling — ping all hosts every 10 min ----
+    // Only runs when the Dashboard is open. Uses /api/hosts/status-check
+    // to batch-ping all hosts. Updates online/offline status in real time.
+    const checkHostStatuses = useCallback(async () => {
+      if (!window.SupportHubLANAPI) return;
+      const available = await window.SupportHubLANAPI.isBackendAvailable();
+      if (!available) return;
+      const hostnames = hosts.filter(h => h.hostname).map(h => h.hostname);
+      if (hostnames.length === 0) return;
+      try {
+        const result = await window.SupportHubLANAPI.checkHostStatus(hostnames);
+        if (result && result.success && !result.demo) {
+          let parsed;
+          try { parsed = JSON.parse(result.data); } catch { parsed = []; }
+          const arr = Array.isArray(parsed) ? parsed : [parsed];
+          const statusMap = {};
+          arr.forEach(r => { if (r.hostname) statusMap[r.hostname] = r.online ? 'online' : 'offline'; });
+          setHosts(prev => prev.map(h => {
+            const newStatus = statusMap[h.hostname];
+            if (newStatus && newStatus !== h.onlineStatus) {
+              return { ...h, onlineStatus: newStatus, pingStatus: newStatus === 'online' ? 'up' : 'down', lastSeen: newStatus === 'online' ? new Date().toISOString() : h.lastSeen };
+            }
+            return h;
+          }));
+        }
+      } catch (e) {}
+    }, [hosts]);
+
+    // Run status check on mount and every 10 minutes when on Dashboard
+    useEffect(() => {
+      if (route.page !== 'dashboard') return;
+      checkHostStatuses();
+      const interval = setInterval(checkHostStatuses, 600000); // 10 minutes
+      return () => clearInterval(interval);
+    }, [route.page, checkHostStatuses]);
+
+    // ---- Hardware info collection — when a host is added, fetch its hardware ----
+    // Called after addHosts() to populate hardware details via PsInfo
+    const fetchHardwareForHost = useCallback(async (hostname) => {
+      if (!window.SupportHubLANAPI) return;
+      try {
+        const result = await window.SupportHubLANAPI.getHardwareInfo(hostname);
+        if (result && result.success && !result.demo && result.data) {
+          const hw = result.data;
+          setHosts(prev => prev.map(h => {
+            if (h.hostname !== hostname) return h;
+            return {
+              ...h,
+              osName: hw.osType || h.osName,
+              osVersion: hw.osVersion || h.osVersion,
+              cpuModel: hw.cpuModel || h.cpuModel,
+              ramGb: hw.ram ? parseInt(hw.ram) : h.ramGb,
+              _hardwareInfo: hw,
+            };
+          }));
+          if (result.changes && result.changes.length > 0) {
+            toast.warning(`Hardware change detected on ${hostname}!`, {
+              detail: result.changes.map(c => `${c.field}: ${c.oldValue} → ${c.newValue}`).join(', '),
+              duration: 10000
+            });
+          }
+        }
+      } catch (e) {}
+    }, []);
+
+    // ---- Scheduled hardware check (every 24h) ----
+    // Runs automatically when the app is open. Can also be triggered manually.
+    const runHardwareCheck = useCallback(async () => {
+      if (!window.SupportHubLANAPI) return;
+      const available = await window.SupportHubLANAPI.isBackendAvailable();
+      if (!available) { toast.warning('Backend not connected.'); return; }
+      const hostnames = hosts.filter(h => h.hostname).map(h => h.hostname);
+      if (hostnames.length === 0) { toast.warning('No hosts to check.'); return; }
+      toast.info(`Checking hardware on ${hostnames.length} host(s)…`);
+      try {
+        const result = await window.SupportHubLANAPI.checkHardwareChanges(hostnames);
+        if (result && result.success && !result.demo) {
+          let parsed;
+          try { parsed = JSON.parse(result.data); } catch { parsed = []; }
+          const arr = Array.isArray(parsed) ? parsed : [parsed];
+          const changed = arr.filter(r => r.changes && r.changes.length > 0);
+          if (changed.length > 0) {
+            changed.forEach(r => {
+              toast.warning(`Hardware changed on ${r.hostname}!`, {
+                detail: r.changes.map(c => `${c.field}: ${c.oldValue} → ${c.newValue}`).join(', '),
+                duration: 10000
+              });
+            });
+            appendAudit({ action: 'hardware.check', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: { hostsChecked: hostnames.length, hostsChanged: changed.length }, result: 'success' });
+          } else {
+            toast.success(`Hardware check complete — no changes detected on ${hostnames.length} host(s).`);
+            appendAudit({ action: 'hardware.check', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: { hostsChecked: hostnames.length, changesDetected: 0 }, result: 'success' });
+          }
+        }
+      } catch (e) {
+        toast.error('Hardware check failed', { detail: e.message });
+      }
+    }, [hosts, appendAudit]);
+
+    // Auto-run hardware check every 24 hours when app is open
+    useEffect(() => {
+      const HW_CHECK_KEY = 'supporthublan:last-hw-check';
+      const lastCheck = (() => { try { return parseInt(localStorage.getItem(HW_CHECK_KEY) || '0', 10); } catch { return 0; } })();
+      const now = Date.now();
+      const twentyFourHours = 24 * 60 * 60 * 1000;
+      if (now - lastCheck > twentyFourHours) {
+        // Run check on mount if >24h since last check
+        setTimeout(() => { runHardwareCheck(); try { localStorage.setItem(HW_CHECK_KEY, String(now)); } catch {} }, 5000);
+      }
+      const interval = setInterval(() => {
+        runHardwareCheck();
+        try { localStorage.setItem(HW_CHECK_KEY, String(Date.now())); } catch {}
+      }, twentyFourHours);
+      return () => clearInterval(interval);
+    }, [runHardwareCheck]);
+
     // ---- Apply theme class to <html> + persist ----
     useEffect(() => {
       const html = document.documentElement;
@@ -8078,6 +8220,7 @@
       appendAudit, clearPersistedState,
       addUser, updateUser, removeUser, addPatchHistory, addDeploymentHistory, addJobLog,
       executePowerAction, executeDeployment, executeScript,
+      checkHostStatuses, runHardwareCheck, fetchHardwareForHost,
       addApiKey, removeApiKey, addMaintenanceWindow, removeMaintenanceWindow,
       updateNotificationRule, apiKeys, maintenanceWindows, notificationRules,
       savedCommands, addSavedCommand,

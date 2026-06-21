@@ -546,120 +546,165 @@ function parseRegUninstall(raw) {
 //   Adobe Refresh Manager 1.8.0
 //   CADReader v3.7.4.21
 // ---------------------------------------------------------------------------
-
-// Helper: parse a single CSV line, handling quoted fields with commas.
-function parseCsvLine(line) {
-  const result = [];
-  let current = '';
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (c === '"') {
-      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
-      else { inQuotes = !inQuotes; }
-    } else if (c === ',' && !inQuotes) {
-      result.push(current);
-      current = '';
-    } else {
-      current += c;
-    }
-  }
-  result.push(current);
-  return result.map(s => s.trim());
-}
-
+// parsePsInfoOutput — parse `psinfo -d -h -s -c \\HOST` output.
+//
+// ACTUAL PsInfo -c output format (from user's machine):
+//   - Single comma-delimited line (no headers, no quoting!)
+//   - Fields containing commas (like "Windows 10 Enterprise, Multiprocessor Free")
+//     are NOT quoted — they just create extra comma-delimited tokens
+//   - Structure: [system info 16 fields] [volumes 7 fields each] [hotfixes] [software]
+//
+// Example:
+//   DESKTOP-TFF7VU4,0 days 5 hours 51 minutes 38 seconds,Windows 10 Enterprise, Multiprocessor Free,Professional,6.3,0,26100,,Nauman,9.0000,C:\Windows,8,2.1 GHz,Intel(R) Core(TM) i7-8650U CPU @,3940 MB,Intel(R) UHD Graphics 620,C:,Fixed,NTFS,Windows,199.79 GB,68.25 GB,34.2%,D:,Fixed,NTFS,,276.93 GB,196.72 GB,71.0%,n/a Internet Explorer - 0,Adobe Refresh Manager 1.8.0,...
+//
+// System info fields (16, but kernel version may add 1 extra token due to comma):
+//   0: hostname
+//   1: uptime
+//   2: kernel version (MAY contain comma → spans 2 tokens)
+//   3: product type (Professional/Server/Enterprise/etc.)
+//   4: product version
+//   5: service pack
+//   6: kernel build number
+//   7: registered organization
+//   8: registered owner
+//   9: IE version
+//  10: system root
+//  11: processors (count)
+//  12: processor speed
+//  13: processor type
+//  14: physical memory
+//  15: video driver
+//
+// Volume fields (7 each, repeated):
+//   0: drive (C:)
+//   1: type (Fixed/Removable/CD-ROM)
+//   2: format (NTFS/FAT32)
+//   3: label
+//   4: size
+//   5: free
+//   6: free%
+//
+// Then hotfix entries (KB1234567 or "n/a Description")
+// Then software entries (application names)
+// ---------------------------------------------------------------------------
 function parsePsInfoOutput(raw, fallbackHost) {
+  // Join all lines into one string, filter out PsInfo banner lines
   const out = (raw || '').replace(/\r/g, '');
-  const lines = out.split('\n');
+  const lines = out.split('\n').filter(l => {
+    const t = l.trim();
+    return t && !/^PsInfo v/i.test(t) && !/^Copyright/i.test(t) && !/^Sysinternals/i.test(t);
+  });
+  const joined = lines.join('').trim();
 
-  const kv = {};        // key-value pairs from the "Field,Value" section
-  const logicalDisks = []; // volume entries
-  const hotfixes = [];     // KB numbers
-  const software = [];     // application names
+  // Split by comma. Note: PsInfo -c does NOT quote fields, so commas in values
+  // create extra tokens. We handle this by detecting the kernel version comma.
+  const tokens = joined.split(',').map(t => t.trim());
 
-  // State machine: track which CSV section we're in
-  let section = 'header'; // 'header' | 'kv' | 'volumes' | 'hotfixes' | 'software'
+  // Known product types — used to detect if kernel version spanned 2 tokens
+  const knownProductTypes = ['Professional', 'Server', 'Enterprise', 'Education',
+    'Home', 'Workstation', 'Standard', 'Datacenter', 'Essentials'];
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
+  let i = 0;
+  const sys = {};
 
-    // Skip empty lines and PsInfo banner
-    if (!trimmed) { continue; }
-    if (/^PsInfo v/i.test(trimmed)) { continue; }
-    if (/^Copyright/i.test(trimmed)) { continue; }
-    if (/^Sysinternals/i.test(trimmed)) { continue; }
+  sys.hostname = tokens[i++] || '';
+  sys.uptime = tokens[i++] || '';
 
-    // Detect section transitions
-    // Key-value section: header row "Field,Value"
-    if (/^Field\s*,\s*Value/i.test(line)) { section = 'kv'; continue; }
-    // Volume section: header row "Volume,Type,Format,..."
-    if (/^Volume\s*,\s*Type\s*,\s*Format/i.test(line)) { section = 'volumes'; continue; }
-    // Hotfix section: header "Hotfix" or "Installed,HotFix"
-    if (/^Hotfix\s*$/i.test(trimmed) || /^Installed\s*,?\s*HotFix/i.test(line)) { section = 'hotfixes'; continue; }
-    // Software section: header "Application" or "Applications:"
-    if (/^Application/i.test(trimmed) && !/,/.test(line)) { section = 'software'; continue; }
-
-    // Parse line based on current section
-    if (section === 'kv') {
-      const fields = parseCsvLine(line);
-      if (fields.length >= 2 && fields[0]) {
-        const key = fields[0].toLowerCase();
-        const val = fields[1] || '';
-        if (val && !(key in kv)) kv[key] = val;
-      }
-    } else if (section === 'volumes') {
-      const fields = parseCsvLine(line);
-      // Expected: Volume, Type, Format, Label, Size, Free, Free%
-      if (fields.length >= 6 && /^[A-Z]:/i.test(fields[0])) {
-        const sizeMatch = /([\d.]+)\s*(GB|MB|TB)/i.exec(fields[4] || '');
-        const freeMatch = /([\d.]+)\s*(GB|MB|TB)/i.exec(fields[5] || '');
-        let sizeGB = 0, freeGB = 0;
-        if (sizeMatch) {
-          const n = parseFloat(sizeMatch[1]);
-          const u = sizeMatch[2].toUpperCase();
-          sizeGB = u === 'TB' ? n * 1024 : n;
-        }
-        if (freeMatch) {
-          const n = parseFloat(freeMatch[1]);
-          const u = freeMatch[2].toUpperCase();
-          freeGB = u === 'TB' ? n * 1024 : n;
-        }
-        logicalDisks.push({
-          drive: fields[0],
-          sizeGB: Math.round(sizeGB * 100) / 100,
-          freeGB: Math.round(freeGB * 100) / 100,
-          fileSystem: fields[2] || '',
-          volumeName: fields[3] || '',
-        });
-      }
-    } else if (section === 'hotfixes') {
-      // Each line is a KB number (or "n/a,Description" for some entries)
-      const kbMatches = trimmed.match(/KB\d+/gi);
-      if (kbMatches) {
-        kbMatches.forEach(kb => hotfixes.push(kb.toUpperCase()));
-      }
-    } else if (section === 'software') {
-      // Each line is an application name (possibly CSV with extra fields)
-      const fields = parseCsvLine(line);
-      const name = fields[0] || trimmed;
-      if (name) software.push({ name });
+  // Kernel version — may span 2 tokens if it contains a comma
+  // ("Windows 10 Enterprise, Multiprocessor Free" → 2 tokens)
+  let kernelVersion = tokens[i++] || '';
+  if (i < tokens.length) {
+    const nextToken = tokens[i] || '';
+    // If next token is NOT a known product type, the kernel version had a comma
+    const isProductType = knownProductTypes.some(pt =>
+      nextToken.toLowerCase() === pt.toLowerCase()
+    );
+    if (!isProductType && nextToken !== '') {
+      kernelVersion += ', ' + tokens[i++];
     }
   }
+  sys.kernelVersion = kernelVersion;
 
-  // Extract hostname from "System information for" value
-  let hostname = fallbackHost;
-  const sysInfo = kv['system information for'] || '';
-  const hostMatch = /\\+([^\s,]+)/.exec(sysInfo);
-  if (hostMatch) hostname = hostMatch[1];
+  sys.productType = tokens[i++] || '';
+  sys.productVersion = tokens[i++] || '';
+  sys.servicePack = tokens[i++] || '';
+  sys.kernelBuild = tokens[i++] || '';
+  sys.registeredOrg = tokens[i++] || '';
+  sys.registeredOwner = tokens[i++] || '';
+  sys.ieVersion = tokens[i++] || '';
+  sys.systemRoot = tokens[i++] || '';
+  sys.processors = tokens[i++] || '';
+  sys.processorSpeed = tokens[i++] || '';
+  sys.processorType = tokens[i++] || '';
+  sys.physicalMemory = tokens[i++] || '';
+  sys.videoDriver = tokens[i++] || '';
 
-  // Parse processor speed (e.g. "2.1 GHz")
-  const procSpeed = kv['processor speed'] || '';
-  const speedMatch = /([\d.]+)\s*GHz/i.exec(procSpeed);
+  // Parse volumes — each is 7 tokens starting with a drive letter pattern
+  const logicalDisks = [];
+  while (i < tokens.length && /^[A-Z]:$/i.test(tokens[i])) {
+    const drive = tokens[i++];
+    const type = tokens[i++] || '';
+    const format = tokens[i++] || '';
+    const label = tokens[i++] || '';
+    const size = tokens[i++] || '';
+    const free = tokens[i++] || '';
+    i++; // skip free%
+
+    const sizeMatch = /([\d.]+)\s*(GB|MB|TB)/i.exec(size);
+    const freeMatch = /([\d.]+)\s*(GB|MB|TB)/i.exec(free);
+    let sizeGB = 0, freeGB = 0;
+    if (sizeMatch) {
+      const n = parseFloat(sizeMatch[1]);
+      const u = sizeMatch[2].toUpperCase();
+      sizeGB = u === 'TB' ? n * 1024 : n;
+    }
+    if (freeMatch) {
+      const n = parseFloat(freeMatch[1]);
+      const u = freeMatch[2].toUpperCase();
+      freeGB = u === 'TB' ? n * 1024 : n;
+    }
+    logicalDisks.push({
+      drive,
+      sizeGB: Math.round(sizeGB * 100) / 100,
+      freeGB: Math.round(freeGB * 100) / 100,
+      fileSystem: format,
+      volumeName: label,
+    });
+  }
+
+  // Parse hotfixes and software
+  // Hotfix entries: contain "KB" followed by digits, or start with "n/a"
+  // Software entries: everything else
+  const hotfixes = [];
+  const software = [];
+  let foundSoftware = false;
+  while (i < tokens.length) {
+    const token = tokens[i++].trim();
+    if (!token) continue;
+
+    // Check if this is a KB hotfix
+    const kbMatch = token.match(/KB\d+/i);
+    if (kbMatch && !foundSoftware) {
+      hotfixes.push(kbMatch[0].toUpperCase());
+      continue;
+    }
+
+    // "n/a" entries are hotfix placeholders (like "n/a Internet Explorer - 0")
+    if (/^n\/a/i.test(token) && !foundSoftware) {
+      continue;
+    }
+
+    // Once we hit a non-hotfix entry, everything after is software
+    foundSoftware = true;
+    software.push({ name: token });
+  }
+
+  // Parse processor speed
+  const speedMatch = /([\d.]+)\s*GHz/i.exec(sys.processorSpeed || '');
   const maxSpeedMHz = speedMatch ? Math.round(parseFloat(speedMatch[1]) * 1000) : 0;
 
-  // Parse total RAM (e.g. "3940 MB")
-  const ramMatch = /(\d+)\s*(MB|GB|TB)/i.exec(kv['physical memory'] || '');
+  // Parse total RAM
+  const ramMatch = /(\d+)\s*(MB|GB|TB)/i.exec(sys.physicalMemory || '');
   let totalRamMB = 0;
   if (ramMatch) {
     const n = parseInt(ramMatch[1], 10);
@@ -668,31 +713,31 @@ function parsePsInfoOutput(raw, fallbackHost) {
   }
 
   // "Processors" = thread count (logical processors)
-  const processorCount = parseInt(kv['processors'] || '0', 10);
+  const processorCount = parseInt(sys.processors || '0', 10);
 
   // Determine CPU manufacturer from processor type name
-  const procName = kv['processor type'] || '';
+  const procName = sys.processorType || '';
   let cpuManufacturer = '';
   if (/Intel/i.test(procName)) cpuManufacturer = 'Intel';
   else if (/AMD|Advanced Micro/i.test(procName)) cpuManufacturer = 'AMD';
 
   // Build GPU array from video driver field
   const gpu = [];
-  if (kv['video driver']) {
-    kv['video driver'].split(/[,;]/).map(s => s.trim()).filter(Boolean).forEach(name => {
+  if (sys.videoDriver) {
+    sys.videoDriver.split(/[,;]/).map(s => s.trim()).filter(Boolean).forEach(name => {
       gpu.push({ name, manufacturer: '', ramMB: 0, driverVersion: '', driverDate: '' });
     });
   }
 
   return {
-    hostname,
+    hostname: sys.hostname || fallbackHost,
     scannedAt: new Date().toISOString(),
 
     system: {
-      manufacturer: kv['system manufacturer'] || '',
-      model: kv['system model'] || '',
+      manufacturer: '',
+      model: '',
       serial: '',
-      systemType: kv['system type'] || '',
+      systemType: '',
       domain: '',
       totalRamMB,
     },
@@ -718,15 +763,15 @@ function parsePsInfoOutput(raw, fallbackHost) {
     gpu,
 
     os: {
-      name: kv['kernel version'] || '',
-      version: kv['product version'] || '',
-      build: kv['kernel build number'] || '',
+      name: sys.kernelVersion || '',
+      version: sys.productVersion || '',
+      build: sys.kernelBuild || '',
       architecture: '',
-      installDate: kv['installation date'] || '',
+      installDate: '',
       lastBoot: '',
       serial: '',
-      registeredOrg: kv['registered organization'] || '',
-      registeredUser: kv['registered owner'] || '',
+      registeredOrg: sys.registeredOrg || '',
+      registeredUser: sys.registeredOwner || '',
     },
 
     hotfixes,

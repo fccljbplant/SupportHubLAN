@@ -532,6 +532,7 @@
 
         // Hardware info + change detection
         getHardwareInfo: (hostname) => apiCall('/api/hosts/' + hostname + '/hardware', {}),
+        getApps: (hostname) => apiCall('/api/hosts/' + hostname + '/apps', {}),
         checkHardwareChanges: (hostnames) => apiCall('/api/hardware/check-changes', { hostnames }),
         checkHostStatus: (hostnames) => apiCall('/api/hosts/status-check', { hostnames }),
         resolveNetbios: (ip) => apiCall('/api/hosts/resolve-netbios', { ip }),
@@ -1651,7 +1652,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v4.0.5';
+  const APP_VERSION = 'v4.0.6';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -1916,15 +1917,11 @@
       { id: 'overview', label: 'Overview', icon: 'Info' },
       { id: 'hardware', label: 'Hardware', icon: 'Cpu' },
       { id: 'updates', label: 'Updates', icon: 'ShieldCheck' },
+      { id: 'apps', label: 'Installed Apps', icon: 'Boxes' },
+      { id: 'services', label: 'Services', icon: 'Activity' },
       { id: 'deployments', label: 'Deployments', icon: 'Package' },
       { id: 'jobs', label: 'Jobs', icon: 'ListOrdered' },
-      { id: 'services', label: 'Services', icon: 'Activity' },
-      { id: 'processes', label: 'Processes', icon: 'Cpu' },
-      { id: 'logs', label: 'Event Logs', icon: 'FileText' },
-      { id: 'network', label: 'Network', icon: 'Network' },
-      { id: 'apps', label: 'Installed Apps', icon: 'Boxes' },
       { id: 'remote', label: 'Remote', icon: 'Monitor' },
-      { id: 'audit', label: 'Audit Trail', icon: 'History' },
     ];
     if (job) tabs = [
       { id: 'overview', label: 'Overview', icon: 'Info' },
@@ -1995,13 +1992,13 @@
     let tabs = [];
     if (host) tabs = [
       { id: 'overview', label: 'Overview', icon: 'Info' },
-      { id: 'services', label: 'Services', icon: 'Activity' },
-      { id: 'processes', label: 'Processes', icon: 'Cpu' },
-      { id: 'logs', label: 'Event Logs', icon: 'FileText' },
+      { id: 'hardware', label: 'Hardware', icon: 'Cpu' },
       { id: 'updates', label: 'Updates', icon: 'ShieldCheck' },
-      { id: 'network', label: 'Network', icon: 'Network' },
-      { id: 'apps', label: 'Apps', icon: 'Boxes' },
-      { id: 'audit', label: 'Audit', icon: 'History' },
+      { id: 'apps', label: 'Installed Apps', icon: 'Boxes' },
+      { id: 'services', label: 'Services', icon: 'Activity' },
+      { id: 'deployments', label: 'Deployments', icon: 'Package' },
+      { id: 'jobs', label: 'Jobs', icon: 'ListOrdered' },
+      { id: 'remote', label: 'Remote', icon: 'Monitor' },
     ];
     if (job) tabs = [
       { id: 'overview', label: 'Overview', icon: 'Info' },
@@ -2434,29 +2431,32 @@
 
   // ==========================================================================
   // HardwareTab — dedicated component for the host drawer's "Hardware" tab.
-  // Shows the COMPLETE hardware breakdown returned by /api/hosts/:hostname/hardware:
-  //   - System summary (hostname, OS, install date, uptime)
-  //   - Processors
-  //   - Memory (total)
-  //   - Storage: Logical volumes (drive letters with free/total space)
-  //   - Storage: Physical disks
-  //   - Network adapters (IP/MAC/DHCP/Gateway/DNS)
-  //   - GPU(s)
+  // Shows the COMPLETE hardware audit breakdown returned by
+  // /api/hosts/:hostname/hardware (now using wmic + ipconfig + psloggedon):
+  //   - System (make, model, serial, type, domain, total RAM)
+  //   - Motherboard (make, model, version, serial)
+  //   - BIOS (manufacturer, version, serial, date)
+  //   - Processor — ONE only (make, model, cores, threads, speed)
+  //   - Memory sticks (capacity, speed, part#, slot)
+  //   - Storage — Volumes (drive letters with usage bars)
+  //   - Storage — Physical Disks (model, size, interface, serial)
+  //   - Network Adapters (IP, MAC, DHCP, gateway, DNS)
+  //   - Graphics / GPU (name, manufacturer, VRAM, driver)
+  //   - Operating System (name, build, arch, install date, last boot, serial)
   //   - Logged-in user
-  //   - Scan timestamp + Rescan button
   // ==========================================================================
-  const HardwareTab = ({ host, updateHosts, onSwitchTab }) => {
+  const HardwareTab = ({ host, updateHosts }) => {
     const toast = useToast();
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
-    const [rawOutput, setRawOutput] = useState(null);
+    const [rawOutputs, setRawOutputs] = useState(null);
     const hw = host._hardwareInfo;
 
     const scan = async () => {
       if (!window.SupportHubLANAPI) { toast.warning('Backend not connected'); return; }
       setLoading(true);
       setError(null);
-      setRawOutput(null);
+      setRawOutputs(null);
       toast.info('Scanning hardware on ' + host.hostname + '…');
       try {
         const r = await window.SupportHubLANAPI.getHardwareInfo(host.hostname);
@@ -2465,11 +2465,10 @@
             ...h,
             _hardwareInfo: r.data,
             osName: r.data?.os?.name || h.osName,
-            osVersion: r.data?.os?.version || h.osVersion,
             osBuild: r.data?.os?.build || h.osBuild,
-            cpuModel: r.data?.processors?.[0]?.name || h.cpuModel,
+            cpuModel: r.data?.processor?.name || h.cpuModel,
             ramGb: r.data?.system?.totalRamMB ? Math.round(r.data.system.totalRamMB / 1024) : h.ramGb,
-            ipAddress: r.data?.network?.[0]?.ipAddress?.split(',')[0]?.trim() || h.ipAddress,
+            ipAddress: r.data?.network?.[0]?.ipAddress || h.ipAddress,
             macAddress: r.data?.network?.[0]?.macAddress || h.macAddress,
           } : h));
           toast.success('Hardware scan complete for ' + host.hostname);
@@ -2481,14 +2480,13 @@
               });
             });
           }
-          if (r.rawPsInfo) setRawOutput(r.rawPsInfo);
+          if (r.rawOutputs) setRawOutputs(r.rawOutputs);
         } else if (r && r.demo) {
           toast.warning('Backend not connected');
           setError('Backend not connected');
         } else {
           toast.error('Hardware scan failed', { detail: r?.error, duration: 8000 });
           setError(r?.error || 'Scan failed');
-          if (r?.rawPsInfo) setRawOutput(r.rawPsInfo);
         }
       } catch (e) {
         toast.error('Hardware scan failed', { detail: e.message, duration: 8000 });
@@ -2514,8 +2512,8 @@
           </div>
           <div className="text-text-dim text-xs py-8 text-center">
             <Icon name="RefreshCw" size={16} className="inline mr-2 animate-spin" />
-            Running psinfo / ipconfig / psloggedon on {host.hostname}…<br />
-            <span className="text-[10px]">(this takes 5-15 seconds)</span>
+            Running wmic + ipconfig + psloggedon on {host.hostname}…<br />
+            <span className="text-[10px]">(11 parallel PsExec calls — takes 10\u201320 seconds)</span>
           </div>
         </div>
       );
@@ -2534,24 +2532,18 @@
             <div className="p-2 bg-danger/10 border border-danger/30 rounded text-xs text-danger">
               <div className="font-medium">Scan failed:</div>
               <div className="mt-0.5">{error}</div>
-              {rawOutput && (
-                <details className="mt-1">
-                  <summary className="cursor-pointer text-[10px]">PsInfo raw output</summary>
-                  <pre className="text-[9px] mt-1 whitespace-pre-wrap break-all max-h-40 overflow-y-auto">{rawOutput}</pre>
-                </details>
-              )}
             </div>
           )}
           {!error && (
             <div className="text-text-dim text-xs py-6 text-center">
-              No hardware data yet. Click <strong>Scan Hardware</strong> to fetch details via PsInfo.
+              No hardware data yet. Click <strong>Scan Hardware</strong> to fetch details.
             </div>
           )}
         </div>
       );
     }
 
-    // We have hardware data — render the full breakdown
+    // Helper: section title
     const SectionTitle = ({ icon, children }) => (
       <div className="flex items-center gap-1.5 mt-3 mb-1">
         <Icon name={icon} size={12} className="text-text-dim" />
@@ -2559,18 +2551,28 @@
       </div>
     );
 
-    const Row = ({ label, value, mono }) => (
-      <div className="flex justify-between items-start py-0.5 text-xs">
-        <span className="text-text-dim">{label}</span>
-        <span className={`text-text text-right ${mono ? 'font-mono' : ''}`}>{value || '—'}</span>
-      </div>
-    );
+    // Helper: label/value row (only shows if value is non-empty)
+    const Row = ({ label, value, mono }) => {
+      if (!value) return null;
+      return (
+        <div className="flex justify-between items-start py-0.5 text-xs">
+          <span className="text-text-dim">{label}</span>
+          <span className={`text-text text-right ${mono ? 'font-mono' : ''}`}>{value}</span>
+        </div>
+      );
+    };
+
+    const cpu = hw.processor;
+    const mb = hw.motherboard;
+    const bios = hw.bios;
+    const sys = hw.system;
+    const osInfo = hw.os;
 
     return (
       <div className="space-y-1">
         {/* Header with rescan button */}
         <div className="flex items-center justify-between">
-          <span className="text-meta text-text-dim uppercase">Hardware</span>
+          <span className="text-meta text-text-dim uppercase">Hardware Audit</span>
           <div className="flex items-center gap-1.5">
             {hw.scannedAt && (
               <span className="text-[9px] text-text-dim">
@@ -2589,60 +2591,87 @@
           </div>
         )}
 
-        {/* SYSTEM */}
+        {/* SYSTEM (Make / Model / Serial) */}
         <SectionTitle icon="Server">System</SectionTitle>
         <div className="p-2 bg-surface-raised rounded border border-border">
-          <Row label="Hostname" value={hw.hostname} mono />
-          <Row label="OS" value={hw.os?.name} />
-          {hw.os?.build && <Row label="OS Build" value={hw.os.build} mono />}
-          {hw.os?.installDate && <Row label="Install Date" value={hw.os.installDate} />}
-          {hw.os?.lastBoot && <Row label="Last Boot" value={hw.os.lastBoot} />}
-          {hw.system?.domain && <Row label="Domain" value={hw.system.domain} mono />}
-          {hw.system?.manufacturer && <Row label="Manufacturer" value={hw.system.manufacturer} />}
-          {hw.system?.model && <Row label="Model" value={hw.system.model} />}
-          {hw.system?.serial && <Row label="Serial" value={hw.system.serial} mono />}
-          {hw.system?.biosVersion && <Row label="BIOS Version" value={hw.system.biosVersion} />}
+          <Row label="Manufacturer" value={sys?.manufacturer} />
+          <Row label="Model" value={sys?.model} />
+          <Row label="Serial Number" value={sys?.serial} mono />
+          <Row label="System Type" value={sys?.systemType} />
+          <Row label="Domain" value={sys?.domain} mono />
+          {sys?.totalRamMB > 0 && (
+            <Row label="Total RAM" value={sys.totalRamMB >= 1024 ? (sys.totalRamMB / 1024).toFixed(1) + ' GB' : sys.totalRamMB + ' MB'} />
+          )}
+          {sys?.numberOfProcessors > 0 && <Row label="Processor Count" value={String(sys.numberOfProcessors)} />}
         </div>
 
-        {/* PROCESSORS */}
-        <SectionTitle icon="Cpu">Processors</SectionTitle>
-        <div className="p-2 bg-surface-raised rounded border border-border space-y-1.5">
-          {hw.processors && hw.processors.length > 0 ? hw.processors.map((cpu, i) => (
-            <div key={i} className="text-xs">
-              <div className="text-text font-medium">{cpu.name || 'Unknown CPU'}</div>
-              <div className="grid grid-cols-2 gap-x-2 text-[10px] text-text-dim mt-0.5">
-                <div>Manufacturer: {cpu.manufacturer || '—'}</div>
-                <div>Cores: {cpu.cores || '—'}C / {cpu.logicalCores || '—'}T</div>
-                {cpu.maxSpeedMHz && <div>Max Speed: {(cpu.maxSpeedMHz / 1000).toFixed(2)} GHz</div>}
-                {cpu.currentSpeedMHz && <div>Current: {(cpu.currentSpeedMHz / 1000).toFixed(2)} GHz</div>}
-                {cpu.socket && <div>Socket: {cpu.socket}</div>}
-              </div>
-            </div>
-          )) : (
+        {/* MOTHERBOARD */}
+        <SectionTitle icon="CircuitBoard">Motherboard</SectionTitle>
+        <div className="p-2 bg-surface-raised rounded border border-border">
+          <Row label="Manufacturer" value={mb?.manufacturer} />
+          <Row label="Product" value={mb?.product} />
+          <Row label="Version" value={mb?.version} />
+          <Row label="Serial Number" value={mb?.serial} mono />
+          {!mb?.manufacturer && !mb?.product && !mb?.serial && (
+            <div className="text-text-dim text-xs">No motherboard data.</div>
+          )}
+        </div>
+
+        {/* BIOS */}
+        <SectionTitle icon="Chip">BIOS</SectionTitle>
+        <div className="p-2 bg-surface-raised rounded border border-border">
+          <Row label="Manufacturer" value={bios?.manufacturer} />
+          <Row label="Name" value={bios?.name} />
+          <Row label="Version" value={bios?.version} />
+          <Row label="Serial Number" value={bios?.serial} mono />
+          <Row label="Release Date" value={bios?.releaseDate} />
+          {!bios?.manufacturer && !bios?.version && (
+            <div className="text-text-dim text-xs">No BIOS data.</div>
+          )}
+        </div>
+
+        {/* PROCESSOR — ONE only (make / model / cores / threads) */}
+        <SectionTitle icon="Cpu">Processor</SectionTitle>
+        <div className="p-2 bg-surface-raised rounded border border-border">
+          {cpu ? (
+            <>
+              <Row label="Make" value={cpu.manufacturer} />
+              <Row label="Model" value={cpu.name} />
+              {cpu.cores > 0 && <Row label="Cores" value={String(cpu.cores)} />}
+              {cpu.threads > 0 && <Row label="Threads" value={String(cpu.threads)} />}
+              {cpu.maxSpeedMHz > 0 && (
+                <Row label="Max Speed" value={(cpu.maxSpeedMHz / 1000).toFixed(2) + ' GHz'} />
+              )}
+              {cpu.currentSpeedMHz > 0 && (
+                <Row label="Current Speed" value={(cpu.currentSpeedMHz / 1000).toFixed(2) + ' GHz'} />
+              )}
+              {cpu.socket && <Row label="Socket" value={cpu.socket} mono />}
+            </>
+          ) : (
             <div className="text-text-dim text-xs">No processor data.</div>
           )}
         </div>
 
-        {/* MEMORY */}
+        {/* MEMORY STICKS */}
         <SectionTitle icon="MemoryStick">Memory</SectionTitle>
         <div className="p-2 bg-surface-raised rounded border border-border">
-          {hw.system?.totalRamMB ? (
-            <Row label="Total RAM" value={hw.system.totalRamMB >= 1024 ? (hw.system.totalRamMB / 1024).toFixed(1) + ' GB' : hw.system.totalRamMB + ' MB'} />
-          ) : (
-            <div className="text-text-dim text-xs">No memory data.</div>
+          {sys?.totalRamMB > 0 && (
+            <Row label="Total RAM" value={sys.totalRamMB >= 1024 ? (sys.totalRamMB / 1024).toFixed(1) + ' GB' : sys.totalRamMB + ' MB'} />
           )}
-          {hw.memory && hw.memory.length > 0 && (
+          {hw.memory && hw.memory.length > 0 ? (
             <div className="mt-2 pt-2 border-t border-border space-y-1">
               <div className="text-[10px] text-text-dim uppercase mb-1">Sticks ({hw.memory.length})</div>
               {hw.memory.map((m, i) => (
                 <div key={i} className="text-[10px] text-text">
                   <span className="font-mono">{m.deviceLocator || 'Slot ' + (i+1)}</span>
-                  {' — '}{m.capacity} GB {m.speed ? '· ' + m.speed + ' MHz' : ''}
+                  {' — '}{m.capacityGB} GB{m.speed ? ' · ' + m.speed + ' MHz' : ''}
                   {m.manufacturer ? ' · ' + m.manufacturer : ''}
                   {m.partNumber ? ' · ' + m.partNumber : ''}
                 </div>
               ))}
             </div>
+          ) : (
+            <div className="text-text-dim text-xs mt-1">No individual stick data (WMI may not expose this on some systems).</div>
           )}
         </div>
 
@@ -2680,9 +2709,15 @@
             <SectionTitle icon="Disc">Physical Disks</SectionTitle>
             <div className="p-2 bg-surface-raised rounded border border-border space-y-1">
               {hw.disks.map((d, i) => (
-                <div key={i} className="text-xs flex justify-between">
-                  <span className="text-text">{d.model || 'Disk ' + i}</span>
-                  <span className="text-text-dim tnum">{d.sizeGB} GB {d.interface ? '· ' + d.interface : ''}</span>
+                <div key={i} className="text-xs">
+                  <div className="flex justify-between">
+                    <span className="text-text">{d.model || 'Disk ' + i}</span>
+                    <span className="text-text-dim tnum">{d.sizeGB} GB</span>
+                  </div>
+                  <div className="text-[9px] text-text-dim">
+                    {d.interface ? d.interface + ' · ' : ''}{d.partitions} partition(s)
+                    {d.serialNumber ? ' · S/N: ' + d.serialNumber : ''}
+                  </div>
                 </div>
               ))}
             </div>
@@ -2704,11 +2739,11 @@
               </div>
             </div>
           )) : (
-            <div className="text-text-dim text-xs">No network adapters. Run rescan.</div>
+            <div className="text-text-dim text-xs">No network adapters found.</div>
           )}
         </div>
 
-        {/* GPU */}
+        {/* GPU / GRAPHICS */}
         {hw.gpu && hw.gpu.length > 0 && (
           <>
             <SectionTitle icon="Monitor">Graphics</SectionTitle>
@@ -2725,38 +2760,167 @@
           </>
         )}
 
-        {/* CD/DVD */}
-        {hw.cdDvd && hw.cdDvd.length > 0 && (
-          <>
-            <SectionTitle icon="Disc">CD / DVD</SectionTitle>
-            <div className="p-2 bg-surface-raised rounded border border-border space-y-1">
-              {hw.cdDvd.map((c, i) => (
-                <div key={i} className="text-xs text-text">{c.name || 'Drive ' + (i+1)}</div>
-              ))}
-            </div>
-          </>
-        )}
+        {/* OPERATING SYSTEM */}
+        <SectionTitle icon="Monitor">Operating System</SectionTitle>
+        <div className="p-2 bg-surface-raised rounded border border-border">
+          <Row label="OS" value={osInfo?.name} />
+          <Row label="Version" value={osInfo?.version} />
+          <Row label="Build" value={osInfo?.build} mono />
+          <Row label="Architecture" value={osInfo?.architecture} />
+          <Row label="Install Date" value={osInfo?.installDate} />
+          <Row label="Last Boot" value={osInfo?.lastBoot} />
+          <Row label="OS Serial" value={osInfo?.serial} mono />
+          <Row label="Registered Org" value={osInfo?.registeredOrg} />
+          <Row label="Registered User" value={osInfo?.registeredUser} />
+        </div>
 
         {/* LOGGED-IN USER */}
         <SectionTitle icon="User">User</SectionTitle>
         <div className="p-2 bg-surface-raised rounded border border-border">
           <Row label="Logged In" value={hw.loggedInUser} mono />
-          {hw.managedBy && <Row label="Managed By (AD)" value={hw.managedBy} />}
+          {!hw.loggedInUser && <div className="text-text-dim text-xs">No user currently logged in.</div>}
         </div>
 
-        {/* RAW PSINFO OUTPUT (collapsible) */}
-        {rawOutput && (
+        {/* RAW OUTPUTS (collapsible, for debugging) */}
+        {rawOutputs && (
           <div className="mt-3">
             <details>
-              <summary className="cursor-pointer text-[10px] text-text-dim">Raw PsInfo output</summary>
-              <pre className="text-[9px] mt-1 p-2 bg-surface-raised rounded border border-border whitespace-pre-wrap break-all max-h-60 overflow-y-auto">{rawOutput}</pre>
+              <summary className="cursor-pointer text-[10px] text-text-dim">Raw wmic outputs (debug)</summary>
+              <div className="mt-1 space-y-2">
+                {Object.entries(rawOutputs).map(([key, val]) => val ? (
+                  <div key={key}>
+                    <div className="text-[9px] text-text-dim font-mono">{key}</div>
+                    <pre className="text-[9px] p-1 bg-surface-raised rounded border border-border whitespace-pre-wrap break-all max-h-32 overflow-y-auto">{val}</pre>
+                  </div>
+                ) : null)}
+              </div>
             </details>
           </div>
         )}
 
         <div className="text-[9px] text-text-dim text-center pt-2 pb-1">
-          Data source: PsInfo · ipconfig /all · PsLoggedOn (no PowerShell)
+          Data source: PsExec + wmic · ipconfig /all · PsLoggedOn (11 parallel calls, no PowerShell)
         </div>
+      </div>
+    );
+  };
+
+  // ==========================================================================
+  // AppsTab — dedicated component for the host drawer's "Installed Apps" tab.
+  // Uses the new /api/hosts/:hostname/apps endpoint (PsExec + reg query,
+  // NO PowerShell). Shows installed software with search filter.
+  // ==========================================================================
+  const AppsTab = ({ host }) => {
+    const toast = useToast();
+    const [apps, setApps] = useState(null);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState(null);
+    const [search, setSearch] = useState('');
+
+    const fetchApps = async () => {
+      if (!window.SupportHubLANAPI) { toast.warning('Backend not connected'); return; }
+      setLoading(true);
+      setError(null);
+      setApps(null);
+      try {
+        const r = await window.SupportHubLANAPI.getApps(host.hostname);
+        if (r && r.success && !r.demo) {
+          const list = r.apps || [];
+          setApps(list);
+          toast.success(`Found ${list.length} app(s) on ${host.hostname}`);
+        } else if (r && r.demo) {
+          toast.warning('Backend not connected');
+          setError('Backend not connected');
+        } else {
+          toast.error('Failed to list apps', { detail: r?.error, duration: 8000 });
+          setError(r?.error || 'Failed');
+        }
+      } catch (e) {
+        toast.error('Failed to list apps', { detail: e.message, duration: 8000 });
+        setError(e.message);
+      }
+      setLoading(false);
+    };
+
+    // Auto-fetch on mount
+    useEffect(() => {
+      if (window.SupportHubLANAPI) fetchApps();
+      // eslint-disable-next-line
+    }, [host.id]);
+
+    const filtered = useMemo(() => {
+      if (!apps) return [];
+      if (!search) return apps;
+      const q = search.toLowerCase();
+      return apps.filter(a =>
+        (a.name || '').toLowerCase().includes(q) ||
+        (a.publisher || '').toLowerCase().includes(q) ||
+        (a.version || '').toLowerCase().includes(q)
+      );
+    }, [apps, search]);
+
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-meta text-text-dim uppercase">
+            Installed Software {apps ? `(${apps.length})` : ''}
+          </span>
+          <ActionButton variant="secondary" size="sm" icon="RefreshCw" disabled={loading} onClick={fetchApps}>
+            {loading ? 'Scanning…' : 'Refresh'}
+          </ActionButton>
+        </div>
+
+        {apps && apps.length > 0 && (
+          <input
+            type="text"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Search by name, publisher, or version…"
+            className="w-full px-2 py-1 text-xs bg-surface border border-border rounded text-text placeholder:text-text-dim focus:outline-none focus:border-primary"
+          />
+        )}
+
+        {loading && (
+          <div className="text-text-dim text-xs py-6 text-center">
+            <Icon name="RefreshCw" size={14} className="inline mr-1.5 animate-spin" />
+            Querying registry on {host.hostname}…
+          </div>
+        )}
+
+        {error && !loading && (
+          <div className="p-2 bg-danger/10 border border-danger/30 rounded text-xs text-danger">
+            <div className="font-medium">Error:</div>
+            <div className="mt-0.5">{error}</div>
+          </div>
+        )}
+
+        {!loading && !error && apps && apps.length === 0 && (
+          <div className="text-text-dim text-xs py-4 text-center">No installed apps found.</div>
+        )}
+
+        {!loading && filtered.length > 0 && (
+          <div className="space-y-1 max-h-[500px] overflow-y-auto">
+            {search && (
+              <div className="text-[10px] text-text-dim text-center pb-1">
+                Showing {filtered.length} of {apps.length}
+              </div>
+            )}
+            {filtered.map((a, i) => (
+              <div key={i} className="p-1.5 bg-surface-raised rounded border border-border text-xs">
+                <div className="text-text">{a.name || 'Unknown'}</div>
+                <div className="text-[10px] text-text-dim">
+                  {a.version || ''}{a.publisher ? ' · ' + a.publisher : ''}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {!loading && apps && apps.length > 0 && (
+          <div className="text-[9px] text-text-dim text-center pt-1">
+            Data source: PsExec + reg query (no PowerShell) · 64-bit + 32-bit + User registry
+          </div>
+        )}
       </div>
     );
   };
@@ -2792,16 +2956,8 @@
     useEffect(() => {
       if (!liveHost?.hostname) return;
       if (tab === 'services') fetchDrawerData(() => window.SupportHubLANAPI.getServices(liveHost.hostname, null));
-      else if (tab === 'processes') fetchDrawerData(() => window.SupportHubLANAPI.getProcesses(liveHost.hostname, null));
-      else if (tab === 'logs') fetchDrawerData(() => window.SupportHubLANAPI.getEventLog(liveHost.hostname, 'System', 30, 'All', null));
-      else if (tab === 'apps') fetchDrawerData(() => window.SupportHubLANAPI.pstoolsExecute('psexec', liveHost.hostname, '-s powershell -NoProfile -Command "Get-ItemProperty HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* | Where-Object DisplayName | Select-Object DisplayName,DisplayVersion,Publisher | ConvertTo-Json -Compress"'));
-      else if (tab === 'audit') fetchDrawerData(async () => {
-        const resp = await fetch(window.SUPPORTHUBLAN_API_URL + '/api/audit/search?q=' + encodeURIComponent(liveHost.hostname));
-        const json = await resp.json();
-        return { success: true, demo: false, data: JSON.stringify(json.data || []) };
-      });
-      // Note: 'updates' tab does NOT auto-fetch — user clicks Scan to trigger.
-      // See the dedicated <UpdatesTab /> component below.
+      // 'apps' tab uses its own <AppsTab /> component — no auto-fetch here.
+      // 'processes', 'logs', 'network', 'audit' tabs have been REMOVED from the drawer.
     }, [tab, liveHost?.hostname]);
 
     // ---- HARDWARE ---- (dedicated Hardware tab — full PsInfo breakdown)
@@ -2829,7 +2985,7 @@
             ].map(([label, value, mono], i) => (
               <div key={i} className={label === 'Tags' ? 'col-span-2' : ''}>
                 <div className="text-meta text-text-dim uppercase">{label}</div>
-                <div className={`text-text ${mono ? 'font-mono' : ''} ${label === 'Tags' ? 'flex flex-wrap gap-1 mt-1' : ''}`}>{value || '\u2014'}</div>
+                <div className={`text-text ${mono ? 'font-mono' : ''} ${label === 'Tags' ? 'flex flex-wrap gap-1 mt-1' : ''}`}>{value || '—'}</div>
               </div>
             ))}
           </div>
@@ -2846,7 +3002,7 @@
                 </button>
               </div>
               <div className="p-2 bg-surface-raised rounded border border-border text-[10px] space-y-1">
-                {hw.processors?.[0]?.name && <div><span className="text-text-dim">CPU:</span> <span className="text-text">{hw.processors[0].name}</span></div>}
+                {hw.processor?.name && <div><span className="text-text-dim">CPU:</span> <span className="text-text">{hw.processor.name}</span></div>}
                 {hw.system?.totalRamMB ? (
                   <div><span className="text-text-dim">RAM:</span> <span className="text-text">{hw.system.totalRamMB >= 1024 ? (hw.system.totalRamMB / 1024).toFixed(1) + ' GB' : hw.system.totalRamMB + ' MB'}</span></div>
                 ) : null}
@@ -2874,7 +3030,7 @@
           )}
           <div className="flex gap-1 flex-wrap">
             <ActionButton variant="primary" size="sm" icon="RefreshCw" onClick={async () => { toast.info('Pinging ' + liveHost.hostname + '...'); if (window.SupportHubLANAPI) { const r = await window.SupportHubLANAPI.pingHost(liveHost.hostname); if (r && r.success && !r.demo) { updateHosts(prev => prev.map(h => h.id === liveHost.id ? { ...h, onlineStatus: r.data?.online ? 'online' : 'offline', pingStatus: r.data?.online ? 'up' : 'down', lastSeen: new Date().toISOString() } : h)); toast.success(liveHost.hostname + ' is ' + (r.data?.online ? 'online' : 'offline')); } else if (r && r.demo) { toast.warning('Backend not connected'); } else { toast.error('Ping failed'); } } }}>Refresh</ActionButton>
-            <ActionButton variant="secondary" size="sm" icon="Cpu" onClick={async () => { toast.info('Scanning hardware on ' + liveHost.hostname + '...'); if (window.SupportHubLANAPI) { const r = await window.SupportHubLANAPI.getHardwareInfo(liveHost.hostname); if (r && r.success && !r.demo) { updateHosts(prev => prev.map(h => h.id === liveHost.id ? { ...h, _hardwareInfo: r.data, osName: r.data?.os?.name || h.osName, cpuModel: r.data?.processors?.[0]?.name || h.cpuModel, ramGb: r.data?.system?.totalRamMB ? Math.round(r.data.system.totalRamMB / 1024) : h.ramGb, ipAddress: r.data?.network?.[0]?.ipAddress?.split(',')[0]?.trim() || h.ipAddress, macAddress: r.data?.network?.[0]?.macAddress || h.macAddress } : h)); toast.success('Hardware scan complete — opening Hardware tab'); if (r.changes?.length > 0) r.changes.forEach(c => toast.warning('Change: ' + c.field, { detail: c.oldValue + ' -> ' + c.newValue, duration: 10000 })); if (setTab) setTab('hardware'); } else if (r && r.demo) { toast.warning('Backend not connected'); } else { toast.error('Scan failed', { detail: r?.error }); } } }}>Scan Hardware</ActionButton>
+            <ActionButton variant="secondary" size="sm" icon="Cpu" onClick={async () => { toast.info('Scanning hardware on ' + liveHost.hostname + '...'); if (window.SupportHubLANAPI) { const r = await window.SupportHubLANAPI.getHardwareInfo(liveHost.hostname); if (r && r.success && !r.demo) { updateHosts(prev => prev.map(h => h.id === liveHost.id ? { ...h, _hardwareInfo: r.data, osName: r.data?.os?.name || h.osName, cpuModel: r.data?.processor?.name || h.cpuModel, ramGb: r.data?.system?.totalRamMB ? Math.round(r.data.system.totalRamMB / 1024) : h.ramGb, ipAddress: r.data?.network?.[0]?.ipAddress || h.ipAddress, macAddress: r.data?.network?.[0]?.macAddress || h.macAddress } : h)); toast.success('Hardware scan complete — opening Hardware tab'); if (r.changes?.length > 0) r.changes.forEach(c => toast.warning('Change: ' + c.field, { detail: c.oldValue + ' -> ' + c.newValue, duration: 10000 })); if (setTab) setTab('hardware'); } else if (r && r.demo) { toast.warning('Backend not connected'); } else { toast.error('Scan failed', { detail: r?.error }); } } }}>Scan Hardware</ActionButton>
             <ActionButton variant="secondary" size="sm" icon="ShieldCheck" onClick={async () => { toast.info('Scanning ' + liveHost.hostname + ' for updates...'); if (window.SupportHubLANAPI) { const r = await window.SupportHubLANAPI.scanUpdates([liveHost.hostname], null); if (r && r.success && !r.demo) { toast.success('Update scan complete'); } else if (r && r.demo) { toast.warning('Backend not connected'); } else { toast.error('Scan failed'); } } }}>Scan Updates</ActionButton>
             <ActionButton variant="secondary" size="sm" icon="Power" onClick={() => { if (confirm('Reboot ' + liveHost.hostname + '?')) { executePowerAction({ action: 'reboot', targetIds: [liveHost.id] }); } }}>Reboot</ActionButton>
           </div>
@@ -2973,16 +3129,16 @@
             <div key={i} className="p-2 bg-surface-raised rounded border border-border space-y-1">
               <div className="font-medium text-text">{n.description || 'Adapter ' + (i+1)}</div>
               <div className="grid grid-cols-2 gap-1 text-[10px]">
-                <div><span className="text-text-dim">IP:</span> <span className="text-text font-mono">{n.ipAddress || '\u2014'}</span></div>
-                <div><span className="text-text-dim">MAC:</span> <span className="text-text font-mono">{n.macAddress || '\u2014'}</span></div>
+                <div><span className="text-text-dim">IP:</span> <span className="text-text font-mono">{n.ipAddress || '—'}</span></div>
+                <div><span className="text-text-dim">MAC:</span> <span className="text-text font-mono">{n.macAddress || '—'}</span></div>
                 <div><span className="text-text-dim">DHCP:</span> <span className="text-text">{n.dhcpEnabled ? 'Yes' : 'No'}</span></div>
-                <div><span className="text-text-dim">Gateway:</span> <span className="text-text font-mono">{n.defaultGateway || '\u2014'}</span></div>
-                <div className="col-span-2"><span className="text-text-dim">DNS:</span> <span className="text-text font-mono">{n.dnsServers || '\u2014'}</span></div>
+                <div><span className="text-text-dim">Gateway:</span> <span className="text-text font-mono">{n.defaultGateway || '—'}</span></div>
+                <div className="col-span-2"><span className="text-text-dim">DNS:</span> <span className="text-text font-mono">{n.dnsServers || '—'}</span></div>
               </div>
             </div>
           )) : (
             <div className="space-y-1">
-              {[['IP Address', liveHost.ipAddress || '\u2014'], ['MAC Address', liveHost.macAddress || '\u2014'], ['FQDN', liveHost.fqdn || '\u2014']].map(([k,v]) => (
+              {[['IP Address', liveHost.ipAddress || '—'], ['MAC Address', liveHost.macAddress || '—'], ['FQDN', liveHost.fqdn || '—']].map(([k,v]) => (
                 <div key={k} className="flex justify-between p-2 bg-surface-raised rounded border border-border">
                   <span className="text-text-dim">{k}</span>
                   <span className="font-mono text-text">{v}</span>
@@ -2997,23 +3153,15 @@
 
     // ---- INSTALLED APPS ----
     if (tab === 'apps') {
-      return (
-        <div className="space-y-1.5">
-          <div className="flex items-center justify-between mb-1">
-            <span className="text-meta text-text-dim uppercase">Installed Software</span>
-            <IconButton icon="RefreshCw" size="sm" title="Refresh" onClick={() => fetchDrawerData(() => window.SupportHubLANAPI.pstoolsExecute('psexec', liveHost.hostname, '-s powershell -NoProfile -Command "Get-ItemProperty HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* | Where-Object DisplayName | Select-Object DisplayName,DisplayVersion,Publisher | ConvertTo-Json -Compress"'))} />
-          </div>
-          {drawerLoading ? <div className="text-text-dim text-xs py-4 text-center">Loading apps...</div> :
-           !drawerData || drawerData.length === 0 ? <div className="text-text-dim text-xs py-4 text-center">No apps found. Ensure backend is connected.</div> :
-           drawerData.map((a, i) => (
-            <div key={i} className="p-1.5 bg-surface-raised rounded border border-border text-xs">
-              <div className="text-text">{a.DisplayName || a.name || 'Unknown'}</div>
-              <div className="text-[10px] text-text-dim">{a.DisplayVersion || a.version || ''} {a.Publisher ? '\u00b7 ' + a.Publisher : ''}</div>
-            </div>
-          ))}
-        </div>
-      );
+      return <AppsTab host={liveHost} />;
     }
+
+    // REMOVED TABS: processes, logs (event logs), network, audit
+    // These tabs have been removed from the host drawer per user request.
+    // Hardware info is now in the dedicated Hardware tab (full wmic breakdown).
+    // Network info is included in the Hardware tab.
+    // Event logs are accessible from the Audit screen in the sidebar.
+    // Processes are not shown — use the terminal for process management.
 
     // ---- AUDIT TRAIL ----
     if (tab === 'audit') {
@@ -3028,7 +3176,7 @@
                 <span className="font-mono text-text">{e.action || ''}</span>
                 <span className={`px-1 text-[9px] rounded ${e.result === 'success' ? 'bg-success/15 text-success' : e.result === 'failed' ? 'bg-danger/15 text-danger' : 'bg-warning/15 text-warning'}`}>{e.result}</span>
               </div>
-              <div className="text-[10px] text-text-dim">{e.timestamp ? new Date(e.timestamp).toLocaleString() : ''} {e.user ? '\u00b7 ' + e.user : ''}</div>
+              <div className="text-[10px] text-text-dim">{e.timestamp ? new Date(e.timestamp).toLocaleString() : ''} {e.user ? '· ' + e.user : ''}</div>
             </div>
           ))}
         </div>
@@ -8921,7 +9069,7 @@
               osName: hw.os?.name || h.osName,
               osVersion: hw.os?.version || h.osVersion,
               osBuild: hw.os?.build || h.osBuild,
-              cpuModel: hw.processors?.[0]?.name || h.cpuModel,
+              cpuModel: hw.processor?.name || h.cpuModel,
               ramGb: hw.system?.totalRamMB ? Math.round(hw.system.totalRamMB / 1024) : h.ramGb,
               ipAddress: hw.network?.[0]?.ipAddress?.split(',')[0]?.trim() || h.ipAddress,
               macAddress: hw.network?.[0]?.macAddress || h.macAddress,

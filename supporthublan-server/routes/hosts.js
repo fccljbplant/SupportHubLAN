@@ -81,47 +81,183 @@ module.exports = function(db) {
   });
 
   // ===========================================================================
-  // HARDWARE INFO — PsInfo-based, NO PowerShell.
+  // HARDWARE INFO — Full hardware audit using MULTIPLE PsTools commands.
   //
-  // Runs three PsTools invocations in parallel:
-  //   1. psinfo.exe -d \\\\HOST          → system info + disk volumes
-  //   2. psexec.exe \\\\HOST -s ipconfig /all → network adapters
-  //   3. psloggedon.exe \\\\HOST         → currently logged-on user
+  // PsTools commands used (study PsTools docs):
+  //   1. PsExec \\HOST -s wmic computersystem  → system make/model/serial/RAM
+  //   2. PsExec \\HOST -s wmic baseboard       → motherboard make/model/serial
+  //   3. PsExec \\HOST -s wmic bios            → BIOS manufacturer/version/date
+  //   4. PsExec \\HOST -s wmic cpu             → processor make/model/cores/threads
+  //   5. PsExec \\HOST -s wmic memorychip      → RAM sticks (capacity/speed/part#)
+  //   6. PsExec \\HOST -s wmic diskdrive       → physical disks (model/size/serial)
+  //   7. PsExec \\HOST -s wmic logicaldisk     → volumes (drive/size/free/fs)
+  //   8. PsExec \\HOST -s wmic path win32_videocontroller → GPU
+  //   9. PsExec \\HOST -s wmic os              → OS name/build/install date/serial
+  //  10. PsExec \\HOST -s ipconfig /all        → network adapters (IP/MAC/DHCP/DNS)
+  //  11. PsLoggedOn \\HOST                     → currently logged-on user
   //
-  // All output is plain text — parsed in JavaScript. No PowerShell required.
+  // All 11 commands run in PARALLEL via Promise.all. No PowerShell needed.
+  // Output parsed in JavaScript from wmic's /format:list output.
   // ===========================================================================
   router.post('/:hostname/hardware', async (req, res) => {
     const safeHost = sanitizeHost(req.params.hostname);
     try {
-      const [psinfoRes, ipconfigRes, loggedOnRes] = await Promise.all([
-        runPsToolDirect('psinfo.exe', ['-d', '\\\\' + safeHost], 30000),
-        runRemoteCmdDirect(safeHost, ['ipconfig', '/all'], 25000),
+      // Launch all 11 PsTools commands in parallel
+      const [
+        csRes, bbRes, biosRes, cpuRes, memRes,
+        diskRes, ldRes, gpuRes, osRes,
+        ipconfigRes, loggedOnRes,
+      ] = await Promise.all([
+        runRemoteCmdDirect(safeHost, ['wmic', 'computersystem', 'get', 'Manufacturer,Model,SerialNumber,SystemType,TotalPhysicalMemory,Domain,NumberOfProcessors,NumberOfLogicalProcessors', '/format:list'], 20000),
+        runRemoteCmdDirect(safeHost, ['wmic', 'baseboard', 'get', 'Manufacturer,Product,Version,SerialNumber', '/format:list'], 20000),
+        runRemoteCmdDirect(safeHost, ['wmic', 'bios', 'get', 'Manufacturer,Name,SMBIOSBIOSVersion,ReleaseDate,SerialNumber', '/format:list'], 20000),
+        runRemoteCmdDirect(safeHost, ['wmic', 'cpu', 'get', 'Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,CurrentClockSpeed,SocketDesignation', '/format:list'], 20000),
+        runRemoteCmdDirect(safeHost, ['wmic', 'memorychip', 'get', 'Capacity,Manufacturer,PartNumber,Speed,DeviceLocator,SerialNumber', '/format:list'], 20000),
+        runRemoteCmdDirect(safeHost, ['wmic', 'diskdrive', 'get', 'Model,Size,InterfaceType,SerialNumber,Partitions,Index,MediaType', '/format:list'], 20000),
+        runRemoteCmdDirect(safeHost, ['wmic', 'logicaldisk', 'where', 'DriveType=3', 'get', 'DeviceID,Size,FreeSpace,FileSystem,VolumeName', '/format:list'], 20000),
+        runRemoteCmdDirect(safeHost, ['wmic', 'path', 'win32_videocontroller', 'get', 'Name,AdapterCompatibility,AdapterRAM,DriverVersion,DriverDate', '/format:list'], 20000),
+        runRemoteCmdDirect(safeHost, ['wmic', 'os', 'get', 'Caption,Version,BuildNumber,InstallDate,LastBootUpTime,SerialNumber,OSArchitecture,RegisteredOrganization,RegisteredUser', '/format:list'], 20000),
+        runRemoteCmdDirect(safeHost, ['ipconfig', '/all'], 20000),
         runPsToolDirect('psloggedon.exe', ['\\\\' + safeHost], 15000),
       ]);
 
-      if (!psinfoRes.success && !psinfoRes.stdout) {
+      // Check if ALL failed (host is likely offline)
+      const allFailed = [csRes, bbRes, biosRes, cpuRes, osRes].every(r => !r.success && !r.stdout);
+      if (allFailed) {
         return res.json({
           success: false,
-          error: psinfoRes.stderr || 'PsInfo failed (host may be offline or PsTools not installed)',
-          stderr: psinfoRes.stderr,
+          error: csRes.stderr || 'All PsExec commands failed — host may be offline or PsTools not installed',
         });
       }
 
-      const hw = parsePsInfoOutput(psinfoRes.stdout, safeHost);
+      // Parse each wmic output
+      const cs = parseWmicList(csRes.stdout);
+      const bb = parseWmicList(bbRes.stdout);
+      const bios = parseWmicList(biosRes.stdout);
+      const cpus = parseWmicListMulti(cpuRes.stdout);
+      const mems = parseWmicListMulti(memRes.stdout);
+      const disks = parseWmicListMulti(diskRes.stdout);
+      const lds = parseWmicListMulti(ldRes.stdout);
+      const gpus = parseWmicListMulti(gpuRes.stdout);
+      const osInfo = parseWmicList(osRes.stdout);
 
-      if (ipconfigRes.success || ipconfigRes.stdout) {
-        hw.network = parseIpConfigOutput(ipconfigRes.stdout);
-      }
-      if (!hw.network) hw.network = [];
+      // Build the structured hardware object
+      const totalRamBytes = parseInt(cs.TotalPhysicalMemory || '0', 10);
+      const totalRamMB = Math.round(totalRamBytes / (1024 * 1024));
 
-      if (loggedOnRes.success || loggedOnRes.stdout) {
-        hw.loggedInUser = parsePsLoggedOnOutput(loggedOnRes.stdout);
-      }
+      // Processor — take the FIRST one only (user request: "just show one processor")
+      const cpu = cpus.length > 0 ? {
+        name: cpus[0].Name || 'Unknown',
+        manufacturer: cpus[0].Manufacturer || 'Unknown',
+        cores: parseInt(cpus[0].NumberOfCores || '0', 10),
+        logicalCores: parseInt(cpus[0].NumberOfLogicalProcessors || '0', 10),
+        threads: parseInt(cpus[0].NumberOfLogicalProcessors || '0', 10), // threads = logical processors
+        maxSpeedMHz: parseInt(cpus[0].MaxClockSpeed || '0', 10),
+        currentSpeedMHz: parseInt(cpus[0].CurrentClockSpeed || '0', 10),
+        socket: cpus[0].SocketDesignation || '',
+      } : null;
 
-      hw.scannedAt = new Date().toISOString();
-      hw.hostname = hw.hostname || safeHost;
+      // Memory sticks
+      const memory = mems.filter(m => m.Capacity).map(m => ({
+        capacityGB: Math.round(parseInt(m.Capacity, 10) / (1024 * 1024 * 1024) * 10) / 10,
+        manufacturer: m.Manufacturer || '',
+        partNumber: m.PartNumber || '',
+        speed: parseInt(m.Speed || '0', 10),
+        deviceLocator: m.DeviceLocator || '',
+        serialNumber: m.SerialNumber || '',
+      }));
 
-      // Hardware change detection (compares with previous snapshot in db.settings)
+      // Physical disks
+      const physicalDisks = disks.filter(d => d.Model).map((d, i) => ({
+        model: d.Model || '',
+        sizeGB: Math.round(parseInt(d.Size || '0', 10) / (1024 * 1024 * 1024) * 10) / 10,
+        interface: d.InterfaceType || d.MediaType || '',
+        serialNumber: d.SerialNumber || '',
+        partitions: parseInt(d.Partitions || '0', 10),
+        index: parseInt(d.Index || i.toString(), 10),
+      }));
+
+      // Logical volumes
+      const logicalDisks = lds.filter(d => d.DeviceID).map(d => ({
+        drive: d.DeviceID,
+        sizeGB: Math.round(parseInt(d.Size || '0', 10) / (1024 * 1024 * 1024) * 10) / 10,
+        freeGB: Math.round(parseInt(d.FreeSpace || '0', 10) / (1024 * 1024 * 1024) * 10) / 10,
+        fileSystem: d.FileSystem || '',
+        volumeName: d.VolumeName || '',
+      }));
+
+      // GPU(s)
+      const gpu = gpus.filter(g => g.Name).map(g => ({
+        name: g.Name || '',
+        manufacturer: g.AdapterCompatibility || '',
+        ramMB: Math.round(parseInt(g.AdapterRAM || '0', 10) / (1024 * 1024)),
+        driverVersion: g.DriverVersion || '',
+        driverDate: g.DriverDate || '',
+      }));
+
+      // Network adapters (from ipconfig /all)
+      const network = parseIpConfigOutput(ipconfigRes.stdout);
+
+      // Logged-in user
+      const loggedInUser = parsePsLoggedOnOutput(loggedOnRes.stdout);
+
+      // Build the final hardware object
+      const hw = {
+        hostname: safeHost,
+        scannedAt: new Date().toISOString(),
+
+        system: {
+          manufacturer: cs.Manufacturer || '',
+          model: cs.Model || '',
+          serial: cs.SerialNumber || '',
+          systemType: cs.SystemType || '',
+          domain: cs.Domain || '',
+          totalRamMB,
+          numberOfProcessors: parseInt(cs.NumberOfProcessors || '0', 10),
+          numberOfLogicalProcessors: parseInt(cs.NumberOfLogicalProcessors || '0', 10),
+        },
+
+        motherboard: {
+          manufacturer: bb.Manufacturer || '',
+          product: bb.Product || '',
+          version: bb.Version || '',
+          serial: bb.SerialNumber || '',
+        },
+
+        bios: {
+          manufacturer: bios.Manufacturer || '',
+          name: bios.Name || '',
+          version: bios.SMBIOSBIOSVersion || '',
+          serial: bios.SerialNumber || '',
+          releaseDate: bios.ReleaseDate || '',
+        },
+
+        processor: cpu, // single processor (first one)
+
+        memory,
+        disks: physicalDisks,
+        logicalDisks,
+        network,
+        gpu,
+
+        os: {
+          name: osInfo.Caption || '',
+          version: osInfo.Version || '',
+          build: osInfo.BuildNumber || '',
+          architecture: osInfo.OSArchitecture || '',
+          installDate: parseWmiDate(osInfo.InstallDate),
+          lastBoot: parseWmiDate(osInfo.LastBootUpTime),
+          serial: osInfo.SerialNumber || '',
+          registeredOrg: osInfo.RegisteredOrganization || '',
+          registeredUser: osInfo.RegisteredUser || '',
+        },
+
+        loggedInUser,
+
+        _source: 'wmic+ipconfig+psloggedon',
+      };
+
+      // Hardware change detection
       const key = 'hardware:' + safeHost;
       let changes = [];
       let isFirstScan = true;
@@ -141,8 +277,9 @@ module.exports = function(db) {
               }
             };
             ['system.manufacturer', 'system.model', 'system.serial',
-             'processors.0.name', 'processors.0.cores', 'processors.0.logicalCores',
-             'system.totalRamMB', 'system.biosVersion'].forEach(compareField);
+             'motherboard.serial', 'bios.serial',
+             'processor.name', 'processor.cores', 'processor.threads',
+             'system.totalRamMB'].forEach(compareField);
             const prevDiskCount = (prev.disks || []).length;
             const newDiskCount = (hw.disks || []).length;
             if (prevDiskCount !== newDiskCount) {
@@ -154,15 +291,74 @@ module.exports = function(db) {
 
       try { db.settings.set(key, JSON.stringify(hw)); } catch (e) { /* ignore save failures */ }
 
+      // Collect any raw outputs for debugging
+      const rawOutputs = {
+        computersystem: csRes.stdout ? csRes.stdout.substring(0, 1000) : '',
+        baseboard: bbRes.stdout ? bbRes.stdout.substring(0, 1000) : '',
+        bios: biosRes.stdout ? biosRes.stdout.substring(0, 1000) : '',
+        cpu: cpuRes.stdout ? cpuRes.stdout.substring(0, 1000) : '',
+      };
+
       res.json({
         success: true,
         data: hw,
         changes,
         isFirstScan,
-        rawPsInfo: psinfoRes.stdout ? psinfoRes.stdout.substring(0, 2000) : '',
+        rawOutputs,
       });
     } catch (e) {
       res.json({ success: false, error: e.message || 'Hardware scan failed' });
+    }
+  });
+
+  // ===========================================================================
+  // INSTALLED APPS — Uses PsExec + reg query (NO PowerShell) to list all
+  // installed software from the Windows registry Uninstall keys.
+  //
+  // Queries both 64-bit and 32-bit Uninstall keys:
+  //   - HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall (64-bit apps)
+  //   - HKLM\SOFTWARE\WOW6432Node\...\Uninstall (32-bit apps on 64-bit OS)
+  //   - HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall (user apps)
+  //
+  // Parses the reg output to extract DisplayName, DisplayVersion, Publisher,
+  // InstallDate for each entry that has a DisplayName.
+  // ===========================================================================
+  router.post('/:hostname/apps', async (req, res) => {
+    const safeHost = sanitizeHost(req.params.hostname);
+    try {
+      const [reg64Res, reg32Res, regUserRes] = await Promise.all([
+        runRemoteCmdDirect(safeHost, ['reg', 'query', 'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall', '/s'], 30000),
+        runRemoteCmdDirect(safeHost, ['reg', 'query', 'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall', '/s'], 30000),
+        runRemoteCmdDirect(safeHost, ['reg', 'query', 'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall', '/s'], 30000),
+      ]);
+
+      const apps64 = parseRegUninstall(reg64Res.stdout);
+      const apps32 = parseRegUninstall(reg32Res.stdout);
+      const appsUser = parseRegUninstall(regUserRes.stdout);
+
+      // Merge, dedupe, sort
+      const allApps = [...apps64, ...apps32, ...appsUser];
+      const seen = new Set();
+      const deduped = allApps.filter(a => {
+        const key = (a.name + '|' + (a.version || '')).toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      }).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+      res.json({
+        success: true,
+        data: JSON.stringify(deduped),
+        apps: deduped,
+        count: deduped.length,
+        sources: {
+          '64bit': apps64.length,
+          '32bit': apps32.length,
+          'user': appsUser.length,
+        },
+      });
+    } catch (e) {
+      res.json({ success: false, error: e.message || 'Failed to list apps' });
     }
   });
 
@@ -261,6 +457,133 @@ module.exports = function(db) {
 // =============================================================================
 // PARSERS — plain text → structured JS objects
 // =============================================================================
+
+// ---------------------------------------------------------------------------
+// parseWmicList — parse wmic /format:list output into a single record object.
+// wmic /format:list output looks like:
+//   Manufacturer=Dell Inc.
+//   Model=OptiPlex 7070
+//   SerialNumber=ABC123
+//
+// Returns the FIRST record as a flat { key: value } object.
+// ---------------------------------------------------------------------------
+function parseWmicList(raw) {
+  const out = (raw || '').replace(/\r/g, '');
+  const obj = {};
+  for (const line of out.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx > 0) {
+      const key = trimmed.substring(0, eqIdx).trim();
+      const value = trimmed.substring(eqIdx + 1).trim();
+      if (value !== '' && !(key in obj)) obj[key] = value;
+    }
+  }
+  return obj;
+}
+
+// ---------------------------------------------------------------------------
+// parseWmicListMulti — parse wmic /format:list output into an ARRAY of records.
+// Used for wmic queries that return multiple rows (e.g. multiple CPUs, memory
+// sticks, disk drives). Records are separated by blank lines.
+// ---------------------------------------------------------------------------
+function parseWmicListMulti(raw) {
+  const out = (raw || '').replace(/\r/g, '');
+  const records = [];
+  let current = {};
+  for (const line of out.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '') {
+      if (Object.keys(current).length > 0) {
+        records.push(current);
+        current = {};
+      }
+      continue;
+    }
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx > 0) {
+      const key = trimmed.substring(0, eqIdx).trim();
+      const value = trimmed.substring(eqIdx + 1).trim();
+      if (value !== '') current[key] = value;
+    }
+  }
+  if (Object.keys(current).length > 0) records.push(current);
+  return records;
+}
+
+// ---------------------------------------------------------------------------
+// parseWmiDate — convert a WMI datetime string to a readable ISO string.
+// WMI dates look like: 20230115123045.000000+000
+// (YYYYMMDDHHMMSS.ffffff+timezone)
+// ---------------------------------------------------------------------------
+function parseWmiDate(wmiDate) {
+  if (!wmiDate || typeof wmiDate !== 'string') return '';
+  const m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/.exec(wmiDate);
+  if (!m) return wmiDate;
+  try {
+    const dt = new Date(Date.UTC(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]), parseInt(m[4]), parseInt(m[5]), parseInt(m[6])));
+    return dt.toISOString().replace('T', ' ').substring(0, 19);
+  } catch {
+    return wmiDate;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// parseRegUninstall — parse `reg query ... /s` output into an array of
+// installed apps with { name, version, publisher, installDate }.
+//
+// reg query /s output looks like:
+//
+//   HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{GUID}
+//       DisplayName    REG_SZ    Microsoft Visual C++ 2015-2019 Redistributable
+//       DisplayVersion    REG_SZ    14.29.30133.0
+//       Publisher    REG_SZ    Microsoft Corporation
+//       InstallDate    REG_SZ    20230115
+//       ...
+//
+// Only entries with a DisplayName are included.
+// ---------------------------------------------------------------------------
+function parseRegUninstall(raw) {
+  const out = (raw || '').replace(/\r/g, '');
+  const apps = [];
+  const lines = out.split('\n');
+  let current = {};
+  let hasName = false;
+
+  for (const line of lines) {
+    // A new registry key starts with HKEY_
+    if (/^HKEY_/.test(line.trim())) {
+      if (hasName && current.name) {
+        apps.push(current);
+      }
+      current = {};
+      hasName = false;
+      continue;
+    }
+    // Property line: "    DisplayName    REG_SZ    Value"
+    const m = /^\s+(\S+)\s+REG_\S+\s*(.*)$/.exec(line);
+    if (m) {
+      const key = m[1];
+      const value = (m[2] || '').trim();
+      if (key === 'DisplayName' && value) {
+        current.name = value;
+        hasName = true;
+      } else if (key === 'DisplayVersion') {
+        current.version = value;
+      } else if (key === 'Publisher') {
+        current.publisher = value;
+      } else if (key === 'InstallDate') {
+        current.installDate = value;
+      }
+    }
+  }
+  // Last entry
+  if (hasName && current.name) {
+    apps.push(current);
+  }
+  return apps;
+}
 
 // Parse `psinfo -d \\HOST` output.
 // Returns: { hostname, os:{name,version,build,installDate,lastBoot}, system:{manufacturer,model,totalRamMB,domain}, processors:[{name,cores,logicalCores,maxSpeedMHz}], memory:[], disks:[], logicalDisks:[], cdDvd:[], network:[], gpu:[{name}], loggedInUser, scannedAt }

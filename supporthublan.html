@@ -157,7 +157,7 @@
     input[type=number]::-webkit-inner-spin-button,
     input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
 
-    /* ---- Professional toolbar styling (Professional) ---- */
+    /* ---- Professional toolbar styling (BatchPatch-inspired) ---- */
     .toolbar-group {
       display: flex;
       align-items: center;
@@ -1576,7 +1576,7 @@
   };
 
   /* ------------------------------------------------------------------------
-     CONTEXT MENU — Right-click menu for host rows (for host rows)
+     CONTEXT MENU — Right-click menu for host rows (like BatchPatch grid)
   ------------------------------------------------------------------------ */
   const ContextMenu = ({ x, y, items, onClose }) => {
     useEffect(() => {
@@ -1610,7 +1610,7 @@
   };
 
   /* ------------------------------------------------------------------------
-     ACTION TOOLBAR — Professional icon toolbar above the grid
+     ACTION TOOLBAR — BatchPatch-style icon toolbar above the grid
   ------------------------------------------------------------------------ */
   const ActionToolbar = ({ groups }) => (
     <div className="flex items-center flex-wrap gap-0 p-1.5 bg-surface border border-border rounded-lg mb-2 overflow-x-auto">
@@ -2087,14 +2087,14 @@
           </FormField>
           <div className="flex gap-2">
             <ActionButton variant="primary" size="sm" icon="RefreshCw" onClick={() => { updateHosts(prev => prev.map(h => h.id === liveHost.id ? { ...h, lastSeen: new Date().toISOString() } : h)); appendAudit({ action: 'hosts.refresh', actionCategory: 'Inventory', targetType: 'Host', targetIds: [liveHost.id], parameters: {}, result: 'success' }); toast.success(`${liveHost.hostname} refreshed.`); }}>Refresh</ActionButton>
-            <ActionButton variant="secondary" size="sm" icon="ShieldCheck" onClick={() => { addJob({ id: 'job-' + Date.now(), name: `Scan — ${liveHost.hostname}`, targets: [liveHost.id], step: 'Scanning (1/3)', progress: 5, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'updates.scan', actionCategory: 'Updates', targetType: 'Host', targetIds: [liveHost.id], parameters: {}, result: 'success' }); toast.info(`Scanning ${liveHost.hostname} for updates…`); }}>Scan Updates</ActionButton>
+            <ActionButton variant="secondary" size="sm" icon="ShieldCheck" onClick={async () => { toast.info(`Scanning ${liveHost.hostname} for updates…`); if (window.SupportHubLANAPI) { const result = await window.SupportHubLANAPI.scanUpdates([liveHost.hostname], null); if (result && result.success && !result.demo) { toast.success(`Scan complete for ${liveHost.hostname}`); } else if (result && result.demo) { toast.warning('Backend not connected.', { duration: 8000 }); } else { toast.error('Scan failed', { detail: result?.error, duration: 8000 }); } } }}>Scan Updates</ActionButton>
             <ActionButton variant="secondary" size="sm" icon="Power" onClick={() => { executePowerAction({ action: 'reboot', targetIds: [liveHost.id] }); toast.success(`Reboot initiated on ${liveHost.hostname}.`); }}>Reboot</ActionButton>
           </div>
         </div>
       );
     }
     if (tab === 'updates') {
-      const pending = liveHost.patchState !== 'compliant' ? KB_CATALOG.slice(0, 4) : [];
+      const pending = []; // Real update data requires a scan — run Scan Updates to populate
       return (
         <div className="space-y-3">
           <div className="grid grid-cols-2 gap-2">
@@ -2131,15 +2131,7 @@
       );
     }
     if (tab === 'deployments') {
-      return <div className="space-y-1.5">{DEPLOYMENT_HISTORY.slice(0,3).map(d => (
-        <div key={d.id} className="p-2 bg-surface-raised rounded border border-border">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-text">{d.package}</span>
-            <StatusBadge variant={d.status === 'complete' ? 'complete' : 'running'} size="xs" />
-          </div>
-          <div className="text-[10px] text-text-dim mt-0.5">{fmtRel(d.timestamp)} · {d.targets} targets · {d.duration || 'running'}</div>
-        </div>
-      ))}</div>;
+      return <div className="text-text-dim text-xs py-4 text-center">Deployment history is available in Reports & Logs.</div>;
     }
     if (tab === 'jobs') {
       return <div className="space-y-1.5">{activeJobs.filter(j => j.targets.includes(liveHost.id)).map(j => (
@@ -2154,66 +2146,26 @@
       ))}{activeJobs.filter(j => j.targets.includes(liveHost.id)).length === 0 && <EmptyState icon="ListOrdered" title="No active jobs" />}</div>;
     }
     if (tab === 'services') {
-      const sampleServices = [
-        { name: 'wuauserv', display: 'Windows Update', status: 'Running', startType: 'Manual', pid: 1234 },
-        { name: 'BITS', display: 'Background Intelligent Transfer', status: 'Running', startType: 'Automatic', pid: 892 },
-        { name: 'Spooler', display: 'Print Spooler', status: 'Stopped', startType: 'Automatic', pid: null },
-        { name: 'WinRM', display: 'Windows Remote Management (WS-Management)', status: 'Running', startType: 'Automatic', pid: 4 },
-      ];
-      return <div className="space-y-1">{sampleServices.map(s => (
-        <div key={s.name} className="flex items-center gap-2 p-1.5 bg-surface-raised rounded border border-border text-xs">
-          <Icon name={s.status === 'Running' ? 'Circle' : 'CircleOff'} size={10} className={s.status === 'Running' ? 'text-success' : 'text-danger'} />
-          <div className="flex-1 min-w-0">
-            <div className="font-mono text-text truncate">{s.name}</div>
-            <div className="text-[10px] text-text-dim truncate">{s.display}</div>
-          </div>
-          <span className="text-[10px] text-text-dim">{s.startType}</span>
-          <div className="flex gap-0.5">
-            <IconButton icon="Play" size="sm" title="Start" />
-            <IconButton icon="Square" size="sm" title="Stop" />
-            <IconButton icon="RotateCw" size="sm" title="Restart" />
-          </div>
-        </div>
-      ))}</div>;
+      return <div className="text-text-dim text-xs py-4 text-center">
+        <Icon name="Activity" size={20} className="mx-auto mb-2 opacity-50" />
+        Go to the <strong>Services</strong> screen to view and manage services on this host.
+      </div>;
     }
     if (tab === 'processes') {
-      const sampleProcs = [
-        { pid: 4, name: 'System', cpu: 1.2, mem: 0.5, user: 'SYSTEM' },
-        { pid: 512, name: 'svchost.exe', cpu: 0.4, mem: 24, user: 'SYSTEM' },
-        { pid: 1024, name: 'sqlservr.exe', cpu: 12.5, mem: 4520, user: 'MSSQL' },
-        { pid: 2048, name: 'chrome.exe', cpu: 4.2, mem: 580, user: 'a.garcia' },
-      ];
-      return <div className="space-y-1">{sampleProcs.map(p => (
-        <div key={p.pid} className="flex items-center gap-2 p-1.5 bg-surface-raised rounded border border-border text-xs">
-          <span className="text-text-dim tnum w-10">PID {p.pid}</span>
-          <span className="flex-1 font-mono text-text truncate">{p.name}</span>
-          <span className="text-text-dim tnum">{p.cpu}%</span>
-          <span className="text-text-dim tnum w-14 text-right">{p.mem} MB</span>
-          <IconButton icon="X" size="sm" variant="danger" title="Kill" />
-        </div>
-      ))}</div>;
+      return <div className="text-text-dim text-xs py-4 text-center">
+        <Icon name="Cpu" size={20} className="mx-auto mb-2 opacity-50" />
+        Use the terminal panel to run: <code className="font-mono text-text">pslist \\{liveHost?.hostname}</code>
+      </div>;
     }
     if (tab === 'logs') {
-      const events = [
-        { id: 4624, source: 'Microsoft-Windows-Security', level: 'Information', time: '07:55:01' },
-        { id: 4634, source: 'Microsoft-Windows-Security', level: 'Information', time: '07:30:14' },
-        { id: 7036, source: 'Service Control Manager', level: 'Information', time: '07:00:00' },
-        { id: 21, source: 'WUSA', level: 'Information', time: '06:45:22' },
-      ];
-      return <div className="space-y-1">{events.map((e, i) => (
-        <div key={i} className="flex items-center gap-2 p-1.5 bg-surface-raised rounded border border-border text-xs">
-          <span className="font-mono text-text-dim text-[10px] w-12">{e.id}</span>
-          <div className="flex-1 min-w-0">
-            <div className="text-text truncate">{e.source}</div>
-            <div className="text-[10px] text-text-dim">{e.time}</div>
-          </div>
-          <Badge color={e.level === 'Error' ? 'danger' : e.level === 'Warning' ? 'warning' : 'info'}>{e.level}</Badge>
-        </div>
-      ))}</div>;
+      return <div className="text-text-dim text-xs py-4 text-center">
+        <Icon name="FileText" size={20} className="mx-auto mb-2 opacity-50" />
+        Click the <strong>PC Log</strong> button (FileText icon) in the inventory row to view event logs.
+      </div>;
     }
     if (tab === 'network') {
       return <div className="space-y-2 text-xs">
-        {[['IP Address', liveHost.ipAddress], ['MAC Address', liveHost.macAddress], ['Subnet Mask', '255.255.255.0'], ['Default Gateway', liveHost.ipAddress.replace(/\.d+$/, '.1')], ['DNS Servers', '10.10.1.11, 10.10.1.12'], ['Adapter', 'Intel I210 Gigabit']].map(([k,v]) => (
+        {[['IP Address', liveHost.ipAddress || '—'], ['MAC Address', liveHost.macAddress || '—'], ['FQDN', liveHost.fqdn || '—']].map(([k,v]) => (
           <div key={k} className="flex justify-between p-2 bg-surface-raised rounded border border-border">
             <span className="text-text-dim">{k}</span>
             <span className="font-mono text-text">{v}</span>
@@ -2222,28 +2174,17 @@
       </div>;
     }
     if (tab === 'apps') {
-      const apps = [
-        { name: 'Google Chrome', version: '120.0.6099.130', publisher: 'Google LLC', installed: '2026-02-10' },
-        { name: '7-Zip 23.01', version: '23.01.0.0', publisher: 'Igor Pavlov', installed: '2026-01-20' },
-        { name: 'Microsoft 365 Apps', version: '16.0.17126.20132', publisher: 'Microsoft', installed: '2025-11-15' },
-        { name: 'Adobe Acrobat Reader DC', version: '2024.005.20320', publisher: 'Adobe', installed: '2026-03-15' },
-      ];
-      return <div className="space-y-1">{apps.map(a => (
-        <div key={a.name} className="p-2 bg-surface-raised rounded border border-border">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-text">{a.name}</span>
-            <span className="text-[10px] text-text-dim font-mono">{a.version}</span>
-          </div>
-          <div className="text-[10px] text-text-dim mt-0.5">{a.publisher} · installed {a.installed}</div>
-        </div>
-      ))}</div>;
+      return <div className="text-text-dim text-xs py-4 text-center">
+        <Icon name="Boxes" size={20} className="mx-auto mb-2 opacity-50" />
+        Use the terminal panel to run: <code className="font-mono text-text">psexec \\{liveHost?.hostname} -s powershell "Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Select DisplayName,DisplayVersion"</code>
+      </div>;
     }
     if (tab === 'remote') {
       return (
         <div className="space-y-3">
           <SectionCard title="Quick Connect">
             <div className="space-y-2">
-              <Select defaultValue="VNC"><option>VNC</option><option>RDP</option><option>SSH</option></Select>
+              <Select defaultValue="VNC"><option>VNC</option><option>RDP</option></Select>
               <div className="flex gap-2">
                 <Input defaultValue={liveHost.ipAddress} className="font-mono" />
                 <Input defaultValue="5900" className="w-20" />
@@ -2607,26 +2548,6 @@
           title="Operations Dashboard"
           subtitle="Live fleet overview · Last refresh: just now"
           actions={<>
-            <ActionButton variant="secondary" icon="Sparkles" className="hidden md:inline-flex" onClick={() => {
-              // Trigger a burst of demo activity so the dashboard comes alive
-              const onlineHosts = hosts.filter(h => h.onlineStatus === 'online');
-              const serverHosts = onlineHosts.filter(h => h.tags.includes('server'));
-              const wsHosts = onlineHosts.filter(h => h.tags.includes('workstation'));
-              const target1 = serverHosts.slice(0, 3).map(h => h.id);
-              const target2 = wsHosts.slice(0, 5).map(h => h.id);
-              const target3 = onlineHosts.slice(0, 4).map(h => h.id);
-              // 1. Trigger a compliance scan job
-              addJob({ id: 'job-seed-' + Date.now() + '-1', name: 'Fleet Compliance Scan (demo)', targets: [...target3], step: 'Scanning (1/3)', progress: 5, startedAt: new Date().toISOString(), status: 'running' });
-              appendAudit({ action: 'updates.scan', actionCategory: 'Updates', targetType: 'Host', targetIds: target3, parameters: { source: 'demo-seed' }, result: 'success' });
-              // 2. Trigger a deployment on a few workstations (Chrome Enterprise)
-              const profile = DEPLOYMENT_PROFILES.find(p => p.id === 'dp02') || DEPLOYMENT_PROFILES[0];
-              executeDeployment({ profile, targetIds: target2 });
-              // 3. Trigger a script run on servers
-              executeScript({ language: 'PowerShell', code: 'Get-Service | Where-Object {$_.Status -eq "Running"} | Select-Object -First 10', targetIds: target1 });
-              // 4. Trigger a reboot on one host
-              setTimeout(() => executePowerAction({ action: 'reboot', targetIds: target1.slice(0, 1) }), 600);
-              toast.success('Demo activity seeded — scan, deploy, script, and reboot triggered. Watch the Active Jobs panel and Audit Trail.');
-            }}>Seed Demo Activity</ActionButton>
             <ActionButton variant="primary" icon="RefreshCw" onClick={() => { updateHosts(prev => prev.map(h => ({...h, lastSeen: new Date().toISOString()}))); toast.success('Fleet data refreshed'); }}><span className="hidden sm:inline">Refresh</span></ActionButton>
           </>}
         />
@@ -3274,14 +3195,14 @@
 
             <BulkActionBar selectedCount={selectedIds.length} actions={bulkActions} onClear={() => setSelectedIds([])} />
 
-            {/* Action Toolbar */}
+            {/* BatchPatch-style Action Toolbar */}
             <ActionToolbar groups={[
               { label: 'Hosts', items: [
                 { icon: 'Plus', label: 'Add', onClick: () => { setAddModalMethod(null); setShowAddModal(true); } },
                 { icon: 'RefreshCw', label: 'Refresh', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; } updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, lastSeen: new Date().toISOString() } : h)); toast.success(`Refreshed ${selectedIds.length} host(s)`); }, disabled: selectedIds.length === 0 },
               ]},
               { label: 'Updates', items: [
-                { icon: 'Search', label: 'Check', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } addJob({ id: 'job-' + Date.now(), name: `Scan — ${selectedIds.length} hosts`, targets: [...selectedIds], step: 'Scanning (1/3)', progress: 5, startedAt: new Date().toISOString(), status: 'running' }); toast.info(`Scanning ${selectedIds.length} hosts…`); }, disabled: selectedIds.length === 0 },
+                { icon: 'Search', label: 'Check', onClick: async () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } const targetHosts = hosts.filter(h => selectedIds.includes(h.id)); const targetNames = targetHosts.map(h => h.hostname); toast.info(`Scanning ${selectedIds.length} host(s)…`); if (window.SupportHubLANAPI) { const result = await window.SupportHubLANAPI.scanUpdates(targetNames, null); if (result && result.success && !result.demo) { toast.success(`Scan complete on ${selectedIds.length} host(s)`); } else if (result && result.demo) { toast.warning('Backend not connected.', { duration: 8000 }); } else { toast.error('Scan failed', { detail: result?.error, duration: 8000 }); } } }, disabled: selectedIds.length === 0 },
                 { icon: 'ShieldCheck', label: 'Install', variant: 'success', onClick: async () => {
                   if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; }
                   const targetHosts = hosts.filter(h => selectedIds.includes(h.id));
@@ -3358,8 +3279,8 @@
                       { icon: 'Info', text: 'View Details', onClick: () => openHost(h) },
                       { icon: 'RefreshCw', text: 'Refresh Host', onClick: () => { updateHosts(prev => prev.map(x => x.id === h.id ? { ...x, lastSeen: new Date().toISOString() } : x)); toast.success(`${h.hostname} refreshed.`); } },
                       { separator: true },
-                      { icon: 'Search', text: 'Check for Updates', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `Scan — ${h.hostname}`, targets: [h.id], step: 'Scanning (1/3)', progress: 5, startedAt: new Date().toISOString(), status: 'running' }); toast.info(`Scanning ${h.hostname}…`); } },
-                      { icon: 'ShieldCheck', text: 'Install Updates', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `Install — ${h.hostname}`, targets: [h.id], step: 'Installing (1/4)', progress: 5, startedAt: new Date().toISOString(), status: 'running' }); setTimeout(() => { updateHosts(prev => prev.map(x => x.id === h.id ? { ...x, patchState: 'compliant', pendingReboot: false } : x)); toast.success(`${h.hostname} now compliant`); }, 6000); toast.info(`Installing on ${h.hostname}…`); } },
+                      { icon: 'Search', text: 'Check for Updates', onClick: async () => { toast.info(`Scanning ${h.hostname} for updates…`); if (window.SupportHubLANAPI) { const result = await window.SupportHubLANAPI.scanUpdates([h.hostname], null); if (result && result.success && !result.demo) { toast.success(`Scan complete for ${h.hostname}`); } else if (result && result.demo) { toast.warning('Backend not connected.', { duration: 8000 }); } else { toast.error('Scan failed', { detail: result?.error, duration: 8000 }); } } } },
+                      { icon: 'ShieldCheck', text: 'Install Updates', onClick: async () => { toast.info(`Installing updates on ${h.hostname}…`); if (window.SupportHubLANAPI) { const result = await window.SupportHubLANAPI.installUpdates([h.hostname], null, { rebootBehavior: 'if-required' }); if (result && result.success && !result.demo) { updateHosts(prev => prev.map(x => x.id === h.id ? { ...x, patchState: 'compliant' } : x)); toast.success(`${h.hostname} now compliant`); } else if (result && result.demo) { toast.warning('Backend not connected.', { duration: 8000 }); } else { toast.error('Install failed', { detail: result?.error, duration: 8000 }); } } } },
                       { separator: true },
                       { icon: 'Power', text: 'Reboot', danger: true, onClick: () => { executePowerAction({ action: 'reboot', targetIds: [h.id] }); toast.success(`Rebooting ${h.hostname}…`); } },
                       { icon: 'PowerOff', text: 'Shutdown', danger: true, onClick: () => { executePowerAction({ action: 'shutdown', targetIds: [h.id] }); toast.warning(`Shutting down ${h.hostname}…`); } },
@@ -3378,9 +3299,9 @@
                       { icon: 'FileText', text: 'View PC Event Log', onClick: () => setLogHost(h) },
                       { icon: 'Power', text: 'PsShutdown — Reboot', danger: true, onClick: () => { executePowerAction({ action: 'reboot', targetIds: [h.id] }); toast.success(`PsShutdown reboot sent to ${h.hostname}`); } },
                       { icon: 'RefreshCw', text: 'Check Pending Reboot + Reboot if Req', onClick: () => { if (h.pendingReboot) { executePowerAction({ action: 'reboot', targetIds: [h.id] }); toast.success(`${h.hostname} had pending reboot — rebooting now.`); } else { toast.info(`${h.hostname} does not have a pending reboot flag.`); } } },
-                      { icon: 'MessageSquare', text: 'Send Message to User', onClick: () => { const msg = prompt('Enter message to display on remote screen:', 'IT Maintenance: Please save your work.'); if (msg) { addJob({ id: 'job-' + Date.now(), name: `Message — ${h.hostname}`, targets: [h.id], step: 'Sending (1/1)', progress: 50, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.message', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: { message: msg }, result: 'success' }); toast.success(`Message sent to ${h.hostname}`); } } },
-                      { icon: 'FileText', text: 'Get Windows Update Log', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `WU Log — ${h.hostname}`, targets: [h.id], step: 'Generating (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); toast.info(`Generating Windows Update log for ${h.hostname}…`); } },
-                      { icon: 'Lock', text: 'Enable RDP Remotely', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `Enable RDP — ${h.hostname}`, targets: [h.id], step: 'Enabling (1/1)', progress: 50, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.enable-rdp', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: {}, result: 'success' }); toast.success(`RDP enabled on ${h.hostname}`); } },
+                      { icon: 'MessageSquare', text: 'Send Message to User', onClick: async () => { const msg = prompt('Enter message to display on remote screen:', 'IT Maintenance: Please save your work.'); if (msg) { toast.info('Sending message to ' + h.hostname + '…'); if (window.SupportHubLANAPI) { const result = await window.SupportHubLANAPI.pstoolsExecute('psexec', h.hostname, 'msg * ' + msg); if (result && result.success && !result.demo) { appendAudit({ action: 'pstools.message', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: { message: msg }, result: 'success' }); toast.success('Message sent to ' + h.hostname); } else if (result && result.demo) { toast.warning('Backend not connected.', { duration: 8000 }); } else { toast.error('Failed to send message', { detail: result?.error, duration: 8000 }); } } } } },
+                      { icon: 'FileText', text: 'Get Windows Update Log', onClick: async () => { toast.info(`Generating Windows Update log for ${h.hostname}…`); if (window.SupportHubLANAPI) { const result = await window.SupportHubLANAPI.pstoolsExecute('psexec', h.hostname, '-s powershell -Command "Get-WindowsUpdateLog -LogPath C:\\WULog.txt; type C:\\WULog.txt"'); if (result && result.success && !result.demo) { appendAudit({ action: 'pstools.wu-log', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: {}, result: 'success' }); toast.success(`Windows Update log generated for ${h.hostname}`, { detail: 'Check terminal panel for output', duration: 5000 }); } else if (result && result.demo) { toast.warning('Backend not connected.', { duration: 8000 }); } else { toast.error('Failed to generate log', { detail: result?.error, duration: 8000 }); } } } },
+                      { icon: 'Lock', text: 'Enable RDP Remotely', onClick: async () => { toast.info(`Enabling RDP on ${h.hostname}…`); if (window.SupportHubLANAPI) { const result = await window.SupportHubLANAPI.pstoolsExecute('psexec', h.hostname, '-s reg add "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f'); if (result && result.success && !result.demo) { appendAudit({ action: 'pstools.enable-rdp', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: {}, result: 'success' }); toast.success(`RDP enabled on ${h.hostname}`); } else if (result && result.demo) { toast.warning('Backend not connected.', { duration: 8000 }); } else { toast.error('Failed to enable RDP', { detail: result?.error, duration: 8000 }); } } } },
                     ],
                   });
                 }}
@@ -4338,51 +4259,31 @@
     }, [route.params]);
 
     const [filters, setFilters] = useState({});
+    // runSimulation was REMOVED — no more fake update animation.
+    // The installUpdates() function calls the real backend endpoint.
     const simSteps = ['Scanning (1/5)', 'Downloading (2/5)', 'Installing (3/5)', 'Rebooting (4/5)', 'Verifying (5/5)'];
 
-    const runSimulation = () => {
+    const runSimulation = async () => {
       if (selectedIds.length === 0) { toast.warning('Select at least one host to install updates on.'); return; }
-      setSimulating(true);
-      setSimStep(0);
-      // Capture the snapshot of selected ids (closure-safe) and the hostnames for the audit log
       const targetIds = [...selectedIds];
       const targetNames = hosts.filter(h => targetIds.includes(h.id)).map(h => h.hostname);
-      const jobId = 'job-' + Date.now();
-      // Create a job entry to track in the Job Queue
-      addJob({
-        id: jobId,
-        name: `Install Updates — ${targetIds.length} hosts`,
-        targets: targetIds,
-        step: simSteps[0],
-        progress: 20,
-        startedAt: new Date().toISOString(),
-        status: 'running',
-      });
-      appendAudit({
-        action: 'updates.install', actionCategory: 'Updates',
-        targetType: 'Host', targetIds,
-        parameters: { mode: 'all', reboot: 'if-required', jobId, hostnames: targetNames },
-        result: 'success',
-      });
-      const interval = setInterval(() => {
-        setSimStep(s => {
-          if (s >= 4) {
-            clearInterval(interval);
-            setSimulating(false);
-            // Actually flip selected hosts to compliant + clear pendingReboot
+      toast.info(`Installing updates on ${targetIds.length} host(s)…`);
+      if (window.SupportHubLANAPI) {
+        try {
+          const result = await window.SupportHubLANAPI.installUpdates(targetNames, null, { rebootBehavior: 'if-required' });
+          if (result && result.success && !result.demo) {
             updateHosts(prev => prev.map(h => targetIds.includes(h.id) ? { ...h, patchState: 'compliant', pendingReboot: false } : h));
-            appendAudit({
-              action: 'updates.install.complete', actionCategory: 'Updates',
-              targetType: 'Host', targetIds,
-              parameters: { jobId, hostnames: targetNames, installed: targetNames.length },
-              result: 'success',
-            });
-            toast.success(`Update complete — ${targetIds.length} host(s) now compliant`);
-            return 0;
+            appendAudit({ action: 'updates.install', actionCategory: 'Updates', targetType: 'Host', targetIds, parameters: { mode: 'all', reboot: 'if-required', hostnames: targetNames }, result: 'success' });
+            toast.success(`Updates installed on ${targetIds.length} host(s)`);
+          } else if (result && result.demo) {
+            toast.warning('Backend not connected. Run the server to install updates.', { duration: 8000 });
+          } else {
+            toast.error('Install failed', { detail: result?.error, duration: 8000 });
           }
-          return s + 1;
-        });
-      }, 1200);
+        } catch (e) {
+          toast.error('Install failed', { detail: e.message, duration: 8000 });
+        }
+      }
     };
 
     const filteredHosts = useMemo(() => {
@@ -4442,7 +4343,7 @@
           if (result.success && !result.demo) { toast.success(`Real install initiated on ${targetNames.length} hosts.`); return; }
         }
         // Demo fallback
-        runSimulation();
+        toast.warning('Backend not connected. Run the server to install updates.', { duration: 8000 });
       } },
       { label: 'Install by Class', icon: 'Filter', onClick: () => setShowClassModal(true) },
       { label: 'Hide Updates', icon: 'EyeOff', onClick: () => {
@@ -4542,21 +4443,7 @@
                 return (
                   <div className="space-y-1.5">
                     <div className="text-xs text-text-dim mb-2">Showing pending updates for <span className="font-mono text-text">{h.hostname}</span></div>
-                    {KB_CATALOG.slice(0, 5).map(kb => (
-                      <div key={kb.kb} className="flex items-center gap-3 p-2 bg-surface-raised rounded border border-border">
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono text-xs text-text">{kb.kb}</span>
-                            <Badge color={kb.severity === 'Critical' ? 'danger' : kb.severity === 'Important' ? 'warning' : 'info'}>{kb.severity}</Badge>
-                            <Badge color="muted">{kb.classification}</Badge>
-                          </div>
-                          <div className="text-[11px] text-text-dim mt-0.5 truncate">{kb.title}</div>
-                        </div>
-                        <span className="text-[10px] text-text-dim tnum">{kb.size} MB</span>
-                        <ActionButton size="xs" variant="ghost" icon="Download">Download</ActionButton>
-                        <ActionButton size="xs" variant="ghost" icon="EyeOff">Hide</ActionButton>
-                      </div>
-                    ))}
+                    <div className="text-text-dim text-xs py-4 text-center">Run a scan to see available updates.</div>
                   </div>
                 );
               })()}
@@ -6179,7 +6066,7 @@
 
     // Build calendar month grid for June 2026
     const calendarDays = useMemo(() => {
-      const year = 2026, month = 5; // June (0-indexed)
+      const now = new Date(); const [calYear, setCalYear] = useState(now.getFullYear()); const [calMonth, setCalMonth] = useState(now.getMonth()); const year = calYear, month = calMonth; // June (0-indexed)
       const first = new Date(year, month, 1);
       const last = new Date(year, month + 1, 0);
       const startDay = first.getDay();
@@ -7207,7 +7094,7 @@
               <FormField label="Reply-To"><Input defaultValue="it-ops@corp.local" className="font-mono" /></FormField>
             </div>
             <div className="mt-3 flex gap-2">
-              <ActionButton variant="primary" icon="Mail" onClick={() => { toast.info('Sending test email…'); setTimeout(() => toast.success('Test email sent to supporthublan@corp.local.'), 1500); }}>Send Test Email</ActionButton>
+              <ActionButton variant="primary" icon="Mail" onClick={() => { toast.warning('SMTP not configured. Email notifications require a backend SMTP endpoint (planned for future release).'); }}>Send Test Email</ActionButton>
               <ActionButton variant="secondary" icon="Save" onClick={() => { appendAudit({ action: 'settings.email-save', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: {}, result: 'success' }); toast.success('Email settings saved.'); }}>Save</ActionButton>
             </div>
             <div className="mt-4">
@@ -8021,88 +7908,43 @@
     }, [hosts, addJob, appendAudit, updateHosts, updateJob, addJobLog]);
 
     // ---- Execute deployment: create a job that progresses through Copying → Extracting → Installing → Verifying ----
-    const executeDeployment = useCallback(({ profile, targetIds }) => {
+    const executeDeployment = useCallback(async ({ profile, targetIds }) => {
       const jobId = 'job-' + Date.now();
       const targetNames = hosts.filter(h => targetIds.includes(h.id)).map(h => h.hostname);
-      const phases = ['Copying (1/4)', 'Extracting (2/4)', 'Installing (3/4)', 'Verifying (4/4)'];
       addJob({
         id: jobId,
         name: `Deploy ${profile.name} — ${targetIds.length} hosts`,
         targets: [...targetIds],
-        step: phases[0],
-        progress: 10,
+        step: 'Deploying (1/1)',
+        progress: 30,
         startedAt: new Date().toISOString(),
         status: 'running',
       });
-      addDeploymentHistory({
-        id: 'dh-' + Date.now(),
-        timestamp: new Date().toISOString(),
-        package: profile.name,
-        type: profile.packageType,
-        targets: targetIds.length,
-        user: CURRENT_USER.username,
-        status: 'running',
-        exitCodes: {},
-        duration: null,
-      });
-      appendAudit({
-        action: 'deployments.run', actionCategory: 'Deployments',
-        targetType: 'Host', targetIds: [...targetIds],
-        parameters: { jobId, profileId: profile.id, profileName: profile.name, hostnames: targetNames },
-        result: 'success',
-      });
-      // Advance through phases every 1.8s
-      let phaseIdx = 0;
-      const interval = setInterval(() => {
-        phaseIdx += 1;
-        if (phaseIdx >= phases.length) {
-          clearInterval(interval);
-          updateJob(jobId, { progress: 100, step: 'Complete', status: 'complete' });
-          updateHosts(prev => prev.map(h => targetIds.includes(h.id) ? { ...h, lastSeen: new Date().toISOString() } : h));
-          addJobLog({ id: 'jl-' + Date.now(), queueName: `Deploy ${profile.name}`, startedAt: new Date().toISOString(), duration: '7s', steps: 4, targets: targetIds.length, result: 'success' });
-          appendAudit({ action: 'deployments.complete', actionCategory: 'Deployments', targetType: 'Host', targetIds, parameters: { jobId, profileName: profile.name }, result: 'success' });
-          return;
+      // Call REAL backend endpoint
+      if (window.SupportHubLANAPI) {
+        try {
+          const result = await window.SupportHubLANAPI.deployPackage(targetNames, profile.packagePath, profile.arguments, null, profile.rebootBehavior);
+          if (result && result.success && !result.demo) {
+            updateJob(jobId, { progress: 100, step: 'Complete', status: 'completed', completedAt: new Date().toISOString(), output: result.data || '' });
+            appendAudit({ action: 'deployments.run', actionCategory: 'Deployments', targetType: 'Host', targetIds, parameters: { jobId, profileName: profile.name, hostnames: targetNames }, result: 'success' });
+            toast.success(`Deployment of ${profile.name} completed on ${targetIds.length} host(s)`);
+          } else if (result && result.demo) {
+            updateJob(jobId, { progress: 100, step: 'Demo mode — backend not connected', status: 'failed', completedAt: new Date().toISOString() });
+            toast.warning('Backend not connected. Run the server to deploy packages.', { duration: 8000 });
+          } else {
+            updateJob(jobId, { progress: 100, step: 'Failed', status: 'failed', completedAt: new Date().toISOString(), output: result?.error || '' });
+            toast.error('Deployment failed', { detail: result?.error, duration: 8000 });
+          }
+        } catch (e) {
+          updateJob(jobId, { progress: 100, step: 'Failed', status: 'failed', completedAt: new Date().toISOString(), output: e.message });
+          toast.error('Deployment failed', { detail: e.message, duration: 8000 });
         }
-        updateJob(jobId, { progress: 10 + (phaseIdx * 25), step: phases[phaseIdx] });
-      }, 1800);
+      }
       return jobId;
-    }, [hosts, addJob, addDeploymentHistory, appendAudit, updateJob, updateHosts, addJobLog]);
+    }, [hosts, addJob, appendAudit, updateJob]);
 
-    // ---- Helper: Generate demo output for script execution (fallback when no backend) ----
-    const generateDemoOutput = (language, code, targetIds, hosts, execId) => {
-      const outputs = targetIds.map((id) => {
-        const h = hosts.find(x => x.id === id);
-        if (!h) return null;
-        const lines = [];
-        if (language === 'PowerShell' && code.includes('Get-Service')) {
-          lines.push('Status   Name               DisplayName');
-          lines.push('------   ----               -----------');
-          lines.push('Running  wuauserv           Windows Update');
-          lines.push('Running  BITS               Background Intelligent Transfer Ser...');
-          lines.push('Stopped  Spooler            Print Spooler');
-        } else if (language === 'PowerShell' && code.includes('Get-PSDrive')) {
-          lines.push('Used (GB)  Free (GB)');
-          lines.push('---------  ---------');
-          lines.push(`${h.diskUsedGb}          ${h.diskFreeGb}`);
-        } else if (code.includes('PendingReboot')) {
-          lines.push(`PendingReboot: ${h.pendingReboot}`);
-        } else if (code.includes('query user')) {
-          lines.push(h.loggedOnUsers.length > 0 ? 'USERNAME  SESSIONNAME  ID  STATE  IDLE  TIME' : 'No users logged on.');
-          h.loggedOnUsers.forEach((u, idx) => lines.push(`${u}  console  ${idx + 1}  Active  none  ${h.uptime}`));
-        } else if (code.includes('flushdns')) {
-          lines.push('Windows IP Configuration');
-          lines.push('Successfully flushed the DNS Resolver Cache.');
-        } else {
-          lines.push(`[${language}] Output on ${h.hostname}:`);
-          lines.push('OK');
-        }
-        return {
-          hostId: id, hostname: h.hostname, status: 'complete', exitCode: 0,
-          duration: `${(0.3 + Math.random() * 1.5).toFixed(2)}s`, output: lines.join('\n'),
-        };
-      }).filter(Boolean);
-      return { execId, outputs, real: false };
-    };
+    // generateDemoOutput was REMOVED — no more fake script output.
+    // When the backend is not connected, executeScript returns an honest error.
 
     // ---- Execute script: generate per-host output ----
     // When backend is connected, executes real PowerShell via Invoke-Command.
@@ -8138,11 +7980,11 @@
             }
           }
           // Fall through to demo mode
-          return generateDemoOutput(language, code, targetIds, hosts, execId);
+          return { id: execId, targetIds, language, startedAt: new Date().toISOString(), perHost: hosts.filter(h => targetIds.includes(h.id)).map(h => ({ hostname: h.hostname, success: false, output: 'Backend not connected' })), output: 'Backend not connected' };
         });
       }
       // Demo mode
-      return Promise.resolve(generateDemoOutput(language, code, targetIds, hosts, execId));
+      return Promise.resolve({ id: execId, targetIds, language, startedAt: new Date().toISOString(), perHost: hosts.filter(h => targetIds.includes(h.id)).map(h => ({ hostname: h.hostname, success: false, output: 'Backend not connected' })), output: 'Backend not connected' });
     }, [hosts, appendAudit]);
 
     const clearPersistedState = useCallback(() => {
@@ -8155,7 +7997,7 @@
       setAuditEvents(AUDIT_EVENTS);
       setUsers(USERS);
       setPatchHistory(PATCH_HISTORY);
-      setDeploymentHistory(DEPLOYMENT_HISTORY);
+      setDeploymentHistory([]);
       setJobLogs(JOB_LOGS);
       setApiKeys(API_KEYS);
       setMaintenanceWindows(MAINTENANCE_WINDOWS);
@@ -8313,7 +8155,7 @@
         }
         // t → toggle theme
         if (e.key === 't' && !e.ctrlKey && !e.metaKey) { e.preventDefault(); toggleTheme(); return; }
-        // Ctrl+B → toggle grid border style
+        // Ctrl+B → toggle grid border style (BatchPatch feature)
         if ((e.ctrlKey || e.metaKey) && e.key === 'b') { e.preventDefault(); document.documentElement.classList.toggle('grid-borderless'); toast.info(`Grid border style: ${document.documentElement.classList.contains('grid-borderless') ? 'borderless' : 'default'}`); return; }
         // / → focus search (already handled in TopHeader, but also handle here as fallback)
         if (e.key === '/' && !e.ctrlKey && !e.metaKey) { e.preventDefault(); document.querySelector('input[placeholder*="Search hosts"]')?.focus(); return; }

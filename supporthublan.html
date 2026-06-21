@@ -1643,7 +1643,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v2.0.0';
+  const APP_VERSION = 'v2.0.1';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -8101,6 +8101,26 @@
     // ---- Mutators ----
     const addHosts = useCallback((newHosts) => {
       setHosts(prev => [...prev, ...newHosts]);
+      // Persist to backend when LIVE
+      if (window.SupportHubLANAPI && window._supporthublanBackendStatus === 'connected') {
+        (async () => {
+          try {
+            // Get active inventory
+            const invResp = await fetch(window.SUPPORTHUBLAN_API_URL + '/api/inventories');
+            const invJson = await invResp.json();
+            if (!invJson.success || !invJson.data || invJson.data.length === 0) return;
+            const active = invJson.data.find(i => i.is_active === 1) || invJson.data[0];
+            // Bulk upsert hosts
+            await fetch(window.SUPPORTHUBLAN_API_URL + '/api/inventories/' + active.id + '/hosts/bulk', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ hosts: newHosts }),
+            });
+          } catch (e) {
+            console.log('[addHosts] Failed to persist to backend:', e.message);
+          }
+        })();
+      }
     }, []);
     const updateHost = useCallback((id, patch) => {
       setHosts(prev => prev.map(h => h.id === id ? { ...h, ...patch } : h));
@@ -8443,6 +8463,69 @@
       const i = setInterval(() => setLastRefresh(new Date().toISOString()), 60000);
       return () => clearInterval(i);
     }, []);
+
+    // ---- Sync hosts from backend when LIVE ----
+    // When the backend is connected, load real hosts from the encrypted store
+    // instead of the hardcoded demo seed data. Polls every 30s to pick up changes
+    // made from other tabs or via the API. When backend goes offline, keeps the
+    // last-known hosts (doesn't blow them away).
+    const [liveHostsLoaded, setLiveHostsLoaded] = useState(false);
+    useEffect(() => {
+      let cancelled = false;
+      async function loadHostsFromBackend() {
+        if (!window.SupportHubLANAPI) return;
+        try {
+          const available = await window.SupportHubLANAPI.isBackendAvailable();
+          if (!available || cancelled) return;
+          // Fetch the active inventory's hosts
+          const invResp = await fetch(window.SUPPORTHUBLAN_API_URL + '/api/inventories');
+          const invJson = await invResp.json();
+          if (!invJson.success || !invJson.data || invJson.data.length === 0 || cancelled) return;
+          const active = invJson.data.find(i => i.is_active === 1) || invJson.data[0];
+          const hostsResp = await fetch(window.SUPPORTHUBLAN_API_URL + '/api/inventories/' + active.id + '/hosts');
+          const hostsJson = await hostsResp.json();
+          if (!hostsJson.success || cancelled) return;
+          // Convert backend host format (snake_case) to frontend format (camelCase)
+          const backendHosts = (hostsJson.data || []).map(h => ({
+            id: 'db-' + h.id,
+            hostname: h.hostname,
+            ipAddress: h.ip_address || '',
+            macAddress: h.mac_address || '',
+            fqdn: h.fqdn || '',
+            osName: h.os || 'Windows',
+            osVersion: '',
+            osBuild: '',
+            onlineStatus: h.online_status || 'unknown',
+            pingStatus: h.online_status === 'online' ? 'up' : h.online_status === 'offline' ? 'down' : 'unknown',
+            patchState: h.patch_state || 'unknown',
+            pendingReboot: h.pending_reboot === 1,
+            lastSeen: h.last_seen,
+            site: h.site || '',
+            owner: h.owner || '',
+            department: h.department || '',
+            tags: h.tags ? (typeof h.tags === 'string' ? h.tags.split(',').filter(Boolean) : h.tags) : [],
+            notes: h.notes || '',
+            _fromBackend: true,
+            _inventoryId: h.inventory_id,
+          }));
+          if (!cancelled && backendHosts.length > 0) {
+            // Replace the demo seed data with real backend hosts
+            setHosts(backendHosts);
+            setLiveHostsLoaded(true);
+          } else if (!cancelled && !liveHostsLoaded) {
+            // First load with empty backend — clear the demo seed data so the user
+            // sees an empty inventory (not fake hosts) when LIVE
+            setHosts([]);
+            setLiveHostsLoaded(true);
+          }
+        } catch (e) {
+          // Silently fail — keep current hosts
+        }
+      }
+      loadHostsFromBackend();
+      const interval = setInterval(loadHostsFromBackend, 30000);
+      return () => { cancelled = true; clearInterval(interval); };
+    }, [liveHostsLoaded]);
 
     // ---- Apply theme class to <html> + persist ----
     useEffect(() => {

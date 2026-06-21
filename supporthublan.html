@@ -2693,7 +2693,7 @@
     const toast = useToast();
     const { navigate } = useApp();
     const [inventories, setInventories] = useState([]);
-    const [activeId, setActiveId] = useState(() => { try { return parseInt(localStorage.getItem('supporthublan:active-inventory') || '0', 10); } catch { return 0; } });
+    const [activeHostId, setActiveHostId] = useState(() => { try { return parseInt(localStorage.getItem('supporthublan:active-inventory') || '0', 10); } catch { return 0; } });
 
     const load = async () => {
       try {
@@ -2728,7 +2728,7 @@
       <div className="flex items-center gap-1 border-b border-border overflow-x-auto">
         {inventories.map(inv => (
           <button key={inv.id} onClick={() => activate(inv.id)}
-            className={`flex items-center gap-2 px-3 py-2 text-xs font-medium border-b-2 -mb-px whitespace-nowrap ${activeId === inv.id ? 'border-primary text-primary' : 'border-transparent text-text-dim hover:text-text'}`}>
+            className={`flex items-center gap-2 px-3 py-2 text-xs font-medium border-b-2 -mb-px whitespace-nowrap ${activeHostId === inv.id ? 'border-primary text-primary' : 'border-transparent text-text-dim hover:text-text'}`}>
             <span className={`w-1.5 h-1.5 rounded-full ${inv.is_active ? 'bg-success' : 'bg-text-dim'}`} />
             {inv.name}
           </button>
@@ -3199,7 +3199,7 @@
             <ActionToolbar groups={[
               { label: 'Hosts', items: [
                 { icon: 'Plus', label: 'Add', onClick: () => { setAddModalMethod(null); setShowAddModal(true); } },
-                { icon: 'RefreshCw', label: 'Refresh', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; } updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, lastSeen: new Date().toISOString() } : h)); toast.success(`Refreshed ${selectedIds.length} host(s)`); }, disabled: selectedIds.length === 0 },
+                { icon: 'RefreshCw', label: 'Refresh', onClick: async () => { if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; } const targets = hosts.filter(h => selectedIds.includes(h.id)); toast.info(`Pinging ${selectedIds.length} host(s)…`); if (window.SupportHubLANAPI) { for (const h of targets) { try { const result = await window.SupportHubLANAPI.pingHost(h.hostname); if (result && result.success && !result.demo) { updateHosts(prev => prev.map(x => x.id === h.id ? { ...x, onlineStatus: result.data?.online ? 'online' : 'offline', pingStatus: result.data?.status || 'unknown', lastSeen: new Date().toISOString() } : x)); } } catch (e) {} } toast.success(`Refreshed ${selectedIds.length} host(s)`); } else { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, lastSeen: new Date().toISOString() } : h)); toast.success(`Refreshed ${selectedIds.length} host(s) (local only)`); } }, disabled: selectedIds.length === 0 },
               ]},
               { label: 'Updates', items: [
                 { icon: 'Search', label: 'Check', onClick: async () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } const targetHosts = hosts.filter(h => selectedIds.includes(h.id)); const targetNames = targetHosts.map(h => h.hostname); toast.info(`Scanning ${selectedIds.length} host(s)…`); if (window.SupportHubLANAPI) { const result = await window.SupportHubLANAPI.scanUpdates(targetNames, null); if (result && result.success && !result.demo) { toast.success(`Scan complete on ${selectedIds.length} host(s)`); } else if (result && result.demo) { toast.warning('Backend not connected.', { duration: 8000 }); } else { toast.error('Scan failed', { detail: result?.error, duration: 8000 }); } } }, disabled: selectedIds.length === 0 },
@@ -3231,7 +3231,7 @@
                     }
                   }
                 }, disabled: selectedIds.length === 0 },
-                { icon: 'EyeOff', label: 'Hide', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } toast.success(`Hiding updates on ${selectedIds.length} host(s)`); }, disabled: selectedIds.length === 0 },
+                { icon: 'EyeOff', label: 'Hide', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } toast.warning('Hide updates requires PSWindowsUpdate -Hide on the backend. Use Run Cmd to execute: Get-WindowsUpdate -Hide -KBArticleID <KB>'); }, disabled: selectedIds.length === 0 },
               ]},
               { label: 'PsTools', items: [
                 { icon: 'Info', label: 'PsInfo', onClick: () => runPsToolBulk('psinfo', 'PsInfo'), disabled: selectedIds.length === 0 },
@@ -5383,193 +5383,6 @@
      SCREEN 07 — REMOTE ACCESS
      ====================================================================== */
 
-  const RemoteScreen = () => {
-    const toast = useToast();
-    const { hosts, appendAudit } = useApp();
-    const [activeTab, setActiveTab] = useState('quick');
-    const [protocol, setProtocol] = useState('VNC');
-    const [host, setHost] = useState('');
-    const [port, setPort] = useState(5900);
-    const [method, setMethod] = useState('launch');
-
-    return (
-      <div className="space-y-3">
-        <PageHeader
-          breadcrumb={['supporthublan', 'Remote Access']}
-          title="Remote Desktop Launcher"
-          subtitle="Launch VNC, RDP, or SSH connections to managed hosts"
-          actions={<ActionButton variant="primary" icon="Plus" onClick={() => {
-            const name = prompt('Profile name:', 'New VNC Profile');
-            if (!name) return;
-            const hostName = prompt('Target hostname (from inventory):', hosts[0]?.hostname || '');
-            if (!hostName) return;
-            const h = hosts.find(x => x.hostname === hostName);
-            const profile = { id: 'rp-' + Date.now(), name, hostId: h?.id || hosts[0]?.id || 'h01', ipOverride: null, port: 5900, display: 0, protocol: 'VNC', authNotes: 'Domain creds', externalClientPath: 'C:\\Tools\\vncviewer.exe', tags: ['workstation'], isFavorite: false, lastConnectedAt: null };
-            appendAudit({ action: 'remote.profile-create', actionCategory: 'Inventory', targetType: 'Host', targetIds: [profile.hostId], parameters: { name, protocol: 'VNC' }, result: 'success' });
-            toast.success(`Created remote access profile "${name}" for ${hostName}.`);
-          }}>New Profile</ActionButton>}
-        />
-
-        <TabGroup
-          tabs={[
-            { id: 'quick', label: 'Quick Connect', icon: 'Zap' },
-            { id: 'profiles', label: 'Saved Profiles', icon: 'Save' },
-            { id: 'history', label: 'Connection History', icon: 'History' },
-            { id: 'favorites', label: 'Favorites', icon: 'Star' },
-            { id: 'settings', label: 'Settings', icon: 'Settings' },
-          ]}
-          active={activeTab}
-          onChange={setActiveTab}
-        />
-
-        {activeTab === 'quick' && (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-            <SectionCard title="Quick Connect" description="Connect to any host with VNC, RDP, or SSH">
-              <div className="space-y-3">
-                <FormField label="Host (search from inventory)" required>
-                  <Input value={host} onChange={e => setHost(e.target.value)} placeholder="Start typing hostname or IP…" className="font-mono" list="host-list" />
-                  <datalist id="host-list">{hosts.map(h => <option key={h.id} value={h.hostname} />)}</datalist>
-                </FormField>
-                <div className="grid grid-cols-3 gap-2">
-                  <FormField label="Protocol"><Select value={protocol} onChange={e => { setProtocol(e.target.value); setPort(e.target.value === 'VNC' ? 5900 : e.target.value === 'RDP' ? 3389 : 22); }}><option>VNC</option><option>RDP</option><option>SSH</option></Select></FormField>
-                  <FormField label="Port"><Input type="number" value={port} onChange={e => setPort(parseInt(e.target.value) || port)} className="font-mono" /></FormField>
-                  <FormField label="Display (VNC)"><Input type="number" defaultValue={0} className="font-mono" /></FormField>
-                </div>
-                <FormField label="Connection Method">
-                  <Select value={method} onChange={e => setMethod(e.target.value)}>
-                    <option value="launch">Launch external app</option>
-                    <option value="copy">Copy connection string</option>
-                    <option value="qr">Show QR code</option>
-                  </Select>
-                </FormField>
-                <FormField label="Credential Profile (optional)">
-                  <Select><option>None — prompt each time</option><option>Domain Admin</option><option>Local Admin</option></Select>
-                </FormField>
-                <div className="flex gap-2 pt-2">
-                  <ActionButton variant="primary" icon="ExternalLink" className="flex-1" onClick={() => toast.success(`Launching ${protocol} viewer for ${host || 'host'}:${port}`)}>Connect</ActionButton>
-                  <ActionButton variant="secondary" icon="Copy" onClick={() => toast.success('Connection string copied to clipboard')}>Copy</ActionButton>
-                </div>
-              </div>
-            </SectionCard>
-
-            <SectionCard title="Recent Connections" description="Recently used hosts and profiles">
-              <div className="space-y-1.5">
-                {REMOTE_PROFILES.map(p => {
-                  const h = hosts.find(h => h.id === p.hostId);
-                  return (
-                    <div key={p.id} className="flex items-center gap-2 p-2 bg-surface-raised rounded border border-border">
-                      <Icon name={p.protocol === 'VNC' ? 'Monitor' : p.protocol === 'RDP' ? 'MonitorSmartphone' : 'Terminal'} size={14} className="text-primary" />
-                      <div className="flex-1 min-w-0">
-                        <div className="text-xs font-medium text-text">{p.name}</div>
-                        <div className="text-[10px] text-text-dim font-mono">{h?.hostname || '—'}:{p.port}</div>
-                      </div>
-                      <Badge>{p.protocol}</Badge>
-                      <IconButton icon="ExternalLink" size="sm" variant="primary" title="Connect" onClick={() => toast.success(`Connecting to ${p.name}`)} />
-                    </div>
-                  );
-                })}
-              </div>
-            </SectionCard>
-          </div>
-        )}
-
-        {activeTab === 'profiles' && (
-          <SectionCard bodyClassName="p-0">
-            <DataTable
-              columns={[
-                { key: 'name', label: 'Profile Name', render: r => <span className="text-text font-medium">{r.name}</span> },
-                { key: 'host', label: 'Host', mono: true, render: r => <span className="font-mono text-text-dim">{hosts.find(h => h.id === r.hostId)?.hostname || '—'}</span> },
-                { key: 'port', label: 'Port', render: r => <span className="tnum">{r.port}</span> },
-                { key: 'protocol', label: 'Protocol', render: r => <Badge color="info">{r.protocol}</Badge> },
-                { key: 'authNotes', label: 'Auth Notes' },
-                { key: 'lastConnectedAt', label: 'Last Connected', render: r => <span className="text-text-dim">{fmtRel(r.lastConnectedAt)}</span> },
-                { key: 'actions', label: 'Actions', render: (r) => (
-                  <div className="flex gap-0.5">
-                    <IconButton icon="ExternalLink" size="sm" variant="primary" title="Connect" onClick={() => toast.success(`Connecting to ${r.name}`)} />
-                    <IconButton icon="Edit" size="sm" title="Edit" />
-                    <IconButton icon="Copy" size="sm" title="Clone" />
-                    <IconButton icon="Star" size="sm" title="Set as Favorite" />
-                    <IconButton icon="Trash" size="sm" variant="danger" title="Delete" />
-                  </div>
-                ) },
-              ]}
-              rows={REMOTE_PROFILES.map(p => ({...p, id: p.id}))}
-              onRowClick={() => {}}
-              maxRows={15}
-            />
-          </SectionCard>
-        )}
-
-        {activeTab === 'history' && (
-          <SectionCard bodyClassName="p-0">
-            <DataTable
-              selectable={false}
-              columns={[
-                { key: 'timestamp', label: 'Timestamp', render: r => <span className="text-text-dim">{fmtRel(r.timestamp)}</span> },
-                { key: 'user', label: 'User', render: r => <span className="font-mono text-text-dim">{r.user}</span> },
-                { key: 'profile', label: 'Profile' },
-                { key: 'host', label: 'Host', mono: true, render: r => <span className="font-mono text-text">{r.host}</span> },
-                { key: 'protocol', label: 'Protocol', render: r => <Badge>{r.protocol}</Badge> },
-                { key: 'duration', label: 'Duration' },
-                { key: 'notes', label: 'Notes' },
-              ]}
-              rows={CONNECTION_HISTORY.map(c => ({...c, id: c.id}))}
-              onRowClick={() => {}}
-              maxRows={15}
-            />
-          </SectionCard>
-        )}
-
-        {activeTab === 'favorites' && (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-            {REMOTE_PROFILES.filter(p => p.isFavorite).map(p => {
-              const h = hosts.find(h => h.id === p.hostId);
-              return (
-                <div key={p.id} className="flex flex-col gap-2 p-4 bg-surface border border-border rounded-lg hover:border-primary/40">
-                  <div className="flex items-center justify-between">
-                    <Icon name={p.protocol === 'VNC' ? 'Monitor' : 'MonitorSmartphone'} size={20} className="text-primary" />
-                    <Icon name="Star" size={14} className="text-warning fill-warning" />
-                  </div>
-                  <div className="text-base font-semibold text-text font-mono">{h?.hostname || p.name}</div>
-                  <div className="text-[11px] text-text-dim">{p.name} · {p.protocol}:{p.port}</div>
-                  <div className="text-[10px] text-text-dim">Last: {fmtRel(p.lastConnectedAt)}</div>
-                  <ActionButton variant="primary" size="sm" icon="ExternalLink" onClick={() => toast.success(`Connecting to ${p.name}`)}>Connect</ActionButton>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        {activeTab === 'settings' && (
-          <div className="space-y-4">
-            <SectionCard title="VNC Viewer Settings" description="Path and launch command for the external VNC client">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <FormField label="VNC Viewer Executable Path"><Input defaultValue="C:\\Tools\\vncviewer.exe" className="font-mono" /></FormField>
-                <FormField label="Default Port"><Input type="number" defaultValue={5900} /></FormField>
-                <FormField label="Launch Command Template" className="md:col-span-2"><Input defaultValue={`"C:\\Tools\\vncviewer.exe" {host}:{port}`} className="font-mono" /></FormField>
-              </div>
-            </SectionCard>
-            <SectionCard title="RDP Client Settings">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <FormField label="RDP Client Path"><Input defaultValue="mstsc.exe" className="font-mono" /></FormField>
-                <FormField label="Default Port"><Input type="number" defaultValue={3389} /></FormField>
-                <FormField label="Launch Method"><Select><option>Open external app</option><option>Copy connection string</option><option>Generate .rdp file</option></Select></FormField>
-              </div>
-            </SectionCard>
-            <SectionCard title="SSH Client Settings">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <FormField label="SSH Client Path"><Input defaultValue="C:\\Windows\\System32\\OpenSSH\\ssh.exe" className="font-mono" /></FormField>
-                <FormField label="Default Port"><Input type="number" defaultValue={22} /></FormField>
-              </div>
-            </SectionCard>
-            <ActionButton variant="primary" icon="Check" onClick={() => { appendAudit({ action: 'settings.remote-save', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: {}, result: 'success' }); toast.success('Remote access settings saved.'); }}>Save Settings</ActionButton>
-          </div>
-        )}
-      </div>
-    );
-  };
-
-  /* __SCREEN_REMOTE_END__ */
 
   const PowerScreen = () => {
     const toast = useToast();
@@ -8375,7 +8188,7 @@
     const [history, setHistory] = useState([]);
     const [historyIdx, setHistoryIdx] = useState(-1);
     const [running, setRunning] = useState(false);
-    const [sessionId] = useState(() => 'term-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
+    const [sessionHostId] = useState(() => 'term-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
     const [autoScroll, setAutoScroll] = useState(true);
     const scrollRef = useRef(null);
     const inputRef = useRef(null);

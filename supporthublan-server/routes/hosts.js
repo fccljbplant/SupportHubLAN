@@ -257,39 +257,98 @@ module.exports = function(db) {
         _source: 'wmic+ipconfig+psloggedon',
       };
 
-      // Hardware change detection
+      // ========================================================================
+      // MERGE LOGIC — don't lose old data if new scan returns empty fields.
+      //
+      // For each section (system, motherboard, bios, processor, memory, disks,
+      // logicalDisks, network, gpu, os), if the NEW scan returned data for
+      // that section, use the new data. If the new scan returned EMPTY for
+      // that section, KEEP the old saved data. This way a partial scan
+      // (e.g. wmic failed but ipconfig worked) doesn't wipe out previously
+      // good data.
+      // ========================================================================
       const key = 'hardware:' + safeHost;
-      let changes = [];
+      let prevHw = null;
       let isFirstScan = true;
       try {
         const previous = db.settings.get(key, null);
         if (previous) {
           isFirstScan = false;
-          let prev;
-          try { prev = JSON.parse(previous); } catch { prev = null; }
-          if (prev) {
-            const getField = (o, p) => p.split('.').reduce((a, k) => (a && a[k] !== undefined) ? a[k] : null, o);
-            const compareField = (field) => {
-              const oldV = getField(prev, field);
-              const newV = getField(hw, field);
-              if (oldV && newV && String(oldV) !== String(newV)) {
-                changes.push({ field, oldValue: oldV, newValue: newV });
-              }
-            };
-            ['system.manufacturer', 'system.model', 'system.serial',
-             'motherboard.serial', 'bios.serial',
-             'processor.name', 'processor.cores', 'processor.threads',
-             'system.totalRamMB'].forEach(compareField);
-            const prevDiskCount = (prev.disks || []).length;
-            const newDiskCount = (hw.disks || []).length;
-            if (prevDiskCount !== newDiskCount) {
-              changes.push({ field: 'diskCount', oldValue: prevDiskCount, newValue: newDiskCount });
-            }
-          }
+          try { prevHw = JSON.parse(previous); } catch { prevHw = null; }
         }
-      } catch (e) { /* ignore comparison failures */ }
+      } catch (e) { /* ignore load failures */ }
 
-      try { db.settings.set(key, JSON.stringify(hw)); } catch (e) { /* ignore save failures */ }
+      // Check which sections the new scan actually returned data for
+      const newHas = {
+        system:        !!(hw.system?.manufacturer || hw.system?.model || hw.system?.serial),
+        motherboard:   !!(hw.motherboard?.manufacturer || hw.motherboard?.product),
+        bios:          !!(hw.bios?.manufacturer || hw.bios?.version),
+        processor:     !!(hw.processor?.name),
+        memory:        !!(hw.memory && hw.memory.length > 0),
+        disks:         !!(hw.disks && hw.disks.length > 0),
+        logicalDisks:  !!(hw.logicalDisks && hw.logicalDisks.length > 0),
+        network:       !!(hw.network && hw.network.length > 0),
+        gpu:           !!(hw.gpu && hw.gpu.length > 0),
+        os:            !!(hw.os?.name),
+      };
+
+      // If we have previous data, merge: use new data where available, keep
+      // old data for sections that came back empty.
+      let finalHw = hw;
+      if (prevHw) {
+        finalHw = { ...prevHw };
+
+        // Always update scan timestamp
+        finalHw.scannedAt = hw.scannedAt;
+
+        // Merge each section
+        if (newHas.system)       finalHw.system       = { ...(prevHw.system || {}), ...hw.system };
+        if (newHas.motherboard)  finalHw.motherboard  = { ...(prevHw.motherboard || {}), ...hw.motherboard };
+        if (newHas.bios)         finalHw.bios         = { ...(prevHw.bios || {}), ...hw.bios };
+        if (newHas.processor)    finalHw.processor    = hw.processor;
+        if (newHas.memory)       finalHw.memory       = hw.memory;
+        if (newHas.disks)        finalHw.disks        = hw.disks;
+        if (newHas.logicalDisks) finalHw.logicalDisks = hw.logicalDisks;
+        if (newHas.network)      finalHw.network      = hw.network;
+        if (newHas.gpu)          finalHw.gpu          = hw.gpu;
+        if (newHas.os)           finalHw.os           = { ...(prevHw.os || {}), ...hw.os };
+
+        // Always update loggedInUser (it's real-time data, not hardware)
+        if (hw.loggedInUser) finalHw.loggedInUser = hw.loggedInUser;
+
+        // Keep the hostname from whichever has it
+        finalHw.hostname = finalHw.hostname || hw.hostname || safeHost;
+      } else {
+        // No previous data — use whatever the new scan returned
+        finalHw = hw;
+      }
+
+      // Hardware change detection (compare finalHw with prevHw)
+      let changes = [];
+      if (prevHw) {
+        try {
+          const getField = (o, p) => p.split('.').reduce((a, k) => (a && a[k] !== undefined) ? a[k] : null, o);
+          const compareField = (field) => {
+            const oldV = getField(prevHw, field);
+            const newV = getField(finalHw, field);
+            if (oldV && newV && String(oldV) !== String(newV)) {
+              changes.push({ field, oldValue: oldV, newValue: newV });
+            }
+          };
+          ['system.manufacturer', 'system.model', 'system.serial',
+           'motherboard.serial', 'bios.serial',
+           'processor.name', 'processor.cores', 'processor.threads',
+           'system.totalRamMB'].forEach(compareField);
+          const prevDiskCount = (prevHw.disks || []).length;
+          const newDiskCount = (finalHw.disks || []).length;
+          if (prevDiskCount !== newDiskCount && newDiskCount > 0) {
+            changes.push({ field: 'diskCount', oldValue: prevDiskCount, newValue: newDiskCount });
+          }
+        } catch (e) { /* ignore comparison failures */ }
+      }
+
+      // Save the MERGED data (never save empty data over good data)
+      try { db.settings.set(key, JSON.stringify(finalHw)); } catch (e) { /* ignore save failures */ }
 
       // Collect any raw outputs for debugging
       const rawOutputs = {
@@ -297,17 +356,46 @@ module.exports = function(db) {
         baseboard: bbRes.stdout ? bbRes.stdout.substring(0, 1000) : '',
         bios: biosRes.stdout ? biosRes.stdout.substring(0, 1000) : '',
         cpu: cpuRes.stdout ? cpuRes.stdout.substring(0, 1000) : '',
+        csStderr: csRes.stderr ? csRes.stderr.substring(0, 500) : '',
       };
+
+      // Determine if this was a partial scan (most sections empty)
+      const newSectionCount = Object.values(newHas).filter(Boolean).length;
+      const partialScan = newSectionCount < 3; // less than 3 sections returned data
 
       res.json({
         success: true,
-        data: hw,
+        data: finalHw,    // return the MERGED data, not the raw new scan
         changes,
         isFirstScan,
+        partialScan,
+        newSections: newHas,
         rawOutputs,
       });
     } catch (e) {
       res.json({ success: false, error: e.message || 'Hardware scan failed' });
+    }
+  });
+
+  // ===========================================================================
+  // GET HARDWARE (saved) — retrieve previously-saved hardware data WITHOUT
+  // running a new scan. Used by the frontend when opening the Hardware tab
+  // so the user sees the last known data immediately (instead of a blank
+  // page while the scan runs).
+  // ===========================================================================
+  router.get('/:hostname/hardware', (req, res) => {
+    const safeHost = sanitizeHost(req.params.hostname);
+    const key = 'hardware:' + safeHost;
+    try {
+      const saved = db.settings.get(key, null);
+      if (saved) {
+        const hw = JSON.parse(saved);
+        res.json({ success: true, data: hw, scannedAt: hw.scannedAt });
+      } else {
+        res.json({ success: false, error: 'No saved hardware data. Run a scan first.' });
+      }
+    } catch (e) {
+      res.json({ success: false, error: 'Failed to load saved hardware data: ' + e.message });
     }
   });
 

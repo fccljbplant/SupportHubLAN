@@ -32,14 +32,30 @@ function runPowerShell(script, timeoutMs = 60000) {
 // `args` is an array of string arguments (we do NOT shell-escape; spawn
 // passes them through verbatim).
 // `timeoutMs` kills the process after N ms.
+// `options.skipAcceptEula` — if true, don't auto-add -accepteula (caller
+//   has already placed it in the correct position).
+//
+// CRITICAL: For psexec.exe, -accepteula MUST come BEFORE \\HOST, because
+// everything after the command (wmic, ipconfig, etc.) is passed as arguments
+// to the remote command. If -accepteula comes after, the remote command
+// receives it as an argument and fails silently. This was the root cause of
+// the "hardware audit returns nothing" bug.
 // ---------------------------------------------------------------------------
-function runPsToolDirect(exeName, args, timeoutMs = 60000) {
+function runPsToolDirect(exeName, args, timeoutMs = 60000, options = {}) {
   return new Promise((resolve) => {
     const exe = pstoolsExe(exeName);
     const finalArgs = Array.isArray(args) ? args.slice() : [];
     // Auto-add -accepteula for PsTools exes (avoids the EULA dialog hang)
-    if (/\.(exe)$/i.test(exeName) && !finalArgs.includes('-accepteula')) {
-      finalArgs.push('-accepteula');
+    if (!options.skipAcceptEula && !finalArgs.includes('-accepteula')) {
+      if (exeName.toLowerCase() === 'psexec.exe') {
+        // For psexec, -accepteula MUST go BEFORE \\computer — it's a psexec
+        // option, not an argument to the remote command.
+        finalArgs.unshift('-accepteula');
+      } else {
+        // For other tools (psinfo, psloggedon, etc.), -accepteula goes AFTER
+        // the host name — it's a tool-specific option.
+        finalArgs.push('-accepteula');
+      }
     }
     let proc;
     try {
@@ -77,9 +93,18 @@ function runPsToolDirect(exeName, args, timeoutMs = 60000) {
 // PowerShell. Example: runRemoteCmdDirect('HOST', ['ipconfig', '/all']).
 // Returns the raw stdout from the remote command (still contains the PsExec
 // banner, which the caller should strip).
+//
+// The resulting psexec command line is:
+//   psexec -accepteula \\HOST -s <remoteCmdArgs...>
+//
+// -accepteula is placed BEFORE \\HOST so psexec treats it as a psexec option,
+// NOT as an argument to the remote command. This is critical — if it comes
+// after the remote command, the remote command (wmic, ipconfig, etc.) receives
+// -accepteula as an unknown argument and fails silently.
 // ---------------------------------------------------------------------------
 function runRemoteCmdDirect(hostname, remoteCmdArgs, timeoutMs = 30000) {
   const safeHost = sanitizeHost(hostname);
+  // -accepteula goes FIRST (before \\HOST), -s goes after \\HOST
   const args = ['\\\\' + safeHost, '-s'].concat(remoteCmdArgs);
   return runPsToolDirect('psexec.exe', args, timeoutMs);
 }

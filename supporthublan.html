@@ -461,6 +461,19 @@
         }
       }
 
+      // apiGet — GET request (for retrieving saved data without triggering
+      // a scan). Used by the Hardware tab to load previously-scan data.
+      async function apiGet(endpoint) {
+        const available = await checkBackend();
+        if (!available) return { success: false, demo: true, error: 'Backend not available' };
+        try {
+          const resp = await fetch(getApiUrl() + endpoint, { method: 'GET' });
+          return await resp.json();
+        } catch (e) {
+          return { success: false, demo: true, error: e.message };
+        }
+      }
+
       return {
         isBackendAvailable: checkBackend,
         apiUrl: getApiUrl(),
@@ -532,6 +545,7 @@
 
         // Hardware info + change detection
         getHardwareInfo: (hostname) => apiCall('/api/hosts/' + hostname + '/hardware', {}),
+        getSavedHardware: (hostname) => apiGet('/api/hosts/' + hostname + '/hardware'),
         getApps: (hostname) => apiCall('/api/hosts/' + hostname + '/apps', {}),
         checkHardwareChanges: (hostnames) => apiCall('/api/hardware/check-changes', { hostnames }),
         checkHostStatus: (hostnames) => apiCall('/api/hosts/status-check', { hostnames }),
@@ -1652,7 +1666,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v4.0.6';
+  const APP_VERSION = 'v4.0.7';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -2495,11 +2509,37 @@
       setLoading(false);
     };
 
-    // Auto-scan on first tab open if we have no hardware data yet
+    // On first tab open: load SAVED hardware data first (instant), then
+    // auto-scan ONLY if no saved data exists. This way the user sees the
+    // last known hardware immediately without waiting for a scan, and we
+    // don't lose old data if a new scan returns empty.
+    const [loadedSaved, setLoadedSaved] = useState(false);
     useEffect(() => {
-      if (!hw && !loading && !error && window.SupportHubLANAPI) {
-        scan();
-      }
+      let cancelled = false;
+      (async () => {
+        if (!window.SupportHubLANAPI) return;
+        // If we already have hardware data in state, don't re-load
+        if (host._hardwareInfo) { setLoadedSaved(true); return; }
+        // Try to load saved hardware data
+        try {
+          const r = await window.SupportHubLANAPI.getSavedHardware(host.hostname);
+          if (cancelled) return;
+          if (r && r.success && r.data) {
+            updateHosts(prev => prev.map(h => h.id === host.id ? { ...h, _hardwareInfo: r.data } : h));
+            setLoadedSaved(true);
+            // Don't auto-scan — user has saved data. They can click Rescan.
+          } else {
+            setLoadedSaved(true);
+            // No saved data — auto-scan
+            scan();
+          }
+        } catch (e) {
+          setLoadedSaved(true);
+          // Failed to load saved — auto-scan
+          scan();
+        }
+      })();
+      return () => { cancelled = true; };
       // eslint-disable-next-line
     }, [host.id]);
 

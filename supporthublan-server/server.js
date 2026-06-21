@@ -59,6 +59,7 @@ const fs = require('fs');
 const { WebSocketServer } = require('ws');
 const http = require('http');
 const crypto = require('crypto');
+const dns = require('dns');
 
 // ---- SQLite + AES-256 encrypted credential storage ----
 const db = require('./db');
@@ -428,31 +429,36 @@ app.post('/api/hosts/:hostname/info', async (req, res) => {
   const { hostname } = req.params;
   const { credential } = req.body;
   const safeHost = sanitizeHost(hostname);
-  const credBlock = credential ? buildCredentialBlock(credential) : '';
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
 
   const script = `
-    ${credBlock}
     try {
-      $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
-      ${credential ? '$params.Credential = $cred' : ''}
+      $psinfo = & "${pstools}psinfo.exe" \\\\${safeHost} -accepteula 2>&1 | Out-String
+      $disk = & "${pstools}psexec.exe" \\\\${safeHost} -accepteula -s powershell -c "Get-CimInstance Win32_LogicalDisk -Filter 'DeviceID=''C:''' | Select-Object Size, FreeSpace | ConvertTo-Json -Compress" 2>&1 | Out-String
 
-      $os = Get-CimInstance Win32_OperatingSystem @params
-      $cs = Get-CimInstance Win32_ComputerSystem @params
-      $cpu = Get-CimInstance Win32_Processor @params | Select-Object -First 1
-      $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" @params
-      $uptime = ((Get-Date) - $os.LastBootUpTime)
+      $osName = if ($psinfo -match 'Kernel version:\\s+(.+)') { $matches[1] } else { 'Unknown' }
+      $osBuild = if ($psinfo -match 'Kernel build number:\\s+(.+)') { $matches[1] } else { '' }
+      $osVersion = if ($psinfo -match 'Product version:\\s+(.+)') { $matches[1] } else { '' }
+      $cpuModel = if ($psinfo -match 'Processor description:\\s+(.+)') { $matches[1] } else { 'Unknown' }
+      $ramStr = if ($psinfo -match 'Memory:\\s+(.+?)(?:\\s|$)') { $matches[1] } else { '0' }
+      $ramGb = if ($ramStr -match '(\\d+)') { [math]::Round([int]$matches[1] / 1024, 1) } else { 0 }
+      $rawUptime = if ($psinfo -match 'Uptime:\\s+(.+)$') { $matches[1] } else { 'Unknown' }
+
+      $diskData = try { $disk | ConvertFrom-Json } catch { $null }
+      $diskSize = if ($diskData) { [long]$diskData.Size } else { 0 }
+      $diskFree = if ($diskData) { [long]$diskData.FreeSpace } else { 0 }
 
       $result = @{
-        hostname = $os.CSName
-        osName = $os.Caption
-        osVersion = $os.Version
-        osBuild = $os.BuildNumber
-        cpuModel = $cpu.Name
-        ramGb = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
-        diskUsedGb = [math]::Round(($disk.Size - $disk.FreeSpace) / 1GB, 1)
-        diskFreeGb = [math]::Round($disk.FreeSpace / 1GB, 1)
-        uptime = "$([math]::Floor($uptime.TotalDays))d $([math]::Floor($uptime.Hours))h"
-        lastBootTime = $os.LastBootUpTime
+        hostname = '${safeHost}'
+        osName = $osName
+        osVersion = $osVersion
+        osBuild = $osBuild
+        cpuModel = $cpuModel
+        ramGb = $ramGb
+        diskUsedGb = if ($diskSize -gt 0) { [math]::Round(($diskSize - $diskFree) / 1GB, 1) } else { 0 }
+        diskFreeGb = if ($diskSize -gt 0) { [math]::Round($diskFree / 1GB, 1) } else { 0 }
+        uptime = $rawUptime
+        lastBootTime = $null
         onlineStatus = 'online'
       }
       $result | ConvertTo-Json -Compress
@@ -461,7 +467,7 @@ app.post('/api/hosts/:hostname/info', async (req, res) => {
     }
   `;
 
-  const result = await runPowerShell(script, 30000);
+  const result = await runPowerShell(script, 60000);
   try {
     const data = JSON.parse(result.stdout);
     sendResult(res, { success: true, data, stdout: result.stdout });
@@ -493,6 +499,47 @@ app.post('/api/hosts/:hostname/ping', async (req, res) => {
 app.post('/api/hosts/:hostname/refresh', async (req, res) => {
   req.url = `/api/hosts/${req.params.hostname}/info`;
   app.handle(req, res);
+});
+
+app.post('/api/hosts/resolve-hostname', (req, res) => {
+  const { ip } = req.body;
+  if (!ip) return res.json({ success: false, error: 'ip required' });
+  dns.reverse(ip, (err, hostnames) => {
+    if (err || !hostnames || hostnames.length === 0) {
+      return res.json({ success: false, hostname: null, error: err ? err.message : 'no ptr record' });
+    }
+    res.json({ success: true, hostname: hostnames[0] });
+  });
+});
+
+app.post('/api/hosts/resolve-netbios', async (req, res) => {
+  const { ip } = req.body;
+  if (!ip) return res.json({ success: false, error: 'ip required' });
+  const safeIp = sanitizeHost(ip);
+  const script = `
+    try {
+      # Method 1: nbtstat (NetBIOS)
+      $raw = nbtstat -A '${safeIp}' 2>&1
+      foreach ($line in ($raw -split "\\r?\\n")) {
+        if ($line -match '^\\s*(\\S+)\\s+<00>\\s+UNIQUE') {
+          Write-Output $matches[1]; exit 0
+        }
+      }
+      # Method 2: PsExec (run hostname remotely via SMB/RPC)
+      $hostname = & "${PSTOOLS_PATH}psexec.exe" \\\\${safeIp} -accepteula -s hostname 2>&1 | Out-String
+      if ($hostname -match '^([A-Za-z0-9_-]+)') {
+        Write-Output $matches[1]; exit 0
+      }
+      Write-Output ''
+    } catch { Write-Output '' }
+  `;
+  const result = await runPowerShell(script, 15000);
+  const name = (result.stdout || '').trim();
+  if (name) {
+    res.json({ success: true, hostname: name.toUpperCase() });
+  } else {
+    res.json({ success: false, hostname: null, error: 'no hostname found' });
+  }
 });
 
 // ==========================================================================
@@ -554,26 +601,29 @@ app.post('/api/scan', async (req, res) => {
 // WINDOWS UPDATES — Real scan/download/install via PSWindowsUpdate module
 // ==========================================================================
 app.post('/api/updates/scan', async (req, res) => {
-  const { hostnames, credential } = req.body;
-  const hostList = hostnames.map(sanitizeHost).join("','");
-  const credParam = credential ? '-Credential $cred' : '';
+  const { hostnames } = req.body;
+  const hostList = hostnames.map(sanitizeHost);
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
   const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
-    Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
     $results = @()
-    foreach ($h in @('${hostList}')) {
+    foreach ($h in @('${hostList.join("','")}')) {
       try {
-        $updates = Get-WindowsUpdate -ComputerName $h ${credParam} -ErrorAction Stop
+        $psCmd = "Import-Module PSWindowsUpdate; Get-WindowsUpdate -ErrorAction Stop | Select-Object KB, Title, Size, MsrcSeverity, Category | ConvertTo-Json -Compress"
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($psCmd))
+        $output = & "${pstools}psexec.exe" \\\\$h -accepteula -s -h powershell -NoProfile -EncodedCommand $encoded 2>&1 | Out-String
+        $updates = try { $output | ConvertFrom-Json } catch { @() }
+        if (-not $updates) { $updates = @() }
+        if ($updates -isnot [array]) { $updates = @($updates) }
         $results += @{
           hostname = $h
           status = 'scanned'
           updateCount = $updates.Count
-          critical = ($updates | Where-Object { $_.MsrcSeverity -eq 'Critical' }).Count
-          security = ($updates | Where-Object { $_.MsrcSeverity -eq 'Important' }).Count
-          updates = $updates | Select-Object KB, Title, Size, MsrcSeverity, Category | ConvertTo-Json
+          critical = ($updates | Where-Object { \$_.MsrcSeverity -eq 'Critical' }).Count
+          security = ($updates | Where-Object { \$_.MsrcSeverity -eq 'Important' }).Count
+          updates = ($updates | ConvertTo-Json -Compress)
         }
       } catch {
-        $results += @{ hostname = $h; status = 'failed'; error = $_.Exception.Message }
+        $results += @{ hostname = $h; status = 'failed'; error = \$_.Exception.Message }
       }
     }
     $results | ConvertTo-Json -Depth 5 -Compress
@@ -583,19 +633,20 @@ app.post('/api/updates/scan', async (req, res) => {
 });
 
 app.post('/api/updates/download', async (req, res) => {
-  const { hostnames, credential, kbFilter } = req.body;
-  const hostList = hostnames.map(sanitizeHost).join("','");
-  const credParam = credential ? '-Credential $cred' : '';
+  const { hostnames, kbFilter } = req.body;
+  const hostList = hostnames.map(sanitizeHost);
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
+  const kbParam = kbFilter ? `-KBArticleID '${sanitizeHost(kbFilter)}'` : '-AcceptAll';
   const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
-    Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
     $results = @()
-    foreach ($h in @('${hostList}')) {
+    foreach ($h in @('${hostList.join("','")}')) {
       try {
-        ${kbFilter ? `$updates = Get-WindowsUpdate -ComputerName $h ${credParam} -KBArticleID '${sanitizeHost(kbFilter)}' -Download -ErrorAction Stop` : `Get-WindowsUpdate -ComputerName $h ${credParam} -Download -AcceptAll -ErrorAction Stop`}
+        $psCmd = "Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue; Get-WindowsUpdate -Download ${kbParam} -ErrorAction Stop | Out-Null"
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($psCmd))
+        & "${pstools}psexec.exe" \\\\$h -accepteula -s -h powershell -NoProfile -EncodedCommand $encoded 2>&1 | Out-String | Write-Host
         $results += @{ hostname = $h; status = 'downloaded' }
       } catch {
-        $results += @{ hostname = $h; status = 'failed'; error = $_.Exception.Message }
+        $results += @{ hostname = $h; status = 'failed'; error = \$_.Exception.Message }
       }
     }
     $results | ConvertTo-Json -Compress
@@ -605,24 +656,23 @@ app.post('/api/updates/download', async (req, res) => {
 });
 
 app.post('/api/updates/install', async (req, res) => {
-  const { hostnames, credential, kbFilter, classification, rebootBehavior } = req.body;
-  const hostList = hostnames.map(sanitizeHost).join("','");
-  const credParam = credential ? '-Credential $cred' : '';
-  const rebootParam = rebootBehavior === 'always' || rebootBehavior === 'if-required' ? '-AutoReboot' : '';
+  const { hostnames, kbFilter, classification, rebootBehavior } = req.body;
+  const hostList = hostnames.map(sanitizeHost);
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
   const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
-    Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
     $results = @()
-    foreach ($h in @('${hostList}')) {
+    foreach ($h in @('${hostList.join("','")}')) {
       try {
-        $params = @{ ComputerName = $h; Install = $true; AcceptAll = $true ${rebootParam ? '; ' + rebootParam : ''} }
-        ${credential ? '$params.Credential = $cred' : ''}
-        ${kbFilter ? "$params.KBArticleID = '${sanitizeHost(kbFilter)}'" : ''}
-        ${classification ? "$params.Category = '${sanitizeHost(classification)}'" : ''}
-        Install-WindowsUpdate @params -ErrorAction Stop
+        $installArgs = "-Install -AcceptAll"
+        ${rebootBehavior === 'always' || rebootBehavior === 'if-required' ? '$installArgs += " -AutoReboot"' : ''}
+        ${kbFilter ? `$installArgs += " -KBArticleID '${sanitizeHost(kbFilter)}'"` : ''}
+        ${classification ? `$installArgs += " -Category '${sanitizeHost(classification)}'"` : ''}
+        $psCmd = "Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue; Install-WindowsUpdate $installArgs -ErrorAction Stop"
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($psCmd))
+        & "${pstools}psexec.exe" \\\\$h -accepteula -s -h powershell -NoProfile -EncodedCommand $encoded 2>&1 | Out-String | Write-Host
         $results += @{ hostname = $h; status = 'installed'; rebootRequired = $false }
       } catch {
-        $results += @{ hostname = $h; status = 'failed'; error = $_.Exception.Message }
+        $results += @{ hostname = $h; status = 'failed'; error = \$_.Exception.Message }
       }
     }
     $results | ConvertTo-Json -Compress
@@ -632,18 +682,19 @@ app.post('/api/updates/install', async (req, res) => {
 });
 
 app.post('/api/updates/history', async (req, res) => {
-  const { hostnames, credential } = req.body;
-  const hostList = hostnames.map(sanitizeHost).join("','");
+  const { hostnames } = req.body;
+  const hostList = hostnames.map(sanitizeHost);
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
   const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
-    Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
     $results = @()
-    foreach ($h in @('${hostList}')) {
+    foreach ($h in @('${hostList.join("','")}')) {
       try {
-        $history = Get-WUHistory -ComputerName $h ${credential ? '-Credential $cred' : ''} -ErrorAction Stop
-        $results += @{ hostname = $h; updates = $history | Select-Object KB, Title, Date, Result | ConvertTo-Json }
+        $psCmd = "Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue; Get-WUHistory -ErrorAction Stop | Select-Object KB, Title, Date, Result | ConvertTo-Json -Compress"
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($psCmd))
+        $output = & "${pstools}psexec.exe" \\\\$h -accepteula -s -h powershell -NoProfile -EncodedCommand $encoded 2>&1 | Out-String
+        $results += @{ hostname = $h; updates = $output }
       } catch {
-        $results += @{ hostname = $h; error = $_.Exception.Message }
+        $results += @{ hostname = $h; error = \$_.Exception.Message }
       }
     }
     $results | ConvertTo-Json -Depth 4 -Compress
@@ -656,17 +707,16 @@ app.post('/api/updates/history', async (req, res) => {
 // SCRIPTS & COMMANDS — Real remote execution
 // ==========================================================================
 app.post('/api/scripts/execute', async (req, res) => {
-  const { hostnames, script: userScript, credential, language, timeout } = req.body;
-  const hostList = hostnames.map(sanitizeHost).join("','");
+  const { hostnames, script: userScript, language, timeout } = req.body;
+  const hostList = hostnames.map(sanitizeHost);
   const timeoutSec = timeout || 60;
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
   const psScript = `
-    ${credential ? buildCredentialBlock(credential) : ''}
     $results = @()
-    foreach ($h in @('${hostList}')) {
+    foreach ($h in @('${hostList.join("','")}')) {
       try {
-        $params = @{ ComputerName = $h; ScriptBlock = { ${userScript} }; ErrorAction = 'Stop' }
-        ${credential ? '$params.Credential = $cred' : ''}
-        $output = Invoke-Command @params
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("${userScript.replace(/"/g, '`"').replace(/'/g, "''")}"))
+        $output = & "${pstools}psexec.exe" \\\\$h -accepteula -s -h powershell -NoProfile -EncodedCommand $encoded 2>&1 | Out-String
         $results += @{ hostname = $h; success = $true; output = ($output | Out-String) }
       } catch {
         $results += @{ hostname = $h; success = $false; error = $_.Exception.Message }
@@ -683,16 +733,29 @@ app.post('/api/scripts/execute', async (req, res) => {
 // ==========================================================================
 app.post('/api/services/:hostname/list', async (req, res) => {
   const { hostname } = req.params;
-  const { credential } = req.body;
   const safeHost = sanitizeHost(hostname);
   const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
     try {
-      $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
-      ${credential ? '$params.Credential = $cred' : ''}
-      Get-CimInstance Win32_Service @params | Select-Object Name, DisplayName, State, StartMode, StartName | ConvertTo-Json -Compress
+      $raw = & "${process.env.PSTOOLS_PATH || 'C:\\PSTools\\'}psservice.exe" \\\\${safeHost} query -accepteula 2>&1 | Out-String
+      $services = @()
+      $current = @{}
+      foreach ($line in ($raw -split "\\r?\\n")) {
+        if ($line -match '^SERVICE_NAME:\\s+(.+)$') {
+          if ($current.Name) { $services += $current }
+          $current = @{ Name = $matches[1] }
+        } elseif ($line -match '^DISPLAY_NAME:\\s+(.+)$') {
+          $current.DisplayName = $matches[1]
+        } elseif ($line -match '^\\s+STATE\\s+:\\s+\\d+\\s+(.+)$') {
+          $current.State = $matches[1].Trim()
+        } elseif ($line -match '^\\s+TYPE\\s+:\\s+\\d+\\s+(.+)$') {
+          $current.StartMode = $matches[1].Trim()
+        }
+      }
+      if ($current.Name) { $services += $current }
+      if ($services.Count -eq 0) { @{ error = $raw.Substring(0, [Math]::Min(500, $raw.Length)) } | ConvertTo-Json -Compress }
+      else { $services | ConvertTo-Json -Compress }
     } catch {
-      @{ error = $_.Exception.Message } | ConvertTo-Json -Compress
+      @{ error = \$_.Exception.Message } | ConvertTo-Json -Compress
     }
   `;
   const result = await runPowerShell(script, 30000);
@@ -704,20 +767,13 @@ app.post('/api/services/:hostname/action', async (req, res) => {
   const { serviceName, action, credential } = req.body;
   const safeHost = sanitizeHost(hostname);
   const safeService = sanitizeHost(serviceName);
-  const credBlock = credential ? buildCredentialBlock(credential) : '';
-  const credParam = credential ? '-Credential $cred' : '';
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
   const script = `
-    ${credBlock}
     try {
-      switch ('${action}') {
-        'start'   { Start-Service   -ComputerName '${safeHost}' -Name '${safeService}' ${credParam}; $newState = 'Running' }
-        'stop'    { Stop-Service    -ComputerName '${safeHost}' -Name '${safeService}' -Force ${credParam}; $newState = 'Stopped' }
-        'restart' { Restart-Service -ComputerName '${safeHost}' -Name '${safeService}' -Force ${credParam}; $newState = 'Running' }
-        default   { throw "Unknown action: ${action}" }
-      }
-      @{ hostname = '${safeHost}'; service = '${safeService}'; state = $newState; success = $true } | ConvertTo-Json -Compress
+      & "${pstools}psservice.exe" \\\\${safeHost} ${action} "${safeService}" -accepteula 2>&1 | Out-String | Write-Host
+      @{ hostname = '${safeHost}'; service = '${safeService}'; action = '${action}'; success = $true } | ConvertTo-Json -Compress
     } catch {
-      @{ hostname = '${safeHost}'; service = '${safeService}'; success = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
+      @{ hostname = '${safeHost}'; service = '${safeService}'; action = '${action}'; success = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
     }
   `;
   const result = await runPowerShell(script, 30000);
@@ -726,16 +782,29 @@ app.post('/api/services/:hostname/action', async (req, res) => {
 
 app.post('/api/processes/:hostname/list', async (req, res) => {
   const { hostname } = req.params;
-  const { credential } = req.body;
   const safeHost = sanitizeHost(hostname);
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
   const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
     try {
-      $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
-      ${credential ? '$params.Credential = $cred' : ''}
-      Get-CimInstance Win32_Process @params | Select-Object ProcessId, Name, @{N='MemMB';E={[math]::Round($_.WorkingSetSize/1MB,1)}}, @{N='CPU';E={$_.UserModeTime/1e7}} | ConvertTo-Json -Compress
+      $raw = & "${pstools}pslist.exe" \\\\${safeHost} -accepteula 2>&1 | Out-String
+      $procs = @()
+      $lines = $raw -split "\\r?\\n"
+      $inData = $false
+      foreach ($line in $lines) {
+        if ($line -match '^Name\\s+Pid\\s+') { $inData = $true; continue }
+        if ($inData -and $line -match '^(\\S+)\\s+(\\d+)\\s+\\d+\\s+\\d+\\s+\\d+\\s+(\\d+)\\s+([\\d:]+)\\s+') {
+          $procs += @{
+            ProcessId = [int]$matches[2]
+            Name = $matches[1]
+            MemMB = if ($matches[3]) { [math]::Round([int]$matches[3] / 1024, 1) } else { 0 }
+            CPU = if ($matches[4]) { [double]($matches[4] -split ':')[0] } else { 0 }
+          }
+        }
+      }
+      if ($procs.Count -eq 0) { @{ error = $raw.Substring(0, [Math]::Min(500, $raw.Length)) } | ConvertTo-Json -Compress }
+      else { $procs | ConvertTo-Json -Compress }
     } catch {
-      @{ error = $_.Exception.Message } | ConvertTo-Json -Compress
+      @{ error = \$_.Exception.Message } | ConvertTo-Json -Compress
     }
   `;
   const result = await runPowerShell(script, 30000);
@@ -744,17 +813,17 @@ app.post('/api/processes/:hostname/list', async (req, res) => {
 
 app.post('/api/processes/:hostname/kill', async (req, res) => {
   const { hostname } = req.params;
-  const { pid, name, credential } = req.body;
+  const { pid, name } = req.body;
   const safeHost = sanitizeHost(hostname);
   const safePid = parseInt(pid, 10);
   if (!safePid) return res.json({ success: false, error: 'Invalid PID' });
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
   const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
     try {
-      Invoke-Command -ComputerName '${safeHost}' ${credential ? '-Credential $cred' : ''} -ScriptBlock { Stop-Process -Id ${safePid} -Force } -ErrorAction Stop
+      & "${pstools}pskill.exe" \\\\${safeHost} ${safePid} -accepteula 2>&1 | Out-String | Write-Host
       @{ hostname = '${safeHost}'; pid = ${safePid}; killed = $true } | ConvertTo-Json -Compress
     } catch {
-      @{ hostname = '${safeHost}'; pid = ${safePid}; killed = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
+      @{ hostname = '${safeHost}'; pid = ${safePid}; killed = $false; error = \$_.Exception.Message } | ConvertTo-Json -Compress
     }
   `;
   const result = await runPowerShell(script, 15000);
@@ -765,26 +834,25 @@ app.post('/api/processes/:hostname/kill', async (req, res) => {
 // POWER MANAGEMENT — Restart / Stop / Wake-on-LAN
 // ==========================================================================
 app.post('/api/power/action', async (req, res) => {
-  const { hostname, action, credential, message, timeout } = req.body;
+  const { hostname, action, message, timeout } = req.body;
   const safeHost = sanitizeHost(hostname);
-  const credBlock = credential ? buildCredentialBlock(credential) : '';
-  const credParam = credential ? '-Credential $cred' : '';
-  const msgParam = message ? `-Force` : `-Force`;
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
+  const delay = timeout || 10;
+  const msgParam = message ? `-m "${message.replace(/"/g, '`"')}"` : '';
   const script = `
-    ${credBlock}
     try {
       switch ('${action}') {
-        'reboot'   { Restart-Computer -ComputerName '${safeHost}' ${credParam} ${msgParam} ${message ? `-Comment "${message.replace(/"/g, '`"')}"` : ''} -ErrorAction Stop }
-        'shutdown' { Stop-Computer -ComputerName '${safeHost}' ${credParam} -Force -ErrorAction Stop }
-        'startup'  { throw 'Cannot power on via PowerShell — use Wake-on-LAN /api/power/wol endpoint' }
+        'reboot'   { & "${pstools}psshutdown.exe" \\\\${safeHost} -r -t ${delay} -c -accepteula ${msgParam} 2>&1 | Out-String | Write-Host }
+        'shutdown' { & "${pstools}psshutdown.exe" \\\\${safeHost} -s -t ${delay} -c -accepteula ${msgParam} 2>&1 | Out-String | Write-Host }
+        'startup'  { throw 'Cannot power on via PsTools — use Wake-on-LAN /api/power/wol endpoint' }
         default    { throw "Unknown action: ${action}" }
       }
       @{ hostname = '${safeHost}'; action = '${action}'; success = $true } | ConvertTo-Json -Compress
     } catch {
-      @{ hostname = '${safeHost}'; action = '${action}'; success = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
+      @{ hostname = '${safeHost}'; action = '${action}'; success = $false; error = \$_.Exception.Message } | ConvertTo-Json -Compress
     }
   `;
-  const result = await runPowerShell(script, 20000);
+  const result = await runPowerShell(script, 30000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
@@ -841,19 +909,17 @@ app.post('/api/laps/retrieve', async (req, res) => {
 });
 
 app.post('/api/laps/rotate', async (req, res) => {
-  const { hostnames, credential } = req.body;
-  const hostList = hostnames.map(sanitizeHost).join("','");
-  // Reset-AdmPwdPassword comes from the LAPS PowerShell module (or AdmPwd.PS legacy)
-  // For modern Windows LAPS (Server 2022+/Win 11+), use Reset-LapsPassword
+  const { hostnames } = req.body;
+  const hostList = hostnames.map(sanitizeHost);
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
   const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
     Import-Module ActiveDirectory -ErrorAction SilentlyContinue
     $results = @()
-    foreach ($h in @('${hostList}')) {
+    foreach ($h in @('${hostList.join("','")}')) {
       try {
-        # Try modern LAPS first (Windows 11 22H2+, Server 2022+)
+        # Try modern LAPS via psexec (Reset-LapsPassword runs locally on the target)
         try {
-          Invoke-Command -ComputerName $h ${credential ? '-Credential $cred' : ''} -ScriptBlock { Reset-LapsPassword } -ErrorAction Stop
+          & "${pstools}psexec.exe" \\\\$h -accepteula -s -h powershell -c "Reset-LapsPassword -ErrorAction Stop" 2>&1 | Out-String | Write-Host
           $results += @{ hostname = $h; rotated = $true; method = 'modern' }
         } catch {
           # Fall back to legacy LAPS — set the expiration time to now
@@ -874,23 +940,25 @@ app.post('/api/laps/rotate', async (req, res) => {
 // SOFTWARE DEPLOYMENT
 // ==========================================================================
 app.post('/api/deploy/package', async (req, res) => {
-  const { hostnames, packagePath, arguments: args, credential, rebootBehavior } = req.body;
-  const hostList = hostnames.map(sanitizeHost).join("','");
+  const { hostnames, packagePath, arguments: args, rebootBehavior } = req.body;
+  const hostList = hostnames.map(sanitizeHost);
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
   const safePath = (packagePath || '').replace(/"/g, '`"').replace(/'/g, "''");
   const safeArgs = (args || '').replace(/"/g, '`"').replace(/'/g, "''");
   const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
     $results = @()
-    foreach ($h in @('${hostList}')) {
+    foreach ($h in @('${hostList.join("','")}')) {
       try {
-        # Copy package to remote host
+        # Copy package to remote host via SMB
         $remotePath = "\\\\$h\\C$\\Temp\\$(Split-Path '${safePath}' -Leaf)"
         Copy-Item '${safePath}' $remotePath -Force -ErrorAction Stop
-        # Execute remotely
-        $cmd = "& \\"C:\\Temp\\$(Split-Path '${safePath}' -Leaf)\\" ${safeArgs}"
-        $output = Invoke-Command -ComputerName $h ${credential ? '-Credential $cred' : ''} -ScriptBlock { param($c) Invoke-Expression $c } -ArgumentList $cmd -ErrorAction Stop
+        # Execute remotely via psexec
+        $cmd = "\\"C:\\Temp\\$(Split-Path '${safePath}' -Leaf)\\" ${safeArgs}"
+        $output = & "${pstools}psexec.exe" \\\\$h -accepteula -s -h $cmd 2>&1 | Out-String
         $results += @{ hostname = $h; success = $true; output = ($output | Out-String) }
-        ${rebootBehavior === 'always' ? `Restart-Computer -ComputerName $h ${credential ? '-Credential $cred' : ''} -Force` : ''}
+        if ('${rebootBehavior}' -eq 'always') {
+          & "${pstools}psshutdown.exe" \\\\$h -r -t 10 -c -accepteula 2>&1 | Out-String | Write-Host
+        }
       } catch {
         $results += @{ hostname = $h; success = $false; error = $_.Exception.Message }
       }
@@ -905,10 +973,8 @@ app.post('/api/deploy/package', async (req, res) => {
 // JOB QUEUE EXECUTION — Real sequential step execution + WebSocket progress
 // ==========================================================================
 app.post('/api/queues/execute', async (req, res) => {
-  const { steps, hostnames, credential, errorHandling, queueName } = req.body;
+  const { steps, hostnames, errorHandling, queueName } = req.body;
   const jobId = 'job-' + Date.now();
-  const credBlock = credential ? buildCredentialBlock(credential) : '';
-  const credParam = credential ? '-Credential $cred' : '';
 
   // Respond immediately with job ID
   res.json({ success: true, data: { jobId, status: 'running', stepCount: steps.length, hostCount: hostnames.length, queueName: queueName || 'Untitled Queue' } });
@@ -929,44 +995,45 @@ app.post('/api/queues/execute', async (req, res) => {
 
         try {
           let script = '';
+          const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
           switch (step.type) {
             case 'check-updates':
-              script = `Import-Module PSWindowsUpdate; Get-WindowsUpdate -ComputerName '${hostname}' ${credParam} | ConvertTo-Json -Compress`;
+              script = `& "${pstools}psexec.exe" \\\\${hostname} -accepteula -s -h powershell -c "Import-Module PSWindowsUpdate; Get-WindowsUpdate | ConvertTo-Json -Compress" 2>&1 | Out-String`;
               break;
             case 'download-updates':
-              script = `Import-Module PSWindowsUpdate; Get-WindowsUpdate -ComputerName '${hostname}' ${credParam} -Download -AcceptAll | ConvertTo-Json -Compress`;
+              script = `& "${pstools}psexec.exe" \\\\${hostname} -accepteula -s -h powershell -c "Import-Module PSWindowsUpdate; Get-WindowsUpdate -Download -AcceptAll | ConvertTo-Json -Compress" 2>&1 | Out-String`;
               break;
             case 'install-all':
             case 'install-updates':
-              script = `Import-Module PSWindowsUpdate; Install-WindowsUpdate -ComputerName '${hostname}' ${credParam} -AcceptAll -AutoReboot | ConvertTo-Json -Compress`;
+              script = `& "${pstools}psexec.exe" \\\\${hostname} -accepteula -s -h powershell -c "Import-Module PSWindowsUpdate; Install-WindowsUpdate -AcceptAll -AutoReboot | ConvertTo-Json -Compress" 2>&1 | Out-String`;
               break;
             case 'reboot':
-              script = `Restart-Computer -ComputerName '${hostname}' ${credParam} -Force; @{ hostname='${hostname}'; rebooted=$true } | ConvertTo-Json -Compress`;
+              script = `& "${pstools}psshutdown.exe" \\\\${hostname} -r -t 10 -c -accepteula 2>&1 | Out-String | Write-Host; @{ hostname='${hostname}'; rebooted=$true } | ConvertTo-Json -Compress`;
               break;
             case 'shutdown':
-              script = `Stop-Computer -ComputerName '${hostname}' ${credParam} -Force; @{ hostname='${hostname}'; stopped=$true } | ConvertTo-Json -Compress`;
+              script = `& "${pstools}psshutdown.exe" \\\\${hostname} -s -t 10 -c -accepteula 2>&1 | Out-String | Write-Host; @{ hostname='${hostname}'; stopped=$true } | ConvertTo-Json -Compress`;
               break;
             case 'wait-for-online':
-              script = `for ($i=0; $i -lt 60; $i++) { if (Test-Connection -ComputerName '${hostname}' -Count 1 -Quiet) { break }; Start-Sleep -Seconds 5 }; @{ hostname='${hostname}'; online=$true } | ConvertTo-Json -Compress`;
+              script = `for ($i=0; $i -lt 60; $i++) { if (ping -n 1 -w 2000 ${hostname} 2>&1 | Select-String 'TTL=') { break }; Start-Sleep -Seconds 5 }; @{ hostname='${hostname}'; online=$true } | ConvertTo-Json -Compress`;
               break;
             case 'run-command':
               if (step.config?.code) {
-                script = `Invoke-Command -ComputerName '${hostname}' ${credParam} -ScriptBlock { ${step.config.code} } | Out-String`;
+                script = `& "${pstools}psexec.exe" \\\\${hostname} -accepteula -s -h powershell -c "${step.config.code.replace(/"/g, '\\`"').replace(/'/g, "''")}" 2>&1 | Out-String`;
               }
               break;
             case 'start-service':
               if (step.config?.serviceName) {
-                script = `Start-Service -ComputerName '${hostname}' -Name '${sanitizeHost(step.config.serviceName)}' ${credParam}; @{ hostname='${hostname}'; service='${sanitizeHost(step.config.serviceName)}'; state='Running' } | ConvertTo-Json -Compress`;
+                script = `& "${pstools}psservice.exe" \\\\${hostname} start "${sanitizeHost(step.config.serviceName)}" -accepteula 2>&1 | Out-String | Write-Host; @{ hostname='${hostname}'; service='${sanitizeHost(step.config.serviceName)}'; state='Running' } | ConvertTo-Json -Compress`;
               }
               break;
             case 'stop-service':
               if (step.config?.serviceName) {
-                script = `Stop-Service -ComputerName '${hostname}' -Name '${sanitizeHost(step.config.serviceName)}' -Force ${credParam}; @{ hostname='${hostname}'; service='${sanitizeHost(step.config.serviceName)}'; state='Stopped' } | ConvertTo-Json -Compress`;
+                script = `& "${pstools}psservice.exe" \\\\${hostname} stop "${sanitizeHost(step.config.serviceName)}" -accepteula 2>&1 | Out-String | Write-Host; @{ hostname='${hostname}'; service='${sanitizeHost(step.config.serviceName)}'; state='Stopped' } | ConvertTo-Json -Compress`;
               }
               break;
             case 'restart-service':
               if (step.config?.serviceName) {
-                script = `Restart-Service -ComputerName '${hostname}' -Name '${sanitizeHost(step.config.serviceName)}' -Force ${credParam}; @{ hostname='${hostname}'; service='${sanitizeHost(step.config.serviceName)}'; state='Running' } | ConvertTo-Json -Compress`;
+                script = `& "${pstools}psservice.exe" \\\\${hostname} restart "${sanitizeHost(step.config.serviceName)}" -accepteula 2>&1 | Out-String | Write-Host; @{ hostname='${hostname}'; service='${sanitizeHost(step.config.serviceName)}'; state='Running' } | ConvertTo-Json -Compress`;
               }
               break;
             case 'psexec-run':
@@ -1117,32 +1184,28 @@ app.post('/api/pstools/pssuspend', async (req, res) => {
 // ==========================================================================
 app.post('/api/hosts/:hostname/eventlog', async (req, res) => {
   const { hostname } = req.params;
-  const { logName = 'System', maxEvents = 50, severity, credential } = req.body;
+  const { logName = 'System', maxEvents = 50, severity } = req.body;
   const safeHost = sanitizeHost(hostname);
   const safeLog = String(logName).replace(/[^a-zA-Z0-9]/g, '');
   const safeMax = Math.min(parseInt(maxEvents, 10) || 50, 500);
-  const credBlock = credential ? buildCredentialBlock(credential) : '';
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
 
-  // Severity filter: All, Error, Warning, Information
   let levelFilter = '';
   if (severity === 'Error') levelFilter = '-Level 2';
   else if (severity === 'Warning') levelFilter = '-Level 3';
   else if (severity === 'Information') levelFilter = '-Level 4';
 
   const script = `
-    ${credBlock}
     try {
-      $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
-      ${credential ? '$params.Credential = $cred' : ''}
-      $events = Get-WinEvent -FilterHashtable @{ LogName = '${safeLog}'; StartTime = (Get-Date).AddDays(-7) } ${levelFilter} -MaxEvents ${safeMax} @params -ErrorAction SilentlyContinue
-      if (-not $events) { $events = @() }
-      $results = $events | Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message | ConvertTo-Json -Depth 3 -Compress
-      $results
+      $psCmd = "Get-WinEvent -FilterHashtable @{ LogName = '${safeLog}'; StartTime = (Get-Date).AddDays(-7) } ${levelFilter} -MaxEvents ${safeMax} -ErrorAction SilentlyContinue | Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message | ConvertTo-Json -Depth 3 -Compress"
+      $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($psCmd))
+      $result = & "${pstools}psexec.exe" \\\\${safeHost} -accepteula -s -h powershell -NoProfile -EncodedCommand $encoded 2>&1 | Out-String
+      if (-not $result) { @{ events = @() } | ConvertTo-Json -Compress } else { $result }
     } catch {
-      @{ error = $_.Exception.Message; events = @() } | ConvertTo-Json -Compress
+      @{ error = \$_.Exception.Message; events = @() } | ConvertTo-Json -Compress
     }
   `;
-  const result = await runPowerShell(script, 30000);
+  const result = await runPowerShell(script, 60000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 

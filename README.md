@@ -116,7 +116,7 @@ See [Deployment](#deployment--full-setup-on-a-windows-admin-pc) below. ~15 minut
 |---|---|
 | Backend serves the frontend (single port 8080) | One firewall rule, no CORS issues, one URL to remember |
 | All vendor JS bundled locally (`/vendor/`) | LAN deployments often have no internet — CDN would break the app |
-| PsTools is the only remote-execution mechanism | No need to enable WinRM/PSRP on targets; PsExec uses SMB/admin$ |
+| PsTools is the ONLY remote-execution mechanism (no WinRM, no WMI cmdlets) | No need to enable WinRM/PSRP on targets; PsExec uses SMB/admin$; all service/process/power actions use PsTools binaries |
 | Backend is Windows-only | PsTools binaries are Windows-only — this is a hard constraint |
 | `.bps` grid files use AES-256-GCM in the browser | No backend round-trip for save/open; password never leaves the browser |
 | WebSocket at `/ws` for queue progress | Long-running jobs need live updates without polling |
@@ -410,7 +410,7 @@ Open the app → gear icon (top right) → **Settings**. Settings has 15 tabs:
 | **LAPS password rotation** | ✅ Real | `POST /api/laps/rotate` → `Reset-LapsPassword` (modern) or `Set-ADComputer` (legacy) |
 | **Windows Updates scan** | ✅ Real | `POST /api/updates/scan` → `PSWindowsUpdate` |
 | **Windows Updates install** | ✅ Real | `POST /api/updates/install` → `Install-WindowsUpdate` |
-| **Services list** | ✅ Real | `POST /api/services/:host/list` → `Get-CimInstance Win32_Service` |
+| **Services list / start / stop / restart** | ✅ Real | `POST /api/services/:host/*` → `psservice.exe` (PsTools only, no WinRM) |
 | **Processes list** | ✅ Real | `POST /api/processes/:host/list` → `Get-CimInstance Win32_Process` |
 | **Power actions (reboot/shutdown)** | ✅ Real | `POST /api/power/action` → `Restart-Computer` / `Stop-Computer` |
 | **Wake-on-LAN** | ✅ Real | `POST /api/power/wol` → UDP magic packet broadcast |

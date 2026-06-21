@@ -159,14 +159,16 @@ This document is the master plan for achieving 100% feature parity with BatchPat
 ## MODULE 4: SERVICES & PROCESSES (Screen 06)
 
 ### 4.1 Services
+**Constraint:** All remote actions use `psservice.exe` (PsTools) — no WinRM, no PowerShell CIM/WMI cmdlets.
+
 | BatchPatch Feature | SupportHubLAN Status | Notes |
 |---|---|---|
-| List services on remote host | ✅ DONE | Services tab with DataTable |
-| Start/Stop/Restart services (inline) | ✅ DONE | Inline action buttons per row |
+| List services on remote host | ✅ DONE | Uses `psservice.exe query`, parses output |
+| Start/Stop/Restart services (inline) | ✅ DONE | Uses `psservice.exe start/stop/restart` |
 | Set start type | ✅ DONE | Set Start Type icon button |
 | Search/filter services by name | ✅ DONE | Filter input |
-| Multi-host aggregate service view | ✅ DONE | Multi-host selector |
-| Stopped auto-services report | ✅ DONE | Stopped Auto-Services tab |
+| Single-host service view | ✅ DONE | HostSelector in single-select mode |
+| Auto-refresh after actions | ✅ DONE | Calls `refreshServices()` after each action |
 
 ### 4.2 Processes
 | BatchPatch Feature | SupportHubLAN Status | Notes |

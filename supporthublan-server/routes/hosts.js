@@ -102,7 +102,10 @@ module.exports = function(db) {
   router.post('/:hostname/hardware', async (req, res) => {
     const safeHost = sanitizeHost(req.params.hostname);
     try {
-      // Launch all 11 PsTools commands in parallel
+      // Launch all 11 PsTools commands in parallel.
+      // PsExec is used for BOTH local and remote targets — the user confirmed
+      // PsExec works on their local machine (tested manually, services tab
+      // works). No local/remote special-casing.
       const [
         csRes, bbRes, biosRes, cpuRes, memRes,
         diskRes, ldRes, gpuRes, osRes,
@@ -145,16 +148,22 @@ module.exports = function(db) {
       const totalRamBytes = parseInt(cs.TotalPhysicalMemory || '0', 10);
       const totalRamMB = Math.round(totalRamBytes / (1024 * 1024));
 
-      // Processor — take the FIRST one only (user request: "just show one processor")
+      // Processor — COMBINE all wmic cpu rows into ONE processor entry.
+      // wmic cpu returns one row per logical processor/socket — on a multi-core
+      // system, this can return multiple rows (one per thread or one per socket).
+      // We combine them: take name/manufacturer from the first row, and SUM
+      // NumberOfCores and NumberOfLogicalProcessors across all rows to get the
+      // total physical cores and total threads for the system.
       const cpu = cpus.length > 0 ? {
         name: cpus[0].Name || 'Unknown',
         manufacturer: cpus[0].Manufacturer || 'Unknown',
-        cores: parseInt(cpus[0].NumberOfCores || '0', 10),
-        logicalCores: parseInt(cpus[0].NumberOfLogicalProcessors || '0', 10),
-        threads: parseInt(cpus[0].NumberOfLogicalProcessors || '0', 10), // threads = logical processors
+        cores: cpus.reduce((sum, c) => sum + parseInt(c.NumberOfCores || '0', 10), 0),
+        threads: cpus.reduce((sum, c) => sum + parseInt(c.NumberOfLogicalProcessors || '0', 10), 0),
+        logicalCores: cpus.reduce((sum, c) => sum + parseInt(c.NumberOfLogicalProcessors || '0', 10), 0),
         maxSpeedMHz: parseInt(cpus[0].MaxClockSpeed || '0', 10),
         currentSpeedMHz: parseInt(cpus[0].CurrentClockSpeed || '0', 10),
         socket: cpus[0].SocketDesignation || '',
+        socketCount: cpus.length,
       } : null;
 
       // Memory sticks

@@ -513,57 +513,71 @@ function parseRegUninstall(raw) {
   return apps;
 }
 
-// Parse `psinfo -d \\HOST` output.
-// Returns: { hostname, os:{name,version,build,installDate,lastBoot}, system:{manufacturer,model,totalRamMB,domain}, processors:[{name,cores,logicalCores,maxSpeedMHz}], memory:[], disks:[], logicalDisks:[], cdDvd:[], network:[], gpu:[{name}], loggedInUser, scannedAt }
 // ---------------------------------------------------------------------------
 // parsePsInfoOutput — parse `psinfo -d -h -s \\HOST` output into a structured
 // hardware object.
 //
-// PsInfo output format:
-//   PsInfo v2.43 - Local and remote system information viewer
+// ACTUAL PsInfo v1.79 output format (from user's machine):
+//
+//   PsInfo v1.79 - Local and remote system information viewer
 //   Copyright (C) 2001-2023 Mark Russinovich
 //   Sysinternals - www.sysinternals.com
 //
-//   System information for \\HOST:
-//       Uptime:                    1 day 2 hours 3 minutes
-//       Kernel version:            Microsoft Windows 11 Pro (Build 22631)
-//       Product type:              Professional
-//       Kernel build number:       22631
-//       Registered organization:
-//       Registered owner:          Nauman
-//       Installation date:         10/15/2023
-//       System manufacturer:       Dell Inc.
-//       System model:              OptiPlex 7070
-//       System type:               x64-based PC
-//       Processor(s):              1
-//       Processor type:            Intel(R) Core(TM) i7-9700 CPU @ 3.00GHz
-//       Processor speed:           3.00 GHz
-//       Physical memory:           16384 MB
-//       Video driver:              NVIDIA GeForce RTX 3060
-//       OS version:                10.0.22631
+//   System information for \\DESKTOP-TFF7VU4:
+//   Uptime:                    0 days 5 hours 9 minutes 31 seconds
+//   Kernel version:            Windows 10 Enterprise, Multipoint Free
+//   Product type:              Professional
+//   Product version:           6.3
+//   Service pack:              0
+//   Kernel build number:       26100
+//   Registered organization:
+//   Registered owner:          Nauman
+//   IE version:                9.0000
+//   System root:               C:\Windows
+//   Processors:                8
+//   Processor speed:           2.1 GHz
+//   Processor type:            Intel(R) Core(TM) i7-8650U CPU @
+//   Physical memory:           3940 MB
+//   Video driver:              Intel(R) UHD Graphics 620
+//   Volume Type       Format     Label                      Size       Free   Free
+//       C: Fixed      NTFS       Windows               199.79 GB   68.52 GB  34.3%
+//       D: Fixed      NTFS                             276.93 GB  196.72 GB  71.0%
 //
-//   Disk Volumes:
-//       C: Fixed NTFS OS 475 GB  200 GB
+//   Installed     HotFix
+//   n/a           Internet Explorer - 0
+//   Applications:
+//   Adobe Refresh Manager 1.8.0
+//   CADReader v3.7.4.21
+//   ...
 //
-//   Hotfixes:
-//       KB5031356
-//
-//   Software:
-//       7-Zip 23.01 (x64)
-//       Google Chrome
+// KEY DIFFERENCES from the old (wrong) assumptions:
+//   1. Key-value lines are NOT indented (start at column 0)
+//   2. Disk sizes use DECIMALS: "199.79 GB" not "475 GB"
+//   3. There is NO "Disk Volumes:" header — the volume table starts with
+//      a "Volume Type Format Label Size Free Free" header line
+//   4. Software section is labeled "Applications:" not "Software:"
+//   5. Hotfix section is labeled "Installed HotFix" not "Hotfixes:"
+//   6. "Processors: 8" is actually the THREAD count (logical processors),
+//      not the physical processor count
 // ---------------------------------------------------------------------------
 function parsePsInfoOutput(raw, fallbackHost) {
   const out = (raw || '').replace(/\r/g, '');
   const lines = out.split('\n');
   const kv = {};
 
-  // Parse key-value pairs (lines like "    Key:    Value")
+  // Parse key-value pairs. PsInfo lines look like:
+  //   "Kernel version:            Windows 10 Enterprise, Multipoint Free"
+  //   "Registered owner:          Nauman"
+  // Key is at start of line (no leading whitespace), followed by ":", then
+  // whitespace, then value. Allow optional leading whitespace just in case.
   for (const line of lines) {
-    const m = /^\s+([A-Za-z][A-Za-z ()/]+?):\s+(.*)$/.exec(line);
+    // Match: "Key:    Value" — key starts at column 0 (or after whitespace),
+    // key can contain letters, spaces, parentheses, digits
+    const m = /^\s*([A-Za-z][A-Za-z ()0-9./]+?):\s+(.*)$/.exec(line);
     if (m) {
       const key = m[1].trim().toLowerCase();
       const val = m[2].trim();
-      if (val !== '') kv[key] = val;
+      if (val !== '' && !(key in kv)) kv[key] = val;
     }
   }
 
@@ -575,12 +589,12 @@ function parsePsInfoOutput(raw, fallbackHost) {
     if (m) hostname = m[1];
   }
 
-  // Parse processor speed
+  // Parse processor speed (e.g. "2.1 GHz")
   const procSpeed = kv['processor speed'] || '';
   const speedMatch = /([\d.]+)\s*GHz/i.exec(procSpeed);
   const maxSpeedMHz = speedMatch ? Math.round(parseFloat(speedMatch[1]) * 1000) : 0;
 
-  // Parse total RAM
+  // Parse total RAM (e.g. "3940 MB" or "16384 MB")
   const ramMatch = /(\d+)\s*(MB|GB|TB)/i.exec(kv['physical memory'] || '');
   let totalRamMB = 0;
   if (ramMatch) {
@@ -589,34 +603,50 @@ function parsePsInfoOutput(raw, fallbackHost) {
     totalRamMB = u === 'GB' ? n * 1024 : u === 'TB' ? n * 1024 * 1024 : n;
   }
 
+  // "Processors: 8" is actually the logical processor / thread count
+  const processorCount = parseInt(kv['processors'] || '0', 10);
+
   // Determine CPU manufacturer from processor type name
   const procName = kv['processor type'] || '';
   let cpuManufacturer = '';
   if (/Intel/i.test(procName)) cpuManufacturer = 'Intel';
   else if (/AMD|Advanced Micro/i.test(procName)) cpuManufacturer = 'AMD';
 
-  // Parse disk volumes section (between "Disk Volumes:" and next section)
+  // Parse disk volumes. The volume table starts AFTER the header line:
+  //   "Volume Type       Format     Label                      Size       Free   Free"
+  // Each volume line looks like:
+  //   "    C: Fixed      NTFS       Windows               199.79 GB   68.52 GB  34.3%"
+  // Note: sizes can be DECIMALS (199.79 GB). The label can be empty.
   const logicalDisks = [];
   let inVolumes = false;
   for (const line of lines) {
-    if (/^\s*Disk Volumes:\s*$/i.test(line)) { inVolumes = true; continue; }
-    if (/^\s*Hotfixes:\s*$/i.test(line)) { inVolumes = false; continue; }
-    if (/^\s*Software:\s*$/i.test(line)) { inVolumes = false; continue; }
+    // Detect the volume table header line
+    if (/^\s*Volume\s+Type\s+Format/i.test(line)) {
+      inVolumes = true;
+      continue;
+    }
+    // End of volume table: blank line, or start of another section
     if (inVolumes) {
-      // Match: "C: Fixed NTFS OS 475 GB  200 GB"
-      // or:    "C: Fixed NTFS  475 GB  200 GB" (no label)
-      const m = /^\s*([A-Z]:)\s+(\S+)\s+(\S+)\s*(.*?)\s+(\d+)\s*(GB|MB|TB)\s+(\d+)\s*(GB|MB|TB)\s*$/i.exec(line);
+      if (/^\s*$/.test(line)) { inVolumes = false; continue; }
+      if (/^\s*Installed\s+HotFix/i.test(line)) { inVolumes = false; continue; }
+      if (/^\s*Applications:/i.test(line)) { inVolumes = false; continue; }
+
+      // Match volume line with DECIMAL sizes:
+      //   "    C: Fixed      NTFS       Windows               199.79 GB   68.52 GB  34.3%"
+      //   "    D: Fixed      NTFS                             276.93 GB  196.72 GB  71.0%"
+      // Groups: 1=drive, 2=type, 3=format, 4=label(optional), 5=size, 6=sizeUnit, 7=free, 8=freeUnit
+      const m = /^\s*([A-Z]:)\s+(\S+)\s+(\S+)\s+(.*?)\s+([\d.]+)\s*(GB|MB|TB)\s+([\d.]+)\s*(GB|MB|TB)\s+([\d.]+)%/i.exec(line);
       if (m) {
-        const sizeNum = parseInt(m[5], 10);
+        const sizeNum = parseFloat(m[5]);
         const sizeUnit = m[6].toUpperCase();
-        const freeNum = parseInt(m[7], 10);
+        const freeNum = parseFloat(m[7]);
         const freeUnit = m[8].toUpperCase();
         const sizeGB = sizeUnit === 'TB' ? sizeNum * 1024 : sizeNum;
         const freeGB = freeUnit === 'TB' ? freeNum * 1024 : freeNum;
         logicalDisks.push({
           drive: m[1],
-          sizeGB,
-          freeGB,
+          sizeGB: Math.round(sizeGB * 100) / 100,
+          freeGB: Math.round(freeGB * 100) / 100,
           fileSystem: m[3],
           volumeName: (m[4] || '').trim(),
         });
@@ -624,23 +654,28 @@ function parsePsInfoOutput(raw, fallbackHost) {
     }
   }
 
-  // Parse hotfixes section
+  // Parse hotfixes. The section starts with "Installed     HotFix" header
+  // and may contain lines like "n/a Internet Explorer - 0" or KB numbers.
   const hotfixes = [];
   let inHotfixes = false;
   for (const line of lines) {
-    if (/^\s*Hotfixes:\s*$/i.test(line)) { inHotfixes = true; continue; }
-    if (/^\s*Software:\s*$/i.test(line)) { inHotfixes = false; continue; }
+    if (/^\s*Installed\s+HotFix/i.test(line)) { inHotfixes = true; continue; }
+    if (/^\s*Applications:/i.test(line)) { inHotfixes = false; continue; }
     if (inHotfixes) {
-      const m = /^\s*(KB\d+)\s*$/i.exec(line);
-      if (m) hotfixes.push(m[1]);
+      // Look for KB numbers anywhere in the line
+      const kbMatches = line.match(/KB\d+/gi);
+      if (kbMatches) {
+        kbMatches.forEach(kb => hotfixes.push(kb.toUpperCase()));
+      }
     }
   }
 
-  // Parse software section
+  // Parse software/applications. Section starts with "Applications:" header
+  // and continues to end of output.
   const software = [];
   let inSoftware = false;
   for (const line of lines) {
-    if (/^\s*Software:\s*$/i.test(line)) { inSoftware = true; continue; }
+    if (/^\s*Applications:\s*$/i.test(line)) { inSoftware = true; continue; }
     if (inSoftware) {
       const trimmed = line.trim();
       if (trimmed) software.push({ name: trimmed });
@@ -663,7 +698,7 @@ function parsePsInfoOutput(raw, fallbackHost) {
     system: {
       manufacturer: kv['system manufacturer'] || '',
       model: kv['system model'] || '',
-      serial: '',  // psinfo doesn't provide this
+      serial: '',
       systemType: kv['system type'] || '',
       domain: '',
       totalRamMB,
@@ -675,23 +710,23 @@ function parsePsInfoOutput(raw, fallbackHost) {
     processor: procName ? {
       name: procName,
       manufacturer: cpuManufacturer,
-      cores: 0,   // psinfo doesn't provide core count
-      threads: 0, // psinfo doesn't provide thread count
+      cores: 0,   // psinfo doesn't provide physical core count
+      threads: processorCount,  // "Processors: 8" = logical processors = threads
       maxSpeedMHz,
       currentSpeedMHz: maxSpeedMHz,
       socket: '',
-      socketCount: parseInt(kv['processor(s)'] || '1', 10),
+      socketCount: 1,
     } : null,
 
     memory: [],     // psinfo doesn't provide individual sticks
     disks: [],      // psinfo doesn't provide physical disk details
     logicalDisks,
-    network: [],    // need ipconfig for this (not included in pure psinfo approach)
+    network: [],    // need ipconfig for this
     gpu,
 
     os: {
       name: kv['kernel version'] || '',
-      version: kv['os version'] || '',
+      version: kv['product version'] || '',
       build: kv['kernel build number'] || '',
       architecture: '',
       installDate: kv['installation date'] || '',

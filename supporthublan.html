@@ -2883,17 +2883,6 @@
     const [showCommandModal, setShowCommandModal] = useState(false);
     const [logHost, setLogHost] = useState(null); // host object for PC Log modal
 
-    // Open the bottom terminal panel and run a PsExec command on the given host.
-    // Dispatches a global event the TerminalPanel listens for.
-    const openTerminalForHost = (host) => {
-      // 1. Make sure terminal is expanded
-      try { localStorage.setItem('supporthublan:terminal-collapsed', '0'); } catch {}
-      // 2. Tell the terminal panel to expand + switch to Terminal tab + run command
-      window.dispatchEvent(new CustomEvent('supporthublan:terminal-open', {
-        detail: { command: `psexec \\\\${host.hostname} cmd`, host: host.hostname }
-      }));
-      toast.info(`Opening remote shell on ${host.hostname}…`);
-    };
     const [showColumnChooser, setShowColumnChooser] = useState(false);
     const [hiddenCols, setHiddenCols] = useState(new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials']));
     const [confirmReboot, setConfirmReboot] = useState(false);
@@ -3025,7 +3014,7 @@
           <Icon name="Activity" size={11} className="text-success" />
         </span>
       ), render: (h) => {
-        let ledColor = h.onlineStatus === 'online' ? (h.patchState === 'compliant' ? '#22c55e' : '#f59e0b') : h.onlineStatus === 'offline' ? '#ef4444' : '#6b7280';
+        let ledColor = h.onlineStatus === 'online' ? '#22c55e' : h.onlineStatus === 'offline' ? '#ef4444' : '#6b7280';
         if (h._ledOverride === 'off') ledColor = 'transparent';
         if (h._ledBlue) ledColor = '#38bdf8';
         if (h._ledStopped) ledColor = '#3d425a';
@@ -3078,13 +3067,6 @@
             <Icon name={remoteDesktopProtocol === 'VNC' ? 'Monitor' : 'MonitorSmartphone'} size={14} />
           </button>
           <button
-            onClick={(e) => { e.stopPropagation(); openTerminalForHost(h); }}
-            title={`Open remote command shell on ${h.hostname} (PsExec)`}
-            className="inline-flex items-center justify-center w-7 h-7 rounded border border-border bg-surface-raised hover:border-primary hover:bg-primary/10 hover:text-primary text-text-dim transition-colors"
-          >
-            <Icon name="TerminalSquare" size={14} />
-          </button>
-          <button
             onClick={(e) => { e.stopPropagation(); setLogHost(h); }}
             title={`View PC event log for ${h.hostname}`}
             className="inline-flex items-center justify-center w-7 h-7 rounded border border-border bg-surface-raised hover:border-primary hover:bg-primary/10 hover:text-primary text-text-dim transition-colors"
@@ -3115,11 +3097,31 @@
       { label: 'Reboot', icon: 'Power', variant: 'danger', onClick: () => setConfirmReboot(true) },
       { label: 'Deploy', icon: 'Package', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; } navigate('deployments'); toast.info(`${selectedIds.length} hosts selected — open the deployment wizard to deploy to them.`); } },
       { label: 'Run Script', icon: 'Terminal', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; } navigate('scripts'); toast.info(`${selectedIds.length} hosts selected — compose your script and click Run Now.`); } },
-      { label: 'Refresh', icon: 'RefreshCw', onClick: () => {
-        if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; }
-        updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, lastSeen: new Date().toISOString() } : h));
-        appendAudit({ action: 'hosts.refresh', actionCategory: 'Inventory', targetType: 'Host', targetIds: [...selectedIds], parameters: {}, result: 'success' });
-        toast.success(`Refreshed ${selectedIds.length} host(s)`);
+      { label: 'Refresh', icon: 'RefreshCw', onClick: async () => {
+        const targets = selectedIds.length > 0 ? hosts.filter(h => selectedIds.includes(h.id)) : hosts;
+        const targetNames = targets.map(h => h.hostname);
+        if (targetNames.length === 0) { toast.warning('No hosts to refresh.'); return; }
+        toast.info(`Pinging ${targetNames.length} host(s)…`);
+        if (window.SupportHubLANAPI) {
+          try {
+            const result = await window.SupportHubLANAPI.checkHostStatus(targetNames);
+            if (result && result.success && !result.demo) {
+              let parsed; try { parsed = JSON.parse(result.data); } catch { parsed = []; }
+              const arr = Array.isArray(parsed) ? parsed : [parsed];
+              const statusMap = {};
+              arr.forEach(r => { if (r.hostname) statusMap[r.hostname] = r.online ? 'online' : 'offline'; });
+              updateHosts(prev => prev.map(h => {
+                const newStatus = statusMap[h.hostname];
+                if (newStatus) { return { ...h, onlineStatus: newStatus, pingStatus: newStatus === 'online' ? 'up' : 'down', lastSeen: newStatus === 'online' ? new Date().toISOString() : h.lastSeen }; }
+                return h;
+              }));
+              const onlineCount = arr.filter(r => r.online).length;
+              toast.success(`Refreshed ${targetNames.length} host(s): ${onlineCount} online, ${targetNames.length - onlineCount} offline`);
+              appendAudit({ action: 'hosts.refresh', actionCategory: 'Inventory', targetType: 'Host', targetIds: targets.map(h => h.id), parameters: { online: onlineCount, offline: targetNames.length - onlineCount }, result: 'success' });
+            } else if (result && result.demo) { toast.warning('Backend not connected.'); }
+            else { toast.error('Refresh failed', { detail: result?.error }); }
+          } catch (e) { toast.error('Refresh failed', { detail: e.message }); }
+        } else { toast.warning('Backend not connected.'); }
       } },
       { label: 'Export', icon: 'Download', onClick: () => {
         const selectedHosts = hosts.filter(h => selectedIds.includes(h.id));
@@ -8423,7 +8425,7 @@
                 <main id="workspace" className="flex-1 overflow-y-auto p-4 bg-bg" style={{ minHeight: '120px' }}>
                   {renderScreen()}
                 </main>
-                <TerminalPanel />
+                {/* TerminalPanel removed */}
               </div>
               {/* Right Drawer — inline (flexbox sibling) so terminal does not extend underneath.
                   When open, the main workspace shrinks to make room. Drawer scrolls independently. */}
@@ -8438,345 +8440,8 @@
     );
   };
 
-  // ============================================================
-  // TERMINAL PANEL — VSCode-style bottom panel for live logs + PsTools command input
-  // ============================================================
-  const TerminalPanel = () => {
-    const { activeJobs, auditEvents } = useApp();
-    const [collapsed, setCollapsed] = useState(() => { try { return localStorage.getItem('supporthublan:terminal-collapsed') === '1'; } catch { return false; } });
-    // Default 3 lines tall (~80px) — user can drag to resize.
-    // IMPORTANT: Clamp stored value to a safe max on load to prevent the panel
-    // from covering the whole screen if a stale value is in localStorage.
-    const [height, setHeight] = useState(() => {
-      try {
-        let stored = parseInt(localStorage.getItem('supporthublan:terminal-height') || '80', 10);
-        // v1.4.7 migration: reset any stored value > 40% of viewport to the default 80px.
-        // This fixes users who have a stale large value from v1.3 (280px) or accidental drags.
-        const maxH = Math.floor(window.innerHeight * 0.4);
-        if (isNaN(stored) || stored < 60 || stored > maxH) {
-          stored = 80;
-          try { localStorage.setItem('supporthublan:terminal-height', '80'); } catch {}
-        }
-        return stored;
-      } catch { return 80; }
-    });
-    const [resizing, setResizing] = useState(false);
-    const [activeTab, setActiveTab] = useState('all'); // all | current | errors | terminal
-    const [lines, setLines] = useState([]);
-    const [command, setCommand] = useState('');
-    const [history, setHistory] = useState([]);
-    const [historyIdx, setHistoryIdx] = useState(-1);
-    const [running, setRunning] = useState(false);
-    const [sessionId] = useState(() => 'term-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
-    const [autoScroll, setAutoScroll] = useState(true);
-    const scrollRef = useRef(null);
-    const inputRef = useRef(null);
-    const linesRef = useRef([]);
+  // TerminalPanel component removed.
 
-    // Append a line — declared FIRST because it's referenced by useEffects below
-    // (must be defined before use to avoid temporal dead zone ReferenceError)
-    const appendLine = useCallback((line, stream = 'info') => {
-      const ts = new Date().toLocaleTimeString();
-      setLines(prev => [...prev.slice(-500), { ts, line: String(line), stream }]); // cap at 500 lines
-    }, []);
-
-    // Persist collapsed state
-    useEffect(() => { try { localStorage.setItem('supporthublan:terminal-collapsed', collapsed ? '1' : '0'); } catch {} }, [collapsed]);
-
-    // Listen for "open terminal and run command" events from the inventory row "Cmd" button
-    useEffect(() => {
-      const handler = (e) => {
-        const { command, host } = e.detail || {};
-        // Expand the panel
-        setCollapsed(false);
-        // Switch to the Terminal tab so the input is visible
-        setActiveTab('terminal');
-        // Auto-run the command after a tick (give the panel time to expand)
-        setTimeout(() => {
-          if (command && window._supporthublanWs && window._supporthublanWs.readyState === 1) {
-            setHistory(prev => [...prev.slice(-50), command]);
-            setHistoryIdx(-1);
-            setRunning(true);
-            window._supporthublanWs.send(JSON.stringify({ type: 'terminal-run', command, sessionId }));
-            appendLine(`\x1b[36m$ ${command}\x1b[0m\r\n`, 'command');
-          } else if (command) {
-            appendLine(`\x1b[33mQueued: ${command}\x1b[0m\r\nWebSocket not ready yet — click in the terminal input and press Enter to retry.`, 'stderr');
-          }
-          // Focus the input
-          setTimeout(() => inputRef.current?.focus(), 200);
-        }, 250);
-      };
-      window.addEventListener('supporthublan:terminal-open', handler);
-      return () => window.removeEventListener('supporthublan:terminal-open', handler);
-    }, [sessionId, appendLine]);
-
-    // Persist height
-    useEffect(() => { try { localStorage.setItem('supporthublan:terminal-height', String(height)); } catch {} }, [height]);
-
-    // Drag-to-resize handler (mouse + touch)
-    const startResize = (e) => {
-      e.preventDefault();
-      setResizing(true);
-      const startY = (e.touches ? e.touches[0].clientY : e.clientY) ;
-      const startH = height;
-      const onMove = (ev) => {
-        const y = ev.touches ? ev.touches[0].clientY : ev.clientY;
-        const delta = startY - y;
-        // Min 60px (1 line), max 40% of viewport — prevents covering the workspace
-        const newH = Math.max(60, Math.min(window.innerHeight * 0.4, startH + delta));
-        setHeight(Math.round(newH));
-      };
-      const onUp = () => {
-        setResizing(false);
-        document.removeEventListener('mousemove', onMove);
-        document.removeEventListener('mouseup', onUp);
-        document.removeEventListener('touchmove', onMove);
-        document.removeEventListener('touchend', onUp);
-        document.body.style.userSelect = '';
-        document.body.style.cursor = '';
-      };
-      document.addEventListener('mousemove', onMove);
-      document.addEventListener('mouseup', onUp);
-      document.addEventListener('touchmove', onMove);
-      document.addEventListener('touchend', onUp);
-      document.body.style.userSelect = 'none';
-      document.body.style.cursor = 'ns-resize';
-    };
-
-    // Keep linesRef in sync
-    useEffect(() => { linesRef.current = lines; }, [lines]);
-
-    // Watch active jobs and append their step changes to the terminal
-    const lastJobStepRef = useRef({});
-    useEffect(() => {
-      activeJobs.forEach(job => {
-        const last = lastJobStepRef.current[job.id];
-        if (last !== job.step) {
-          lastJobStepRef.current[job.id] = job.step;
-          if (job.step) {
-            const color = job.status === 'failed' ? '\x1b[31m' : job.status === 'completed' ? '\x1b[32m' : '\x1b[36m';
-            appendLine(`${color}[${job.name}] ${job.step}${job.status === 'completed' ? ' — done' : job.status === 'failed' ? ' — FAILED' : ''}\x1b[0m`, job.status === 'failed' ? 'stderr' : 'stdout');
-          }
-        }
-      });
-    }, [activeJobs, appendLine]);
-
-    // Watch audit events — show new ones in terminal
-    const lastAuditIdRef = useRef(null);
-    useEffect(() => {
-      if (!auditEvents || auditEvents.length === 0) return;
-      const latest = auditEvents[0];
-      if (lastAuditIdRef.current === null) {
-        lastAuditIdRef.current = latest.id;
-        return;
-      }
-      if (latest.id !== lastAuditIdRef.current) {
-        lastAuditIdRef.current = latest.id;
-        const color = latest.result === 'success' ? '\x1b[32m' : latest.result === 'failed' ? '\x1b[31m' : '\x1b[33m';
-        appendLine(`${color}[audit] ${latest.action} → ${latest.result}${latest.parameters?.hostname ? ' on ' + latest.parameters.hostname : ''}\x1b[0m`, latest.result === 'failed' ? 'stderr' : 'info');
-      }
-    }, [auditEvents, appendLine]);
-
-    // WebSocket message handler for terminal output
-    useEffect(() => {
-      const handler = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'terminal-output' && data.sessionId === sessionId) {
-            appendLine(data.line, data.stream || 'stdout');
-          } else if (data.type === 'terminal-complete' && data.sessionId === sessionId) {
-            setRunning(false);
-          } else if (data.type === 'terminal-error' && data.sessionId === sessionId) {
-            appendLine(`\x1b[31mError: ${data.error}\x1b[0m`, 'stderr');
-            setRunning(false);
-          } else if (data.type === 'queue-step-complete' || data.type === 'queue-progress' || data.type === 'queue-complete') {
-            const color = data.status === 'failed' ? '\x1b[31m' : data.type === 'queue-complete' ? '\x1b[32m' : '\x1b[36m';
-            const label = data.type === 'queue-complete'
-              ? `[queue] Complete — ${data.completed}/${data.total} steps`
-              : `[queue] Step ${data.stepIndex + 1}/${data.totalSteps} on ${data.hostname} — ${data.status || 'running'} (${data.completed}/${data.total})`;
-            appendLine(`${color}${label}\x1b[0m`, data.status === 'failed' ? 'stderr' : 'stdout');
-          } else if (data.type === 'scan-complete') {
-            const s = data.summary;
-            appendLine(`\x1b[32m[scan] Complete — ${s.online}/${s.total} hosts online\x1b[0m`, 'stdout');
-          }
-        } catch {}
-      };
-      // The WebSocket is opened by StatusBar's useEffect and stored at window._supporthublanWs
-      // We add our own listener that checks the raw message via a CustomEvent
-      // Simpler: poll window._supporthublanWs every 200ms
-      const interval = setInterval(() => {
-        if (window._supporthublanWs && !window._supporthublanWs._supporthublanListenerAdded) {
-          window._supporthublanWs.addEventListener('message', handler);
-          window._supporthublanWs._supporthublanListenerAdded = true;
-        }
-      }, 200);
-      return () => {
-        clearInterval(interval);
-        if (window._supporthublanWs) {
-          window._supporthublanWs.removeEventListener('message', handler);
-          window._supporthublanWs._supporthublanListenerAdded = false;
-        }
-      };
-    }, [sessionId, appendLine]);
-
-    // Auto-scroll
-    useEffect(() => {
-      if (autoScroll && scrollRef.current) {
-        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-      }
-    }, [lines, autoScroll]);
-
-    // Run command
-    const runCommand = () => {
-      const cmd = command.trim();
-      if (!cmd) return;
-      if (!window._supporthublanWs || window._supporthublanWs.readyState !== 1) {
-        appendLine('\x1b[31mError: WebSocket not connected. Backend must be running to execute commands.\x1b[0m', 'stderr');
-        return;
-      }
-      setHistory(prev => [...prev.slice(-50), cmd]);
-      setHistoryIdx(-1);
-      setRunning(true);
-      window._supporthublanWs.send(JSON.stringify({ type: 'terminal-run', command: cmd, sessionId }));
-      setCommand('');
-    };
-
-    // Filter lines by active tab
-    const filteredLines = lines.filter(l => {
-      if (activeTab === 'all') return true;
-      if (activeTab === 'errors') return l.stream === 'stderr';
-      if (activeTab === 'current') return true; // would filter by current host — for now, same as all
-      if (activeTab === 'terminal') return true; // only manual commands — would need tagging
-      return true;
-    });
-
-    // Render ANSI color codes (simple parser — converts \x1b[...m to spans)
-    const renderLine = (text) => {
-      // Strip ANSI for now — Terminal panel doesn't need full color support
-      const stripped = text.replace(/\x1b\[[0-9;]*m/g, '');
-      return stripped;
-    };
-
-    const handleKeyDown = (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); runCommand(); }
-      else if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        if (history.length > 0) {
-          const newIdx = historyIdx === -1 ? history.length - 1 : Math.max(0, historyIdx - 1);
-          setHistoryIdx(newIdx);
-          setCommand(history[newIdx]);
-        }
-      } else if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        if (historyIdx !== -1) {
-          const newIdx = historyIdx + 1;
-          if (newIdx >= history.length) { setHistoryIdx(-1); setCommand(''); }
-          else { setHistoryIdx(newIdx); setCommand(history[newIdx]); }
-        }
-      } else if (e.key === 'l' && e.ctrlKey) {
-        e.preventDefault();
-        setLines([]);
-      }
-    };
-
-    if (collapsed) {
-      return (
-        <div className="flex-shrink-0 bg-surface border-t border-border h-7 flex items-center px-3 text-meta text-text-dim">
-          <button onClick={() => setCollapsed(false)} className="flex items-center gap-1.5 hover:text-text">
-            <Icon name="ChevronUp" size={12} /> Terminal
-            {running && <span className="ml-2 w-1.5 h-1.5 bg-success rounded-full animate-pulse" />}
-            {lines.length > 0 && <span className="ml-1">({lines.length} lines)</span>}
-          </button>
-        </div>
-      );
-    }
-
-    return (
-      <div className="flex-shrink-0 bg-surface border-t-2 border-border flex flex-col relative" style={{ height: height + 'px' }}>
-        {/* Resize handle — drag up/down to resize the panel */}
-        <div
-          onMouseDown={startResize}
-          onTouchStart={startResize}
-          className="absolute top-0 left-0 right-0 h-1 cursor-ns-resize hover:bg-primary/50 transition-colors group"
-          title="Drag to resize"
-        >
-          <div className="absolute top-0 left-1/2 -translate-x-1/2 w-12 h-1 bg-border group-hover:bg-primary rounded-b" />
-        </div>
-        {/* Tab bar */}
-        <div className="flex items-center justify-between border-b border-border bg-surface-raised px-1">
-          <div className="flex">
-            {[
-              { id: 'all', label: 'All', icon: 'List' },
-              { id: 'current', label: 'Current', icon: 'Crosshair' },
-              { id: 'errors', label: 'Errors', icon: 'AlertCircle' },
-              { id: 'terminal', label: 'Terminal', icon: 'Terminal' },
-            ].map(t => (
-              <button key={t.id} onClick={() => { setActiveTab(t.id); if (t.id === 'terminal') setTimeout(() => inputRef.current?.focus(), 100); }}
-                className={`flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium border-b-2 -mb-px ${activeTab === t.id ? 'border-primary text-primary' : 'border-transparent text-text-dim hover:text-text'}`}>
-                <Icon name={t.icon} size={11} />{t.label}
-                {t.id === 'errors' && lines.filter(l => l.stream === 'stderr').length > 0 && (
-                  <span className="ml-1 px-1 text-[9px] bg-red-500/20 text-danger rounded">{lines.filter(l => l.stream === 'stderr').length}</span>
-                )}
-              </button>
-            ))}
-          </div>
-          <div className="flex items-center gap-1">
-            <button onClick={() => setAutoScroll(a => !a)} title="Toggle auto-scroll" className={`p-1 rounded ${autoScroll ? 'text-primary' : 'text-text-dim'} hover:bg-border`}>
-              <Icon name="ArrowDownToLine" size={12} />
-            </button>
-            <button onClick={() => setLines([])} title="Clear (Ctrl+L)" className="p-1 rounded text-text-dim hover:bg-border">
-              <Icon name="Trash2" size={12} />
-            </button>
-            <button onClick={() => setCollapsed(true)} title="Collapse panel" className="p-1 rounded text-text-dim hover:bg-border">
-              <Icon name="ChevronDown" size={12} />
-            </button>
-          </div>
-        </div>
-
-        {/* Output area */}
-        <div ref={scrollRef} className="flex-1 overflow-y-auto font-mono text-[12px] leading-[1.4] p-2 text-text" style={{ fontFamily: 'JetBrains Mono, Consolas, "Courier New", monospace' }}>
-          {filteredLines.length === 0 ? (
-            <div className="text-muted italic px-1 py-2">
-              No output yet. Type a PsTools command below (e.g. <code className="text-text-dim">psinfo \\pc-01</code>) or run an action from the inventory.
-            </div>
-          ) : (
-            filteredLines.map((l, i) => (
-              <div key={i} className={`whitespace-pre-wrap break-all ${l.stream === 'stderr' ? 'text-danger' : l.stream === 'stdout' ? 'text-text' : l.stream === 'command' ? 'text-info' : 'text-text-dim'}`}>
-                <span className="text-muted mr-2">{l.ts}</span>
-                {renderLine(l.line)}
-              </div>
-            ))
-          )}
-        </div>
-
-        {/* Command input */}
-        <div className="border-t border-border bg-surface-raised flex items-center px-2 py-1.5">
-          <span className="text-success font-mono text-[12px] mr-2 flex-shrink-0">ps&gt;</span>
-          <input
-            ref={inputRef}
-            type="text"
-            value={command}
-            onChange={(e) => setCommand(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Type a PsTools command — e.g.  psexec \\pc-01 cmd   |   psinfo \\pc-01   |   ping pc-01   |   powershell Get-Service"
-            className="flex-1 bg-transparent border-0 outline-none font-mono text-[12px] text-text placeholder-gray-600"
-            style={{ fontFamily: 'JetBrains Mono, Consolas, "Courier New", monospace' }}
-            disabled={running}
-          />
-          {running && (
-            <button onClick={() => window._supporthublanWs?.send(JSON.stringify({ type: 'terminal-kill', sessionId }))}
-              className="ml-2 px-2 py-0.5 text-[10px] bg-red-500/20 text-danger rounded hover:bg-red-500/30">
-              Stop
-            </button>
-          )}
-        </div>
-      </div>
-    );
-  };
-
-  // ============================================================
-  // AUDIT SCREEN — Persistent audit log from SQLite
-  // ============================================================
   const AuditScreen = () => {
     const toast = useToast();
     const [entries, setEntries] = useState([]);

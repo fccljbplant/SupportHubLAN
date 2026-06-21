@@ -2368,24 +2368,8 @@
     return null;
   };
 
-  // ---- BulkActionBar ----
-  const BulkActionBar = ({ selectedCount, actions, onClear }) => {
-    if (selectedCount === 0) return null;
-    return (
-      <div className="flex items-center gap-2 mb-3 p-2 bg-primary/10 border border-primary/30 rounded-lg animate-fadeIn">
-        <span className="px-2 py-1 text-xs font-medium text-primary">
-          {selectedCount} host{selectedCount === 1 ? '' : 's'} selected
-        </span>
-        <button onClick={onClear} className="text-meta text-text-dim hover:text-text underline">Clear</button>
-        <div className="flex-1" />
-        <div className="flex items-center gap-1 flex-wrap">
-          {actions.map((a, i) => (
-            <ActionButton key={i} size="xs" variant={a.variant || 'secondary'} icon={a.icon} onClick={a.onClick} title={a.title}>{a.label}</ActionButton>
-          ))}
-        </div>
-      </div>
-    );
-  };
+  // ---- BulkActionBar — removed (merged into toolbar) ----
+  const BulkActionBar = () => null;
 
   // ---- Status Bar (28px) ----
   const StatusBar = () => {
@@ -3345,13 +3329,12 @@
               </>
             )}
 
-            <BulkActionBar selectedCount={selectedIds.length} actions={bulkActions} onClear={() => setSelectedIds([])} />
-
-            {/* BatchPatch-style Action Toolbar */}
+            {/* Action Toolbar (includes Select All + selected count) */}
             <ActionToolbar groups={[
-              { label: 'Hosts', items: [
+              { label: selectedIds.length > 0 ? `Hosts (${selectedIds.length} selected)` : 'Hosts', items: [
                 { icon: 'Plus', label: 'Add', onClick: () => { setAddModalMethod(null); setShowAddModal(true); } },
-                { icon: 'RefreshCw', label: 'Refresh', onClick: async () => { if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; } const targets = hosts.filter(h => selectedIds.includes(h.id)); toast.info(`Pinging ${selectedIds.length} host(s)…`); if (window.SupportHubLANAPI) { for (const h of targets) { try { const result = await window.SupportHubLANAPI.pingHost(h.hostname); if (result && result.success && !result.demo) { updateHosts(prev => prev.map(x => x.id === h.id ? { ...x, onlineStatus: result.data?.online ? 'online' : 'offline', pingStatus: result.data?.status || 'unknown', lastSeen: new Date().toISOString() } : x)); } } catch (e) {} } toast.success(`Refreshed ${selectedIds.length} host(s)`); } else { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, lastSeen: new Date().toISOString() } : h)); toast.success(`Refreshed ${selectedIds.length} host(s) (local only)`); } }, disabled: selectedIds.length === 0 },
+                { icon: selectedIds.length === filteredHosts.length && filteredHosts.length > 0 ? 'SquareCheck' : 'CheckSquare', label: selectedIds.length === filteredHosts.length && filteredHosts.length > 0 ? 'Unselect All' : 'Select All', onClick: () => { if (selectedIds.length === filteredHosts.length && filteredHosts.length > 0) { setSelectedIds([]); } else { setSelectedIds(filteredHosts.map(h => h.id)); } } },
+                { icon: 'RefreshCw', label: 'Refresh', onClick: async () => { const targets = selectedIds.length > 0 ? hosts.filter(h => selectedIds.includes(h.id)) : hosts; const targetNames = targets.map(h => h.hostname); if (targetNames.length === 0) { toast.warning('No hosts to refresh.'); return; } toast.info('Pinging ' + targetNames.length + ' host(s)...'); if (window.SupportHubLANAPI) { try { const result = await window.SupportHubLANAPI.checkHostStatus(targetNames); if (result && result.success && !result.demo) { let parsed; try { parsed = JSON.parse(result.data); } catch { parsed = []; } const arr = Array.isArray(parsed) ? parsed : [parsed]; const statusMap = {}; arr.forEach(r => { if (r.hostname) statusMap[r.hostname] = r.online ? 'online' : 'offline'; }); updateHosts(prev => prev.map(h => { const newStatus = statusMap[h.hostname]; if (newStatus) { return { ...h, onlineStatus: newStatus, pingStatus: newStatus === 'online' ? 'up' : 'down', lastSeen: newStatus === 'online' ? new Date().toISOString() : h.lastSeen }; } return h; })); const onlineCount = arr.filter(r => r.online).length; toast.success('Refreshed ' + targetNames.length + ' host(s): ' + onlineCount + ' online, ' + (targetNames.length - onlineCount) + ' offline'); appendAudit({ action: 'hosts.refresh', actionCategory: 'Inventory', targetType: 'Host', targetIds: targets.map(h => h.id), parameters: { online: onlineCount, offline: targetNames.length - onlineCount }, result: 'success' }); } else if (result && result.demo) { toast.warning('Backend not connected.'); } else { toast.error('Refresh failed', { detail: result?.error }); } } catch (e) { toast.error('Refresh failed', { detail: e.message }); } } else { toast.warning('Backend not connected.'); } } },
               ]},
               { label: 'Updates', items: [
                 { icon: 'Search', label: 'Check', onClick: async () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } const targetHosts = hosts.filter(h => selectedIds.includes(h.id)); const targetNames = targetHosts.map(h => h.hostname); toast.info(`Scanning ${selectedIds.length} host(s)…`); if (window.SupportHubLANAPI) { const result = await window.SupportHubLANAPI.scanUpdates(targetNames, null); if (result && result.success && !result.demo) { toast.success(`Scan complete on ${selectedIds.length} host(s)`); } else if (result && result.demo) { toast.warning('Backend not connected.', { duration: 8000 }); } else { toast.error('Scan failed', { detail: result?.error, duration: 8000 }); } } }, disabled: selectedIds.length === 0 },

@@ -81,200 +81,50 @@ module.exports = function(db) {
   });
 
   // ===========================================================================
-  // HARDWARE INFO — Full hardware audit using MULTIPLE PsTools commands.
+  // HARDWARE INFO — Pure PsTools approach using psinfo + psloggedon.
   //
-  // PsTools commands used (study PsTools docs):
-  //   1. PsExec \\HOST -s wmic computersystem  → system make/model/serial/RAM
-  //   2. PsExec \\HOST -s wmic baseboard       → motherboard make/model/serial
-  //   3. PsExec \\HOST -s wmic bios            → BIOS manufacturer/version/date
-  //   4. PsExec \\HOST -s wmic cpu             → processor make/model/cores/threads
-  //   5. PsExec \\HOST -s wmic memorychip      → RAM sticks (capacity/speed/part#)
-  //   6. PsExec \\HOST -s wmic diskdrive       → physical disks (model/size/serial)
-  //   7. PsExec \\HOST -s wmic logicaldisk     → volumes (drive/size/free/fs)
-  //   8. PsExec \\HOST -s wmic path win32_videocontroller → GPU
-  //   9. PsExec \\HOST -s wmic os              → OS name/build/install date/serial
-  //  10. PsExec \\HOST -s ipconfig /all        → network adapters (IP/MAC/DHCP/DNS)
-  //  11. PsLoggedOn \\HOST                     → currently logged-on user
+  // PsTools commands used:
+  //   1. psinfo.exe -d -h -s \\HOST  → system info + disk volumes + hotfixes + software
+  //   2. psloggedon.exe \\HOST       → currently logged-on user
   //
-  // All 11 commands run in PARALLEL via Promise.all. No PowerShell needed.
-  // Output parsed in JavaScript from wmic's /format:list output.
+  // psinfo provides:
+  //   - System manufacturer, model, type
+  //   - OS name, version, build, install date
+  //   - Processor name, speed, count
+  //   - Total physical memory
+  //   - Video driver (GPU name)
+  //   - Disk volumes (drive, type, format, label, size, free)
+  //   - Installed hotfixes (KB numbers)
+  //   - Installed software (names)
+  //
+  // No wmic, no PowerShell, no ipconfig — just native PsTools.
   // ===========================================================================
   router.post('/:hostname/hardware', async (req, res) => {
     const safeHost = sanitizeHost(req.params.hostname);
     try {
-      // Launch all 11 PsTools commands in parallel.
-      // PsExec is used for BOTH local and remote targets — the user confirmed
-      // PsExec works on their local machine (tested manually, services tab
-      // works). No local/remote special-casing.
-      const [
-        csRes, bbRes, biosRes, cpuRes, memRes,
-        diskRes, ldRes, gpuRes, osRes,
-        ipconfigRes, loggedOnRes,
-      ] = await Promise.all([
-        runRemoteCmdDirect(safeHost, ['wmic', 'computersystem', 'get', 'Manufacturer,Model,SerialNumber,SystemType,TotalPhysicalMemory,Domain,NumberOfProcessors,NumberOfLogicalProcessors', '/format:list'], 20000),
-        runRemoteCmdDirect(safeHost, ['wmic', 'baseboard', 'get', 'Manufacturer,Product,Version,SerialNumber', '/format:list'], 20000),
-        runRemoteCmdDirect(safeHost, ['wmic', 'bios', 'get', 'Manufacturer,Name,SMBIOSBIOSVersion,ReleaseDate,SerialNumber', '/format:list'], 20000),
-        runRemoteCmdDirect(safeHost, ['wmic', 'cpu', 'get', 'Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,CurrentClockSpeed,SocketDesignation', '/format:list'], 20000),
-        runRemoteCmdDirect(safeHost, ['wmic', 'memorychip', 'get', 'Capacity,Manufacturer,PartNumber,Speed,DeviceLocator,SerialNumber', '/format:list'], 20000),
-        runRemoteCmdDirect(safeHost, ['wmic', 'diskdrive', 'get', 'Model,Size,InterfaceType,SerialNumber,Partitions,Index,MediaType', '/format:list'], 20000),
-        runRemoteCmdDirect(safeHost, ['wmic', 'logicaldisk', 'where', 'DriveType=3', 'get', 'DeviceID,Size,FreeSpace,FileSystem,VolumeName', '/format:list'], 20000),
-        runRemoteCmdDirect(safeHost, ['wmic', 'path', 'win32_videocontroller', 'get', 'Name,AdapterCompatibility,AdapterRAM,DriverVersion,DriverDate', '/format:list'], 20000),
-        runRemoteCmdDirect(safeHost, ['wmic', 'os', 'get', 'Caption,Version,BuildNumber,InstallDate,LastBootUpTime,SerialNumber,OSArchitecture,RegisteredOrganization,RegisteredUser', '/format:list'], 20000),
-        runRemoteCmdDirect(safeHost, ['ipconfig', '/all'], 20000),
+      const [psinfoRes, loggedOnRes] = await Promise.all([
+        runPsToolDirect('psinfo.exe', ['-d', '-h', '-s', '\\\\' + safeHost], 30000),
         runPsToolDirect('psloggedon.exe', ['\\\\' + safeHost], 15000),
       ]);
 
-      // Check if ALL failed (host is likely offline)
-      const allFailed = [csRes, bbRes, biosRes, cpuRes, osRes].every(r => !r.success && !r.stdout);
-      if (allFailed) {
+      if (!psinfoRes.success && !psinfoRes.stdout) {
         return res.json({
           success: false,
-          error: csRes.stderr || 'All PsExec commands failed — host may be offline or PsTools not installed',
+          error: psinfoRes.stderr || 'PsInfo failed — host may be offline or PsTools not installed',
+          rawOutputs: { psinfoStderr: psinfoRes.stderr || '' },
         });
       }
 
-      // Parse each wmic output
-      const cs = parseWmicList(csRes.stdout);
-      const bb = parseWmicList(bbRes.stdout);
-      const bios = parseWmicList(biosRes.stdout);
-      const cpus = parseWmicListMulti(cpuRes.stdout);
-      const mems = parseWmicListMulti(memRes.stdout);
-      const disks = parseWmicListMulti(diskRes.stdout);
-      const lds = parseWmicListMulti(ldRes.stdout);
-      const gpus = parseWmicListMulti(gpuRes.stdout);
-      const osInfo = parseWmicList(osRes.stdout);
+      // Parse psinfo output into structured hardware object
+      const hw = parsePsInfoOutput(psinfoRes.stdout, safeHost);
 
-      // Build the structured hardware object
-      const totalRamBytes = parseInt(cs.TotalPhysicalMemory || '0', 10);
-      const totalRamMB = Math.round(totalRamBytes / (1024 * 1024));
-
-      // Processor — COMBINE all wmic cpu rows into ONE processor entry.
-      // wmic cpu returns one row per logical processor/socket — on a multi-core
-      // system, this can return multiple rows (one per thread or one per socket).
-      // We combine them: take name/manufacturer from the first row, and SUM
-      // NumberOfCores and NumberOfLogicalProcessors across all rows to get the
-      // total physical cores and total threads for the system.
-      const cpu = cpus.length > 0 ? {
-        name: cpus[0].Name || 'Unknown',
-        manufacturer: cpus[0].Manufacturer || 'Unknown',
-        cores: cpus.reduce((sum, c) => sum + parseInt(c.NumberOfCores || '0', 10), 0),
-        threads: cpus.reduce((sum, c) => sum + parseInt(c.NumberOfLogicalProcessors || '0', 10), 0),
-        logicalCores: cpus.reduce((sum, c) => sum + parseInt(c.NumberOfLogicalProcessors || '0', 10), 0),
-        maxSpeedMHz: parseInt(cpus[0].MaxClockSpeed || '0', 10),
-        currentSpeedMHz: parseInt(cpus[0].CurrentClockSpeed || '0', 10),
-        socket: cpus[0].SocketDesignation || '',
-        socketCount: cpus.length,
-      } : null;
-
-      // Memory sticks
-      const memory = mems.filter(m => m.Capacity).map(m => ({
-        capacityGB: Math.round(parseInt(m.Capacity, 10) / (1024 * 1024 * 1024) * 10) / 10,
-        manufacturer: m.Manufacturer || '',
-        partNumber: m.PartNumber || '',
-        speed: parseInt(m.Speed || '0', 10),
-        deviceLocator: m.DeviceLocator || '',
-        serialNumber: m.SerialNumber || '',
-      }));
-
-      // Physical disks
-      const physicalDisks = disks.filter(d => d.Model).map((d, i) => ({
-        model: d.Model || '',
-        sizeGB: Math.round(parseInt(d.Size || '0', 10) / (1024 * 1024 * 1024) * 10) / 10,
-        interface: d.InterfaceType || d.MediaType || '',
-        serialNumber: d.SerialNumber || '',
-        partitions: parseInt(d.Partitions || '0', 10),
-        index: parseInt(d.Index || i.toString(), 10),
-      }));
-
-      // Logical volumes
-      const logicalDisks = lds.filter(d => d.DeviceID).map(d => ({
-        drive: d.DeviceID,
-        sizeGB: Math.round(parseInt(d.Size || '0', 10) / (1024 * 1024 * 1024) * 10) / 10,
-        freeGB: Math.round(parseInt(d.FreeSpace || '0', 10) / (1024 * 1024 * 1024) * 10) / 10,
-        fileSystem: d.FileSystem || '',
-        volumeName: d.VolumeName || '',
-      }));
-
-      // GPU(s)
-      const gpu = gpus.filter(g => g.Name).map(g => ({
-        name: g.Name || '',
-        manufacturer: g.AdapterCompatibility || '',
-        ramMB: Math.round(parseInt(g.AdapterRAM || '0', 10) / (1024 * 1024)),
-        driverVersion: g.DriverVersion || '',
-        driverDate: g.DriverDate || '',
-      }));
-
-      // Network adapters (from ipconfig /all)
-      const network = parseIpConfigOutput(ipconfigRes.stdout);
-
-      // Logged-in user
-      const loggedInUser = parsePsLoggedOnOutput(loggedOnRes.stdout);
-
-      // Build the final hardware object
-      const hw = {
-        hostname: safeHost,
-        scannedAt: new Date().toISOString(),
-
-        system: {
-          manufacturer: cs.Manufacturer || '',
-          model: cs.Model || '',
-          serial: cs.SerialNumber || '',
-          systemType: cs.SystemType || '',
-          domain: cs.Domain || '',
-          totalRamMB,
-          numberOfProcessors: parseInt(cs.NumberOfProcessors || '0', 10),
-          numberOfLogicalProcessors: parseInt(cs.NumberOfLogicalProcessors || '0', 10),
-        },
-
-        motherboard: {
-          manufacturer: bb.Manufacturer || '',
-          product: bb.Product || '',
-          version: bb.Version || '',
-          serial: bb.SerialNumber || '',
-        },
-
-        bios: {
-          manufacturer: bios.Manufacturer || '',
-          name: bios.Name || '',
-          version: bios.SMBIOSBIOSVersion || '',
-          serial: bios.SerialNumber || '',
-          releaseDate: bios.ReleaseDate || '',
-        },
-
-        processor: cpu, // single processor (first one)
-
-        memory,
-        disks: physicalDisks,
-        logicalDisks,
-        network,
-        gpu,
-
-        os: {
-          name: osInfo.Caption || '',
-          version: osInfo.Version || '',
-          build: osInfo.BuildNumber || '',
-          architecture: osInfo.OSArchitecture || '',
-          installDate: parseWmiDate(osInfo.InstallDate),
-          lastBoot: parseWmiDate(osInfo.LastBootUpTime),
-          serial: osInfo.SerialNumber || '',
-          registeredOrg: osInfo.RegisteredOrganization || '',
-          registeredUser: osInfo.RegisteredUser || '',
-        },
-
-        loggedInUser,
-
-        _source: 'wmic+ipconfig+psloggedon',
-      };
+      // Parse logged-in user
+      if (loggedOnRes.success || loggedOnRes.stdout) {
+        hw.loggedInUser = parsePsLoggedOnOutput(loggedOnRes.stdout);
+      }
 
       // ========================================================================
       // MERGE LOGIC — don't lose old data if new scan returns empty fields.
-      //
-      // For each section (system, motherboard, bios, processor, memory, disks,
-      // logicalDisks, network, gpu, os), if the NEW scan returned data for
-      // that section, use the new data. If the new scan returned EMPTY for
-      // that section, KEEP the old saved data. This way a partial scan
-      // (e.g. wmic failed but ipconfig worked) doesn't wipe out previously
-      // good data.
       // ========================================================================
       const key = 'hardware:' + safeHost;
       let prevHw = null;
@@ -285,32 +135,26 @@ module.exports = function(db) {
           isFirstScan = false;
           try { prevHw = JSON.parse(previous); } catch { prevHw = null; }
         }
-      } catch (e) { /* ignore load failures */ }
+      } catch (e) {}
 
-      // Check which sections the new scan actually returned data for
+      // Check which sections the new scan returned data for
       const newHas = {
-        system:        !!(hw.system?.manufacturer || hw.system?.model || hw.system?.serial),
-        motherboard:   !!(hw.motherboard?.manufacturer || hw.motherboard?.product),
-        bios:          !!(hw.bios?.manufacturer || hw.bios?.version),
-        processor:     !!(hw.processor?.name),
-        memory:        !!(hw.memory && hw.memory.length > 0),
-        disks:         !!(hw.disks && hw.disks.length > 0),
-        logicalDisks:  !!(hw.logicalDisks && hw.logicalDisks.length > 0),
-        network:       !!(hw.network && hw.network.length > 0),
-        gpu:           !!(hw.gpu && hw.gpu.length > 0),
-        os:            !!(hw.os?.name),
+        system:       !!(hw.system?.manufacturer || hw.system?.model),
+        motherboard:  !!(hw.motherboard?.manufacturer),
+        bios:         !!(hw.bios?.manufacturer),
+        processor:    !!(hw.processor?.name),
+        memory:       !!(hw.memory && hw.memory.length > 0),
+        disks:        !!(hw.disks && hw.disks.length > 0),
+        logicalDisks: !!(hw.logicalDisks && hw.logicalDisks.length > 0),
+        network:      !!(hw.network && hw.network.length > 0),
+        gpu:          !!(hw.gpu && hw.gpu.length > 0),
+        os:           !!(hw.os?.name),
       };
 
-      // If we have previous data, merge: use new data where available, keep
-      // old data for sections that came back empty.
       let finalHw = hw;
       if (prevHw) {
         finalHw = { ...prevHw };
-
-        // Always update scan timestamp
         finalHw.scannedAt = hw.scannedAt;
-
-        // Merge each section
         if (newHas.system)       finalHw.system       = { ...(prevHw.system || {}), ...hw.system };
         if (newHas.motherboard)  finalHw.motherboard  = { ...(prevHw.motherboard || {}), ...hw.motherboard };
         if (newHas.bios)         finalHw.bios         = { ...(prevHw.bios || {}), ...hw.bios };
@@ -321,18 +165,16 @@ module.exports = function(db) {
         if (newHas.network)      finalHw.network      = hw.network;
         if (newHas.gpu)          finalHw.gpu          = hw.gpu;
         if (newHas.os)           finalHw.os           = { ...(prevHw.os || {}), ...hw.os };
-
-        // Always update loggedInUser (it's real-time data, not hardware)
         if (hw.loggedInUser) finalHw.loggedInUser = hw.loggedInUser;
-
-        // Keep the hostname from whichever has it
+        // Always update hotfixes and software (psinfo provides these)
+        if (hw.hotfixes)  finalHw.hotfixes  = hw.hotfixes;
+        if (hw.software)  finalHw.software  = hw.software;
         finalHw.hostname = finalHw.hostname || hw.hostname || safeHost;
       } else {
-        // No previous data — use whatever the new scan returned
         finalHw = hw;
       }
 
-      // Hardware change detection (compare finalHw with prevHw)
+      // Hardware change detection
       let changes = [];
       if (prevHw) {
         try {
@@ -345,39 +187,28 @@ module.exports = function(db) {
             }
           };
           ['system.manufacturer', 'system.model', 'system.serial',
-           'motherboard.serial', 'bios.serial',
-           'processor.name', 'processor.cores', 'processor.threads',
-           'system.totalRamMB'].forEach(compareField);
-          const prevDiskCount = (prevHw.disks || []).length;
-          const newDiskCount = (finalHw.disks || []).length;
+           'processor.name', 'system.totalRamMB'].forEach(compareField);
+          const prevDiskCount = (prevHw.logicalDisks || []).length;
+          const newDiskCount = (finalHw.logicalDisks || []).length;
           if (prevDiskCount !== newDiskCount && newDiskCount > 0) {
             changes.push({ field: 'diskCount', oldValue: prevDiskCount, newValue: newDiskCount });
           }
-        } catch (e) { /* ignore comparison failures */ }
+        } catch (e) {}
       }
 
-      // Save the MERGED data (never save empty data over good data)
-      try { db.settings.set(key, JSON.stringify(finalHw)); } catch (e) { /* ignore save failures */ }
+      try { db.settings.set(key, JSON.stringify(finalHw)); } catch (e) {}
 
-      // Collect any raw outputs for debugging
       const rawOutputs = {
-        computersystem: csRes.stdout ? csRes.stdout.substring(0, 1000) : '',
-        baseboard: bbRes.stdout ? bbRes.stdout.substring(0, 1000) : '',
-        bios: biosRes.stdout ? biosRes.stdout.substring(0, 1000) : '',
-        cpu: cpuRes.stdout ? cpuRes.stdout.substring(0, 1000) : '',
-        csStderr: csRes.stderr ? csRes.stderr.substring(0, 500) : '',
+        psinfo: psinfoRes.stdout ? psinfoRes.stdout.substring(0, 2000) : '',
+        psinfoStderr: psinfoRes.stderr ? psinfoRes.stderr.substring(0, 500) : '',
       };
-
-      // Determine if this was a partial scan (most sections empty)
-      const newSectionCount = Object.values(newHas).filter(Boolean).length;
-      const partialScan = newSectionCount < 3; // less than 3 sections returned data
 
       res.json({
         success: true,
-        data: finalHw,    // return the MERGED data, not the raw new scan
+        data: finalHw,
         changes,
         isFirstScan,
-        partialScan,
+        partialScan: Object.values(newHas).filter(Boolean).length < 3,
         newSections: newHas,
         rawOutputs,
       });
@@ -684,13 +515,51 @@ function parseRegUninstall(raw) {
 
 // Parse `psinfo -d \\HOST` output.
 // Returns: { hostname, os:{name,version,build,installDate,lastBoot}, system:{manufacturer,model,totalRamMB,domain}, processors:[{name,cores,logicalCores,maxSpeedMHz}], memory:[], disks:[], logicalDisks:[], cdDvd:[], network:[], gpu:[{name}], loggedInUser, scannedAt }
+// ---------------------------------------------------------------------------
+// parsePsInfoOutput — parse `psinfo -d -h -s \\HOST` output into a structured
+// hardware object.
+//
+// PsInfo output format:
+//   PsInfo v2.43 - Local and remote system information viewer
+//   Copyright (C) 2001-2023 Mark Russinovich
+//   Sysinternals - www.sysinternals.com
+//
+//   System information for \\HOST:
+//       Uptime:                    1 day 2 hours 3 minutes
+//       Kernel version:            Microsoft Windows 11 Pro (Build 22631)
+//       Product type:              Professional
+//       Kernel build number:       22631
+//       Registered organization:
+//       Registered owner:          Nauman
+//       Installation date:         10/15/2023
+//       System manufacturer:       Dell Inc.
+//       System model:              OptiPlex 7070
+//       System type:               x64-based PC
+//       Processor(s):              1
+//       Processor type:            Intel(R) Core(TM) i7-9700 CPU @ 3.00GHz
+//       Processor speed:           3.00 GHz
+//       Physical memory:           16384 MB
+//       Video driver:              NVIDIA GeForce RTX 3060
+//       OS version:                10.0.22631
+//
+//   Disk Volumes:
+//       C: Fixed NTFS OS 475 GB  200 GB
+//
+//   Hotfixes:
+//       KB5031356
+//
+//   Software:
+//       7-Zip 23.01 (x64)
+//       Google Chrome
+// ---------------------------------------------------------------------------
 function parsePsInfoOutput(raw, fallbackHost) {
-  const out = raw || '';
-  const lines = out.split(/\r?\n/);
-  const kv = {}; // key:value map
+  const out = (raw || '').replace(/\r/g, '');
+  const lines = out.split('\n');
+  const kv = {};
 
+  // Parse key-value pairs (lines like "    Key:    Value")
   for (const line of lines) {
-    const m = /^\s*([A-Za-z][A-Za-z ]+?)\s*:\s*(.*)$/.exec(line);
+    const m = /^\s+([A-Za-z][A-Za-z ()/]+?):\s+(.*)$/.exec(line);
     if (m) {
       const key = m[1].trim().toLowerCase();
       const val = m[2].trim();
@@ -698,7 +567,7 @@ function parsePsInfoOutput(raw, fallbackHost) {
     }
   }
 
-  // Find the "System information for \\\\HOST:" line
+  // Extract hostname from "System information for \\HOST:"
   let hostname = fallbackHost;
   const hostLine = lines.find(l => /System information for/i.test(l));
   if (hostLine) {
@@ -706,58 +575,12 @@ function parsePsInfoOutput(raw, fallbackHost) {
     if (m) hostname = m[1];
   }
 
-  // Disk volumes block — starts after a header like "Volume Type Format ..."
-  const disks = [];
-  const logicalDisks = [];
-  let inVolumeBlock = false;
-  for (const line of lines) {
-    if (/^\s*Volume\s+Type\s+Format/i.test(line)) { inVolumeBlock = true; continue; }
-    if (inVolumeBlock) {
-      if (/^\s*$/.test(line)) { inVolumeBlock = false; continue; }
-      // Match:  "C:     Fixed         NTFS       OS                  475 GB     200 GB"
-      const m = /^\s*([A-Z]:)\s+(\S+)\s+(\S+)\s*(.*?)\s+(\d+)\s*(GB|MB)\s+(\d+)\s*(GB|MB)\s*$/i.exec(line);
-      if (m) {
-        const drive = m[1];
-        const type = m[2];
-        const fmt = m[3];
-        const label = (m[4] || '').trim();
-        const sizeNum = parseInt(m[5], 10);
-        const sizeUnit = m[6].toUpperCase();
-        const freeNum = parseInt(m[7], 10);
-        const freeUnit = m[8].toUpperCase();
-        const sizeGB = sizeUnit === 'TB' ? sizeNum * 1024 : sizeNum;
-        const freeGB = freeUnit === 'TB' ? freeNum * 1024 : freeNum;
-        if (/fixed|internal|removable/i.test(type)) {
-          disks.push({ model: label || (type + ' drive'), sizeGB, interface: type, firmware: '', serialNumber: '', partitions: 0, index: disks.length });
-        }
-        logicalDisks.push({ drive, sizeGB, freeGB, fileSystem: fmt, volumeName: label });
-      } else {
-        // blank or end of block
-        if (/^\s*$/.test(line)) inVolumeBlock = false;
-      }
-    }
-  }
-
-  // Build structured hardware object
-  const processors = [];
-  const procCount = parseInt(kv['processors'] || '1', 10) || 1;
-  const procName = kv['processor type'] || 'Unknown CPU';
+  // Parse processor speed
   const procSpeed = kv['processor speed'] || '';
   const speedMatch = /([\d.]+)\s*GHz/i.exec(procSpeed);
-  const maxSpeedMHz = speedMatch ? Math.round(parseFloat(speedMatch[1]) * 1000) : null;
-  // PsInfo doesn't break out cores vs logical — we set both to procCount as a best-effort.
-  for (let i = 0; i < procCount; i++) {
-    processors.push({
-      name: procName,
-      manufacturer: /Intel/i.test(procName) ? 'Intel' : /AMD|Advanced Micro/i.test(procName) ? 'AMD' : 'Unknown',
-      cores: procCount,
-      logicalCores: procCount,
-      maxSpeedMHz,
-      currentSpeedMHz: maxSpeedMHz,
-      socket: '',
-    });
-  }
+  const maxSpeedMHz = speedMatch ? Math.round(parseFloat(speedMatch[1]) * 1000) : 0;
 
+  // Parse total RAM
   const ramMatch = /(\d+)\s*(MB|GB|TB)/i.exec(kv['physical memory'] || '');
   let totalRamMB = 0;
   if (ramMatch) {
@@ -766,7 +589,65 @@ function parsePsInfoOutput(raw, fallbackHost) {
     totalRamMB = u === 'GB' ? n * 1024 : u === 'TB' ? n * 1024 * 1024 : n;
   }
 
-  // GPU — PsInfo shows "Video driver:" but only one. Could be comma-separated.
+  // Determine CPU manufacturer from processor type name
+  const procName = kv['processor type'] || '';
+  let cpuManufacturer = '';
+  if (/Intel/i.test(procName)) cpuManufacturer = 'Intel';
+  else if (/AMD|Advanced Micro/i.test(procName)) cpuManufacturer = 'AMD';
+
+  // Parse disk volumes section (between "Disk Volumes:" and next section)
+  const logicalDisks = [];
+  let inVolumes = false;
+  for (const line of lines) {
+    if (/^\s*Disk Volumes:\s*$/i.test(line)) { inVolumes = true; continue; }
+    if (/^\s*Hotfixes:\s*$/i.test(line)) { inVolumes = false; continue; }
+    if (/^\s*Software:\s*$/i.test(line)) { inVolumes = false; continue; }
+    if (inVolumes) {
+      // Match: "C: Fixed NTFS OS 475 GB  200 GB"
+      // or:    "C: Fixed NTFS  475 GB  200 GB" (no label)
+      const m = /^\s*([A-Z]:)\s+(\S+)\s+(\S+)\s*(.*?)\s+(\d+)\s*(GB|MB|TB)\s+(\d+)\s*(GB|MB|TB)\s*$/i.exec(line);
+      if (m) {
+        const sizeNum = parseInt(m[5], 10);
+        const sizeUnit = m[6].toUpperCase();
+        const freeNum = parseInt(m[7], 10);
+        const freeUnit = m[8].toUpperCase();
+        const sizeGB = sizeUnit === 'TB' ? sizeNum * 1024 : sizeNum;
+        const freeGB = freeUnit === 'TB' ? freeNum * 1024 : freeNum;
+        logicalDisks.push({
+          drive: m[1],
+          sizeGB,
+          freeGB,
+          fileSystem: m[3],
+          volumeName: (m[4] || '').trim(),
+        });
+      }
+    }
+  }
+
+  // Parse hotfixes section
+  const hotfixes = [];
+  let inHotfixes = false;
+  for (const line of lines) {
+    if (/^\s*Hotfixes:\s*$/i.test(line)) { inHotfixes = true; continue; }
+    if (/^\s*Software:\s*$/i.test(line)) { inHotfixes = false; continue; }
+    if (inHotfixes) {
+      const m = /^\s*(KB\d+)\s*$/i.exec(line);
+      if (m) hotfixes.push(m[1]);
+    }
+  }
+
+  // Parse software section
+  const software = [];
+  let inSoftware = false;
+  for (const line of lines) {
+    if (/^\s*Software:\s*$/i.test(line)) { inSoftware = true; continue; }
+    if (inSoftware) {
+      const trimmed = line.trim();
+      if (trimmed) software.push({ name: trimmed });
+    }
+  }
+
+  // Build GPU array from video driver field
   const gpu = [];
   if (kv['video driver']) {
     kv['video driver'].split(/[,;]/).map(s => s.trim()).filter(Boolean).forEach(name => {
@@ -774,37 +655,56 @@ function parsePsInfoOutput(raw, fallbackHost) {
     });
   }
 
+  // Build the structured hardware object matching the frontend's expectations
   return {
     hostname,
+    scannedAt: new Date().toISOString(),
+
+    system: {
+      manufacturer: kv['system manufacturer'] || '',
+      model: kv['system model'] || '',
+      serial: '',  // psinfo doesn't provide this
+      systemType: kv['system type'] || '',
+      domain: '',
+      totalRamMB,
+    },
+
+    motherboard: {},  // psinfo doesn't provide this
+    bios: {},          // psinfo doesn't provide this
+
+    processor: procName ? {
+      name: procName,
+      manufacturer: cpuManufacturer,
+      cores: 0,   // psinfo doesn't provide core count
+      threads: 0, // psinfo doesn't provide thread count
+      maxSpeedMHz,
+      currentSpeedMHz: maxSpeedMHz,
+      socket: '',
+      socketCount: parseInt(kv['processor(s)'] || '1', 10),
+    } : null,
+
+    memory: [],     // psinfo doesn't provide individual sticks
+    disks: [],      // psinfo doesn't provide physical disk details
+    logicalDisks,
+    network: [],    // need ipconfig for this (not included in pure psinfo approach)
+    gpu,
+
     os: {
-      name: kv['kernel version'] || kv['product type'] || 'Windows',
-      version: '',
-      build: kv['kernel build number'] || kv['os build'] || '',
+      name: kv['kernel version'] || '',
+      version: kv['os version'] || '',
+      build: kv['kernel build number'] || '',
       architecture: '',
-      installDate: kv['install date'] || '',
+      installDate: kv['installation date'] || '',
       lastBoot: '',
       serial: '',
+      registeredOrg: kv['registered organization'] || '',
+      registeredUser: kv['registered owner'] || '',
     },
-    system: {
-      manufacturer: '', // PsInfo doesn't expose this
-      model: '',        // PsInfo doesn't expose this
-      serial: '',
-      biosVersion: '',
-      biosDate: '',
-      totalRamMB,
-      domain: '',
-    },
-    processors,
-    memory: [], // PsInfo doesn't enumerate individual sticks
-    disks,
-    logicalDisks,
-    cdDvd: [],  // PsInfo doesn't enumerate CD/DVD
-    network: [], // filled by parseIpConfigOutput later
-    gpu,
-    loggedInUser: null, // filled by parsePsLoggedOnOutput later
-    managedBy: null,
-    scannedAt: new Date().toISOString(),
-    _source: 'psinfo',
+
+    hotfixes,
+    software,
+    loggedInUser: null, // filled by parsePsLoggedOnOutput
+    _source: 'psinfo+psloggedon',
   };
 }
 

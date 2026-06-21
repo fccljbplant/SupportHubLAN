@@ -1666,7 +1666,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v4.0.8';
+  const APP_VERSION = 'v4.0.9';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -2552,8 +2552,8 @@
           </div>
           <div className="text-text-dim text-xs py-8 text-center">
             <Icon name="RefreshCw" size={16} className="inline mr-2 animate-spin" />
-            Running wmic + ipconfig + psloggedon on {host.hostname}…<br />
-            <span className="text-[10px]">(11 parallel PsExec calls — takes 10\u201320 seconds)</span>
+            Running psinfo -d -h -s + psloggedon on {host.hostname}…<br />
+            <span className="text-[10px]">(2 PsTools calls — takes 5–15 seconds)</span>
           </div>
         </div>
       );
@@ -2815,6 +2815,20 @@
           <Row label="Registered User" value={osInfo?.registeredUser} />
         </div>
 
+        {/* HOTFIXES */}
+        {hw.hotfixes && hw.hotfixes.length > 0 && (
+          <>
+            <SectionTitle icon="ShieldCheck">Installed Hotfixes ({hw.hotfixes.length})</SectionTitle>
+            <div className="p-2 bg-surface-raised rounded border border-border">
+              <div className="flex flex-wrap gap-1">
+                {hw.hotfixes.map((kb, i) => (
+                  <span key={i} className="font-mono text-[10px] bg-surface px-1.5 py-0.5 rounded border border-border text-text">{kb}</span>
+                ))}
+              </div>
+            </div>
+          </>
+        )}
+
         {/* LOGGED-IN USER */}
         <SectionTitle icon="User">User</SectionTitle>
         <div className="p-2 bg-surface-raised rounded border border-border">
@@ -2840,7 +2854,7 @@
         )}
 
         <div className="text-[9px] text-text-dim text-center pt-2 pb-1">
-          Data source: PsExec + wmic · ipconfig /all · PsLoggedOn (11 parallel calls, no PowerShell)
+          Data source: PsInfo -d -h -s · PsLoggedOn (pure PsTools, no wmic/PowerShell)
         </div>
       </div>
     );

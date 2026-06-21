@@ -2858,6 +2858,52 @@
     const [showDeployModal, setShowDeployModal] = useState(false);
     const [showCommandModal, setShowCommandModal] = useState(false);
     const [logHost, setLogHost] = useState(null); // host object for PC Log modal
+    const [editHost, setEditHost] = useState(null); // host object for Edit modal
+
+    // Delete host from inventory + backend
+    const deleteHost = async (host) => {
+      // Remove from local state
+      updateHosts(prev => prev.filter(h => h.id !== host.id));
+      appendAudit({ action: 'hosts.delete', actionCategory: 'Inventory', targetType: 'Host', targetIds: [host.id], parameters: { hostname: host.hostname }, result: 'success' });
+      toast.success('Deleted ' + host.hostname);
+      // Delete from backend if LIVE
+      if (window.SupportHubLANAPI && window._supporthublanBackendStatus === 'connected' && host._fromBackend) {
+        try {
+          const dbId = host.id.replace('db-', '');
+          await fetch(window.SUPPORTHUBLAN_API_URL + '/api/hosts/' + dbId, { method: 'DELETE' });
+        } catch (e) {}
+      }
+    };
+
+    // Save edited host to local state + backend
+    const saveHostEdit = async (host, fields) => {
+      updateHosts(prev => prev.map(h => h.id === host.id ? { ...h, ...fields } : h));
+      appendAudit({ action: 'hosts.edit', actionCategory: 'Inventory', targetType: 'Host', targetIds: [host.id], parameters: { hostname: host.hostname, fields }, result: 'success' });
+      toast.success('Updated ' + host.hostname);
+      // Update backend if LIVE
+      if (window.SupportHubLANAPI && window._supporthublanBackendStatus === 'connected' && host._fromBackend) {
+        try {
+          const dbId = host.id.replace('db-', '');
+          const backendFields = {};
+          if (fields.hostname) backendFields.hostname = fields.hostname;
+          if (fields.ipAddress !== undefined) backendFields.ip_address = fields.ipAddress;
+          if (fields.macAddress !== undefined) backendFields.mac_address = fields.macAddress;
+          if (fields.fqdn !== undefined) backendFields.fqdn = fields.fqdn;
+          if (fields.osName !== undefined) backendFields.os = fields.osName;
+          if (fields.site !== undefined) backendFields.site = fields.site;
+          if (fields.owner !== undefined) backendFields.owner = fields.owner;
+          if (fields.department !== undefined) backendFields.department = fields.department;
+          if (fields.tags !== undefined) backendFields.tags = Array.isArray(fields.tags) ? fields.tags.join(',') : fields.tags;
+          if (fields.notes !== undefined) backendFields.notes = fields.notes;
+          await fetch(window.SUPPORTHUBLAN_API_URL + '/api/hosts/' + dbId, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(backendFields),
+          });
+        } catch (e) {}
+      }
+      setEditHost(null);
+    };
 
     const [showColumnChooser, setShowColumnChooser] = useState(false);
     const [hiddenCols, setHiddenCols] = useState(new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials']));
@@ -3383,7 +3429,9 @@
                       { label: h.hostname },
                       { separator: true },
                       { icon: 'Info', text: 'View Details', onClick: () => openHost(h) },
-                      { icon: 'RefreshCw', text: 'Refresh Host', onClick: () => { updateHosts(prev => prev.map(x => x.id === h.id ? { ...x, lastSeen: new Date().toISOString() } : x)); toast.success(`${h.hostname} refreshed.`); } },
+                      { icon: 'Edit', text: 'Edit Host', onClick: () => setEditHost(h) },
+                      { icon: 'Trash', text: 'Delete Host', danger: true, onClick: () => { if (confirm('Delete ' + h.hostname + '? This cannot be undone.')) { deleteHost(h); } } },
+                      { icon: 'RefreshCw', text: 'Refresh Host', onClick: async () => { toast.info('Pinging ' + h.hostname + '...'); if (window.SupportHubLANAPI) { const r = await window.SupportHubLANAPI.pingHost(h.hostname); if (r && r.success && !r.demo) { updateHosts(prev => prev.map(x => x.id === h.id ? { ...x, onlineStatus: r.data?.online ? 'online' : 'offline', pingStatus: r.data?.online ? 'up' : 'down', lastSeen: new Date().toISOString() } : x)); toast.success(h.hostname + ' is ' + (r.data?.online ? 'online' : 'offline')); } else { toast.warning('Backend not connected'); } } } },
                       { separator: true },
                       { icon: 'Search', text: 'Check for Updates', onClick: async () => { toast.info(`Scanning ${h.hostname} for updates…`); if (window.SupportHubLANAPI) { const result = await window.SupportHubLANAPI.scanUpdates([h.hostname], null); if (result && result.success && !result.demo) { toast.success(`Scan complete for ${h.hostname}`); } else if (result && result.demo) { toast.warning('Backend not connected.', { duration: 8000 }); } else { toast.error('Scan failed', { detail: result?.error, duration: 8000 }); } } } },
                       { icon: 'ShieldCheck', text: 'Install Updates', onClick: async () => { toast.info(`Installing updates on ${h.hostname}…`); if (window.SupportHubLANAPI) { const result = await window.SupportHubLANAPI.installUpdates([h.hostname], null, { rebootBehavior: 'if-required' }); if (result && result.success && !result.demo) { updateHosts(prev => prev.map(x => x.id === h.id ? { ...x, patchState: 'compliant' } : x)); toast.success(`${h.hostname} now compliant`); } else if (result && result.demo) { toast.warning('Backend not connected.', { duration: 8000 }); } else { toast.error('Install failed', { detail: result?.error, duration: 8000 }); } } } },
@@ -3431,6 +3479,9 @@
         {/* PC Log Modal — opened from row action button */}
         <PCLogModal open={!!logHost} host={logHost} onClose={() => setLogHost(null)} />
 
+        {/* Edit Host Modal */}
+        {editHost && <EditHostModal host={editHost} onSave={saveHostEdit} onClose={() => setEditHost(null)} />}
+
         {/* Encrypted Grid File Export/Import Modal */}
 
         {/* Reboot Confirmation Dialog */}
@@ -3477,6 +3528,83 @@
           />
         )}
       </div>
+    );
+  };
+
+  // ============================================================
+  // EDIT HOST MODAL — Edit hostname, IP, MAC, OS, site, owner, etc.
+  // ============================================================
+  const EditHostModal = ({ host, onSave, onClose }) => {
+    const toast = useToast();
+    const [form, setForm] = useState({
+      hostname: host.hostname || '',
+      ipAddress: host.ipAddress || '',
+      macAddress: host.macAddress || '',
+      fqdn: host.fqdn || '',
+      osName: host.osName || '',
+      site: host.site || '',
+      owner: host.owner || '',
+      department: host.department || '',
+      tags: Array.isArray(host.tags) ? host.tags.join(', ') : (host.tags || ''),
+      notes: host.notes || '',
+    });
+
+    const handleSave = () => {
+      if (!form.hostname.trim()) { toast.warning('Hostname is required'); return; }
+      const fields = {
+        hostname: form.hostname.trim(),
+        ipAddress: form.ipAddress.trim(),
+        macAddress: form.macAddress.trim(),
+        fqdn: form.fqdn.trim(),
+        osName: form.osName.trim(),
+        site: form.site.trim(),
+        owner: form.owner.trim(),
+        department: form.department.trim(),
+        tags: form.tags.split(',').map(t => t.trim()).filter(Boolean),
+        notes: form.notes.trim(),
+      };
+      onSave(host, fields);
+    };
+
+    return (
+      <Modal open={true} onClose={onClose} title={'Edit Host — ' + host.hostname} subtitle="Modify host details" size="lg"
+        footer={<>
+          <ActionButton variant="secondary" onClick={onClose}>Cancel</ActionButton>
+          <ActionButton variant="primary" icon="Check" onClick={handleSave}>Save Changes</ActionButton>
+        </>}>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <FormField label="Hostname" required>
+            <Input value={form.hostname} onChange={e => setForm(f => ({ ...f, hostname: e.target.value }))} className="font-mono" />
+          </FormField>
+          <FormField label="IP Address">
+            <Input value={form.ipAddress} onChange={e => setForm(f => ({ ...f, ipAddress: e.target.value }))} className="font-mono" />
+          </FormField>
+          <FormField label="MAC Address">
+            <Input value={form.macAddress} onChange={e => setForm(f => ({ ...f, macAddress: e.target.value }))} className="font-mono" />
+          </FormField>
+          <FormField label="FQDN">
+            <Input value={form.fqdn} onChange={e => setForm(f => ({ ...f, fqdn: e.target.value }))} className="font-mono" />
+          </FormField>
+          <FormField label="OS">
+            <Input value={form.osName} onChange={e => setForm(f => ({ ...f, osName: e.target.value }))} />
+          </FormField>
+          <FormField label="Site">
+            <Input value={form.site} onChange={e => setForm(f => ({ ...f, site: e.target.value }))} />
+          </FormField>
+          <FormField label="Owner">
+            <Input value={form.owner} onChange={e => setForm(f => ({ ...f, owner: e.target.value }))} />
+          </FormField>
+          <FormField label="Department">
+            <Input value={form.department} onChange={e => setForm(f => ({ ...f, department: e.target.value }))} />
+          </FormField>
+          <FormField label="Tags (comma-separated)" className="sm:col-span-2">
+            <Input value={form.tags} onChange={e => setForm(f => ({ ...f, tags: e.target.value }))} className="font-mono" />
+          </FormField>
+          <FormField label="Notes" className="sm:col-span-2">
+            <Textarea rows={2} value={form.notes} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} />
+          </FormField>
+        </div>
+      </Modal>
     );
   };
 

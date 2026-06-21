@@ -2846,7 +2846,7 @@
   };
 
   const InventoryScreen = () => {
-    const { route, openHost, openDrawer, hosts, addHosts, addJob, appendAudit } = useApp();
+    const { route, openHost, openDrawer, hosts, addHosts, addJob, appendAudit, updateHosts } = useApp();
     const toast = useToast();
     const [activeTab, setActiveTab] = useState('all');
     const [search, setSearch] = useState('');

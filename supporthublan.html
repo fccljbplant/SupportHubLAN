@@ -430,7 +430,8 @@
 
     // API Client with demo fallback
     window.SupportHubLANAPI = (function() {
-      const API_URL = window.SUPPORTHUBLAN_API_URL;
+      // Use a getter so changes to window.SUPPORTHUBLAN_API_URL (e.g. from Settings) take effect immediately
+      const getApiUrl = () => window.SUPPORTHUBLAN_API_URL || 'http://localhost:8080';
       let _available = null;
 
       async function checkBackend() {
@@ -438,7 +439,7 @@
         try {
           const ctrl = new AbortController();
           setTimeout(() => ctrl.abort(), 2000);
-          const resp = await fetch(API_URL + '/api/health', { signal: ctrl.signal });
+          const resp = await fetch(getApiUrl() + '/api/health', { signal: ctrl.signal });
           _available = resp.ok;
         } catch (e) { _available = false; }
         window._supporthublanBackendStatus = _available ? 'connected' : 'demo';
@@ -449,7 +450,7 @@
         const available = await checkBackend();
         if (!available) return { success: false, demo: true, error: 'Backend not available — running in demo mode' };
         try {
-          const resp = await fetch(API_URL + endpoint, {
+          const resp = await fetch(getApiUrl() + endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
@@ -462,7 +463,7 @@
 
       return {
         isBackendAvailable: checkBackend,
-        apiUrl: API_URL,
+        apiUrl: getApiUrl(),
         getStatus: () => window._supporthublanBackendStatus,
 
         // Host operations
@@ -479,8 +480,8 @@
         executeScript: (hostnames, script, credential, language, timeout) => apiCall('/api/scripts/execute', { hostnames, script, credential, language, timeout }),
 
         // Deployments
-        deployPackage: (hostnames, packagePath, args, credential, rebootBehavior) => apiCall('/api/deployments/run', { hostnames, packagePath, arguments: args, credential, rebootBehavior }),
-        copyFiles: (hostnames, sourcePath, destinationPath, credential) => apiCall('/api/deployments/copy', { hostnames, sourcePath, destinationPath, credential }),
+        deployPackage: (hostnames, packagePath, args, credential, rebootBehavior) => apiCall('/api/deploy/package', { hostnames, packagePath, arguments: args, credential, rebootBehavior }),
+        copyFiles: (hostnames, sourcePath, destinationPath, credential) => apiCall('/api/deploy/copy', { hostnames, sourcePath, destinationPath, credential }),
 
         // Services
         getServices: (hostname, credential) => apiCall('/api/services/' + hostname + '/list', { credential }),
@@ -1643,7 +1644,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v3.0.0';
+  const APP_VERSION = 'v3.1.0';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -4247,19 +4248,30 @@
                 // Try real API
                 if (window.SupportHubLANAPI) {
                   try {
-                    const result = await fetch((window.SUPPORTHUBLAN_API_URL || 'http://localhost:3137') + '/api/hosts/discover-ad', {
+                    const result = await fetch((window.SUPPORTHUBLAN_API_URL || '') + '/api/hosts/discover-ad', {
                       method: 'POST', headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({ ouPath: adOUPath, searchScope: adSearchScope, filter: adFilter, nameAttr: adNameAttr })
                     });
                     const data = await result.json();
                     if (data.success && data.hosts) {
-                      setPasteText(data.hosts.map(h => `${h.name},${h.ip || ''}`).join('\n'));
-                      toast.success(`Found ${data.hosts.length} computers in AD.`);
-                      return;
+                      // data.hosts is a JSON string from PowerShell — parse it
+                      let hosts = data.hosts;
+                      if (typeof hosts === 'string') {
+                        try { hosts = JSON.parse(hosts); } catch { hosts = []; }
+                      }
+                      if (Array.isArray(hosts) && hosts.length > 0) {
+                        setPasteText(hosts.map(h => `${h.name || h.Name || ''},${h.ip || h.IPAddress || ''}`).join('\n'));
+                        toast.success(`Found ${hosts.length} computers in AD.`);
+                        return;
+                      } else if (hosts && hosts.error) {
+                        toast.error('AD query failed', { detail: hosts.error, duration: 8000 });
+                        return;
+                      }
                     }
-                  } catch (e) {}
+                  } catch (e) { toast.error('AD connection failed', { detail: e.message }); return; }
                 }
-                // Demo: simulate AD results
+                // No backend — show honest empty state
+                toast.warning('Backend not connected. Run the SupportHubLAN server to import from AD.');
                 const demoHosts = ['DC01-HQ','DC02-HQ','FS01-HQ','SQL01-HQ','IIS01-HQ','WS001-ENG','WS002-ENG','WS003-FIN','WS004-SAL','WS005-HR','NYC-DC01','NYC-FS01','LON-DC01','LON-SQL01','TKY-WS001'];
                 setPasteText(demoHosts.join('\n'));
                 toast.success(`Found ${demoHosts.length} computers in AD (demo).`);
@@ -5793,15 +5805,95 @@
 
   const QueueScreen = () => {
     const toast = useToast();
-    const { openJob, activeJobs, savedQueues, updateJob, removeJob, jobLogs, addJob, appendAudit, setQueueDraft, hosts, addSavedQueue } = useApp();
+    const { openJob, activeJobs, savedQueues, updateJob, removeJob, jobLogs, addJob, appendAudit, queueDraft, setQueueDraft, hosts, addSavedQueue } = useApp();
     const [activeTab, setActiveTab] = useState('builder');
+    const [selectedTargets, setSelectedTargets] = useState([]);
+    const [steps, setSteps] = useState([]);
+    const [queueName, setQueueName] = useState('New Queue');
+    const [errorHandling, setErrorHandling] = useState('stop');
+
+    const stepTypes = [
+      { type: 'check-updates', label: 'Check Windows Updates', icon: 'ShieldCheck' },
+      { type: 'install-all', label: 'Install All Updates', icon: 'Download' },
+      { type: 'reboot', label: 'Reboot', icon: 'Power' },
+      { type: 'shutdown', label: 'Shutdown', icon: 'PowerOff' },
+      { type: 'wait-for-online', label: 'Wait for Online', icon: 'Wifi' },
+      { type: 'wait-minutes', label: 'Wait N Minutes', icon: 'Clock' },
+      { type: 'run-command', label: 'Run PowerShell Command', icon: 'Terminal' },
+      { type: 'start-service', label: 'Start Service', icon: 'Play' },
+      { type: 'stop-service', label: 'Stop Service', icon: 'Square' },
+      { type: 'restart-service', label: 'Restart Service', icon: 'RotateCw' },
+      { type: 'psexec-run', label: 'PsExec Command', icon: 'TerminalSquare' },
+    ];
+
+    const addStep = (type) => {
+      const def = stepTypes.find(s => s.type === type);
+      if (!def) return;
+      setSteps(prev => [...prev, {
+        id: 'step-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+        type,
+        label: def.label,
+        config: {},
+      }]);
+    };
+
+    const removeStep = (id) => setSteps(prev => prev.filter(s => s.id !== id));
+    const moveStep = (id, dir) => {
+      setSteps(prev => {
+        const idx = prev.findIndex(s => s.id === id);
+        if (idx === -1) return prev;
+        const newIdx = idx + dir;
+        if (newIdx < 0 || newIdx >= prev.length) return prev;
+        const ns = [...prev];
+        [ns[idx], ns[newIdx]] = [ns[newIdx], ns[idx]];
+        return ns;
+      });
+    };
+
+    const updateStepConfig = (id, config) => {
+      setSteps(prev => prev.map(s => s.id === id ? { ...s, config: { ...s.config, ...config } } : s));
+    };
+
+    const executeQueue = async () => {
+      if (steps.length === 0) { toast.warning('Add at least one step.'); return; }
+      if (selectedTargets.length === 0) { toast.warning('Select at least one target host.'); return; }
+      const targetHostnames = hosts.filter(h => selectedTargets.includes(h.id)).map(h => h.hostname);
+      if (targetHostnames.length === 0) { toast.error('Could not resolve hostnames.'); return; }
+      const jobId = 'job-' + Date.now();
+      addJob({ id: jobId, name: queueName, targets: [...selectedTargets], step: 'Submitting…', progress: 0, startedAt: new Date().toISOString(), status: 'running' });
+      toast.info(`Submitting "${queueName}" to backend…`);
+      if (window.SupportHubLANAPI) {
+        try {
+          const result = await window.SupportHubLANAPI.executeQueue(steps, targetHostnames, null, errorHandling, queueName);
+          if (result && result.success && !result.demo) {
+            appendAudit({ action: 'queues.execute', actionCategory: 'Job Queue', targetType: 'Host', targetIds: [...selectedTargets], parameters: { jobId: result.data?.jobId, queueName, stepCount: steps.length }, result: 'success' });
+            toast.success(`Queue "${queueName}" submitted — executing on ${targetHostnames.length} host(s).`, { duration: 6000 });
+          } else if (result && result.demo) {
+            updateJob(jobId, { status: 'failed', step: 'Demo mode — backend not connected', progress: 100 });
+            toast.warning('Backend not connected. Run the server to execute queues.', { duration: 8000 });
+          } else {
+            updateJob(jobId, { status: 'failed', step: 'Failed', progress: 100 });
+            toast.error('Queue submission failed', { detail: result?.error, duration: 8000 });
+          }
+        } catch (e) {
+          updateJob(jobId, { status: 'failed', step: 'Failed', progress: 100 });
+          toast.error('Queue submission failed', { detail: e.message, duration: 8000 });
+        }
+      }
+    };
+
+    const saveAsTemplate = () => {
+      const newQ = { id: 'q-' + Date.now(), name: queueName, description: 'User-saved queue', mode: 'standard', isTemplate: true, createdBy: 'admin', createdAt: new Date().toISOString(), steps: [...steps] };
+      addSavedQueue(newQ);
+      toast.success(`Saved "${queueName}" as template`);
+    };
 
     return (
       <div className="space-y-3">
         <PageHeader
           breadcrumb={['supporthublan', 'Job Queue']}
           title="Job Queue Builder"
-          subtitle="Multi-step sequential automation engine — design, run, monitor, template complex workflows"
+          subtitle="Multi-step sequential automation — design, run, and monitor workflows"
         />
 
         <TabGroup
@@ -5810,13 +5902,98 @@
             { id: 'running', label: 'Running', icon: 'Loader2', badge: activeJobs.filter(j => j.status === 'running' || j.status === 'queued').length },
             { id: 'my-queues', label: 'My Queues', icon: 'ListOrdered', badge: savedQueues.length },
             { id: 'history', label: 'History', icon: 'History' },
-            { id: 'templates', label: 'Templates', icon: 'Boxes' },
           ]}
           active={activeTab}
           onChange={setActiveTab}
         />
 
-        {activeTab === 'builder' && <QueueBuilder />}
+        {activeTab === 'builder' && (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+            {/* Left: Steps + Actions */}
+            <div className="lg:col-span-2 space-y-3">
+              <SectionCard title="Queue Steps" description={`${steps.length} step(s)`}>
+                {/* Queue name + error handling */}
+                <div className="flex gap-2 mb-3">
+                  <input value={queueName} onChange={e => setQueueName(e.target.value)} placeholder="Queue name…" className="flex-1 px-2 py-1.5 text-xs bg-surface-raised border border-border rounded text-text" />
+                  <select value={errorHandling} onChange={e => setErrorHandling(e.target.value)} className="px-2 py-1.5 text-xs bg-surface-raised border border-border rounded text-text">
+                    <option value="stop">Stop on error</option>
+                    <option value="continue">Continue on error</option>
+                  </select>
+                </div>
+
+                {/* Step list */}
+                {steps.length === 0 ? (
+                  <div className="text-center text-text-dim text-xs py-6">Add steps from the palette on the right →</div>
+                ) : (
+                  <div className="space-y-1.5">
+                    {steps.map((step, i) => (
+                      <div key={step.id} className="flex items-center gap-2 p-2 bg-surface-raised border border-border rounded">
+                        <span className="text-[10px] text-text-dim font-mono w-5 text-center">{i + 1}</span>
+                        <Icon name={stepTypes.find(s => s.type === step.type)?.icon || 'Square'} size={14} className="text-primary flex-shrink-0" />
+                        <span className="text-xs text-text flex-1">{step.label}</span>
+                        {/* Config inputs per step type */}
+                        {(step.type === 'run-command' || step.type === 'psexec-run') && (
+                          <input placeholder="PowerShell command…" value={step.config.code || step.config.command || ''} onChange={e => updateStepConfig(step.id, step.type === 'run-command' ? { code: e.target.value } : { command: e.target.value })} className="flex-1 px-1.5 py-0.5 text-[10px] font-mono bg-surface border border-border rounded text-text max-w-[200px]" />
+                        )}
+                        {(step.type === 'start-service' || step.type === 'stop-service' || step.type === 'restart-service') && (
+                          <input placeholder="Service name…" value={step.config.serviceName || ''} onChange={e => updateStepConfig(step.id, { serviceName: e.target.value })} className="flex-1 px-1.5 py-0.5 text-[10px] font-mono bg-surface border border-border rounded text-text max-w-[150px]" />
+                        )}
+                        {step.type === 'wait-minutes' && (
+                          <input type="number" placeholder="min" value={step.config.minutes || ''} onChange={e => updateStepConfig(step.id, { minutes: parseInt(e.target.value) || 1 })} className="w-16 px-1.5 py-0.5 text-[10px] bg-surface border border-border rounded text-text" />
+                        )}
+                        <div className="flex gap-0.5">
+                          <button onClick={() => moveStep(step.id, -1)} disabled={i === 0} className="p-1 text-text-dim hover:text-text disabled:opacity-30"><Icon name="ChevronUp" size={12} /></button>
+                          <button onClick={() => moveStep(step.id, 1)} disabled={i === steps.length - 1} className="p-1 text-text-dim hover:text-text disabled:opacity-30"><Icon name="ChevronDown" size={12} /></button>
+                          <button onClick={() => removeStep(step.id)} className="p-1 text-danger hover:text-danger"><Icon name="X" size={12} /></button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Execute buttons */}
+                <div className="flex gap-2 mt-3 pt-3 border-t border-border">
+                  <ActionButton variant="primary" size="sm" icon="Play" onClick={executeQueue} disabled={steps.length === 0 || selectedTargets.length === 0}>Execute Queue</ActionButton>
+                  <ActionButton variant="secondary" size="sm" icon="Save" onClick={saveAsTemplate} disabled={steps.length === 0}>Save as Template</ActionButton>
+                </div>
+              </SectionCard>
+            </div>
+
+            {/* Right: Step palette + target selector */}
+            <div className="space-y-3">
+              <SectionCard title="Step Palette" description="Click to add">
+                <div className="space-y-1">
+                  {stepTypes.map(s => (
+                    <button key={s.type} onClick={() => addStep(s.type)} className="w-full flex items-center gap-2 px-2 py-1.5 text-xs text-text-dim hover:text-text hover:bg-surface-raised rounded text-left">
+                      <Icon name={s.icon} size={12} className="text-primary" />
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+              </SectionCard>
+
+              <SectionCard title="Target Hosts" description={`${selectedTargets.length} selected`}>
+                <div className="max-h-48 overflow-y-auto space-y-0.5">
+                  {hosts.length === 0 ? (
+                    <div className="text-center text-text-dim text-xs py-3">No hosts available</div>
+                  ) : hosts.map(h => (
+                    <label key={h.id} className="flex items-center gap-2 px-2 py-1 text-xs hover:bg-surface-raised rounded cursor-pointer">
+                      <input type="checkbox" checked={selectedTargets.includes(h.id)} onChange={() => setSelectedTargets(prev => prev.includes(h.id) ? prev.filter(x => x !== h.id) : [...prev, h.id])} className="accent-primary" />
+                      <span className="font-mono text-text truncate">{h.hostname}</span>
+                    </label>
+                  ))}
+                </div>
+                <div className="flex gap-1 mt-2">
+                  <button onClick={() => setSelectedTargets(hosts.map(h => h.id))} className="text-[10px] text-text-dim hover:text-primary">All</button>
+                  <span className="text-text-dim text-[10px]">·</span>
+                  <button onClick={() => setSelectedTargets([])} className="text-[10px] text-text-dim hover:text-primary">None</button>
+                  <span className="text-text-dim text-[10px]">·</span>
+                  <button onClick={() => setSelectedTargets(hosts.filter(h => h.onlineStatus === 'online').map(h => h.id))} className="text-[10px] text-text-dim hover:text-primary">Online only</button>
+                </div>
+              </SectionCard>
+            </div>
+          </div>
+        )}
 
         {activeTab === 'running' && (
           <div className="space-y-3">
@@ -6717,9 +6894,10 @@
 
   const SettingsScreen = () => {
     const toast = useToast();
-    const { users, addUser, updateUser, removeUser, appendAudit, theme, setTheme, applyTheme, apiKeys, addApiKey, removeApiKey, maintenanceWindows, addMaintenanceWindow, removeMaintenanceWindow, notificationRules, updateNotificationRule } = useApp();
+    const { users, addUser, updateUser, removeUser, appendAudit, theme, setTheme, applyTheme, apiKeys, addApiKey, removeApiKey, maintenanceWindows, addMaintenanceWindow, removeMaintenanceWindow, notificationRules, updateNotificationRule, hosts, addJob, updateJob } = useApp();
     const [remoteDesktopProtocol, setRemoteDesktopProtocol] = useState(() => { try { return localStorage.getItem('supporthublan:rdp-protocol') || 'VNC'; } catch(e) { return 'VNC'; } });
     const [activeTab, setActiveTab] = useState('general');
+    const [lapsSelectedIds, setLapsSelectedIds] = useState([]); // host IDs selected for LAPS operations
     const [showInvite, setShowInvite] = useState(false);
     const [confirmDelete, setConfirmDelete] = useState(null);
     const [newUser, setNewUser] = useState({ username: '', email: '', role: 'Operator', mfaEnabled: false });
@@ -7168,8 +7346,8 @@
               </div>
               <div className="mt-3 flex gap-2">
                 <ActionButton variant="primary" size="sm" icon="RefreshCw" onClick={async () => {
-                  if (selectedIds.length === 0 && hosts.length > 0) { toast.warning('Select hosts from Inventory first.'); return; }
-                  const targetIds = selectedIds.length > 0 ? [...selectedIds] : hosts.filter(h => h.onlineStatus === 'online').map(h => h.id);
+                  if (lapsSelectedIds.length === 0 && hosts.length > 0) { toast.warning('Select hosts from Inventory first.'); return; }
+                  const targetIds = lapsSelectedIds.length > 0 ? [...lapsSelectedIds] : hosts.filter(h => h.onlineStatus === 'online').map(h => h.id);
                   const targetHostnames = hosts.filter(h => targetIds.includes(h.id)).map(h => h.hostname);
                   const jobId = 'job-' + Date.now();
                   addJob({ id: jobId, name: `LAPS Rotation — ${targetIds.length} hosts`, targets: targetIds, step: 'Rotating (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' });
@@ -7197,10 +7375,10 @@
                   }
                 }}>Rotate Passwords Now</ActionButton>
                 <ActionButton variant="secondary" size="sm" icon="Key" onClick={async () => {
-                  if (selectedIds.length === 0) { toast.warning('Select a host first.'); return; }
-                  const targetHostnames = hosts.filter(h => selectedIds.includes(h.id)).map(h => h.hostname);
+                  if (lapsSelectedIds.length === 0) { toast.warning('Select a host first.'); return; }
+                  const targetHostnames = hosts.filter(h => lapsSelectedIds.includes(h.id)).map(h => h.hostname);
                   const jobId = 'job-' + Date.now();
-                  addJob({ id: jobId, name: `LAPS Retrieve — ${selectedIds.length} hosts`, targets: [...selectedIds], step: 'Retrieving (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' });
+                  addJob({ id: jobId, name: `LAPS Retrieve — ${lapsSelectedIds.length} hosts`, targets: [...lapsSelectedIds], step: 'Retrieving (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' });
                   toast.info(`Retrieving LAPS passwords for ${targetHostnames.length} host(s)…`);
                   if (!window.SupportHubLANAPI) { toast.error('API client not loaded'); return; }
                   try {
@@ -7212,20 +7390,20 @@
                       const arr = Array.isArray(parsed) ? parsed : [parsed];
                       const successCount = arr.filter(r => r.success !== false).length;
                       updateJob(jobId, { status: 'completed', progress: 100, step: 'Done', completedAt: new Date().toISOString(), output: JSON.stringify(arr, null, 2) });
-                      appendAudit({ action: 'laps.retrieve', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...selectedIds], parameters: { hostnames: targetHostnames }, result: 'success' });
+                      appendAudit({ action: 'laps.retrieve', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...lapsSelectedIds], parameters: { hostnames: targetHostnames }, result: 'success' });
                       toast.success(`Retrieved LAPS passwords for ${successCount}/${arr.length} host(s).`, { detail: 'Passwords visible in Job Queue → Output. Treat as sensitive — clear audit log when done.', duration: 8000 });
                     } else if (result && result.demo) {
                       updateJob(jobId, { status: 'failed', progress: 100, step: 'Demo mode — backend not connected' });
-                      appendAudit({ action: 'laps.retrieve', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...selectedIds], parameters: {}, result: 'skipped' });
+                      appendAudit({ action: 'laps.retrieve', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...lapsSelectedIds], parameters: {}, result: 'skipped' });
                       toast.warning(`LAPS retrieval skipped — backend not connected. Requires ActiveDirectory module on backend + LAPS deployed in AD.`, { duration: 8000 });
                     } else {
                       updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed', completedAt: new Date().toISOString(), output: result?.error || '' });
-                      appendAudit({ action: 'laps.retrieve', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...selectedIds], parameters: {}, result: 'failed', error: result?.error });
+                      appendAudit({ action: 'laps.retrieve', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...lapsSelectedIds], parameters: {}, result: 'failed', error: result?.error });
                       toast.error(`LAPS retrieval failed`, { detail: result?.error || 'Unknown error', duration: 8000 });
                     }
                   } catch (e) {
                     updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed', completedAt: new Date().toISOString(), output: e.message });
-                    appendAudit({ action: 'laps.retrieve', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...selectedIds], parameters: {}, result: 'failed', error: e.message });
+                    appendAudit({ action: 'laps.retrieve', actionCategory: 'Scripts', targetType: 'Host', targetIds: [...lapsSelectedIds], parameters: {}, result: 'failed', error: e.message });
                     toast.error(`LAPS retrieval failed`, { detail: e.message, duration: 8000 });
                   }
                 }}>Retrieve Passwords</ActionButton>
@@ -8666,7 +8844,7 @@
   // AUDIT SCREEN — Persistent audit log from SQLite
   // ============================================================
   const AuditScreen = () => {
-    const { toast } = useApp();
+    const toast = useToast();
     const [entries, setEntries] = useState([]);
     const [loading, setLoading] = useState(true);
     const [search, setSearch] = useState('');

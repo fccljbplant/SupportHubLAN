@@ -354,7 +354,18 @@ const audit = {
       (e.action || '').toLowerCase().includes(q) || (e.output || '').toLowerCase().includes(q) || (e.parameters || '').toLowerCase().includes(q)
     ).reverse().slice(0, limit);
   },
-  clear: () => { const s = loadStore(); s.audit_log = []; saveStore(); return { success: true }; },
+  clear: (olderThanDays = null) => {
+    const s = loadStore();
+    if (olderThanDays && olderThanDays > 0) {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - olderThanDays);
+      s.audit_log = s.audit_log.filter(e => new Date(e.timestamp) > cutoff);
+    } else {
+      s.audit_log = [];
+    }
+    saveStore();
+    return { success: true };
+  },
 };
 
 // ==========================================================================

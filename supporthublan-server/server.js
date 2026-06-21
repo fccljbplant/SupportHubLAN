@@ -155,20 +155,20 @@ function sanitizeHost(h) {
 
 // ==========================================================================
 // AUTHENTICATION — Simple single-user login (no invites, no user management)
-// Username + password from .env: APP_USER / APP_PASS
+// Username + password from .env: ADMIN_USER / ADMIN_PASS
 // Returns a session token (stored in memory — lost on restart)
 // ==========================================================================
 const SESSION_TOKENS = new Set();
 
 app.post('/api/auth/login', (req, res) => {
   const { username, password } = req.body;
-  if (!APP_USER || !APP_PASS) {
+  if (!ADMIN_USER || !ADMIN_PASS) {
     // If no credentials configured, allow access without login
     const token = 'no-auth-' + Date.now();
     SESSION_TOKENS.add(token);
     return res.json({ success: true, token, user: { username: 'admin', role: 'Admin' } });
   }
-  if (username === APP_USER && password === APP_PASS) {
+  if (username === ADMIN_USER && password === ADMIN_PASS) {
     const token = crypto.randomBytes(32).toString('hex');
     SESSION_TOKENS.add(token);
     db.audit.add({ action: 'auth.login', category: 'Security', result: 'success', parameters: { username } });
@@ -180,11 +180,11 @@ app.post('/api/auth/login', (req, res) => {
 
 app.post('/api/auth/check', (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!APP_USER || !APP_PASS) {
+  if (!ADMIN_USER || !ADMIN_PASS) {
     return res.json({ success: true, authenticated: true, user: { username: 'admin', role: 'Admin' } });
   }
   if (token && SESSION_TOKENS.has(token)) {
-    return res.json({ success: true, authenticated: true, user: { username: APP_USER, role: 'Admin' } });
+    return res.json({ success: true, authenticated: true, user: { username: ADMIN_USER, role: 'Admin' } });
   }
   res.json({ success: true, authenticated: false });
 });
@@ -195,9 +195,9 @@ app.post('/api/auth/logout', (req, res) => {
   res.json({ success: true });
 });
 
-// Auth middleware — only applied when APP_USER + APP_PASS are set
+// Auth middleware — only applied when ADMIN_USER + ADMIN_PASS are set
 function requireAuth(req, res, next) {
-  if (!APP_USER || !APP_PASS) return next(); // No auth configured
+  if (!ADMIN_USER || !ADMIN_PASS) return next(); // No auth configured
   // Skip auth for health check, login, static files, WebSocket
   if (req.path === '/api/health' || req.path === '/api/auth/login' || req.path === '/api/auth/check' ||
       req.path === '/' || req.path.startsWith('/vendor/') || req.path.endsWith('.html') || req.path === '/ws') {
@@ -1006,6 +1006,58 @@ app.post('/api/deploy/package', async (req, res) => {
     $results | ConvertTo-Json -Depth 4 -Compress
   `;
   const result = await runPowerShell(script, 300000);
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
+});
+
+// ==========================================================================
+// COPY FILES — Copy files/folders to remote hosts via SMB (Copy-Item)
+// ==========================================================================
+app.post('/api/deploy/copy', async (req, res) => {
+  const { hostnames, sourcePath, destinationPath, credential } = req.body;
+  const hostList = hostnames.map(sanitizeHost);
+  const safeSrc = String(sourcePath || '').replace(/"/g, '`"').replace(/'/g, "''");
+  const safeDst = String(destinationPath || '').replace(/"/g, '`"').replace(/'/g, "''");
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
+  const script = `
+    ${credential ? buildCredentialBlock(credential) : ''}
+    $results = @()
+    foreach ($h in @('${hostList.join("','")}')) {
+      try {
+        $remotePath = "\\\\$h\\${safeDst.replace(/\\/g, '$').replace(':', '$')}"
+        Copy-Item '${safeSrc}' $remotePath -Recurse -Force -ErrorAction Stop
+        $results += @{ hostname = $h; success = $true }
+      } catch {
+        $results += @{ hostname = $h; success = $false; error = $_.Exception.Message }
+      }
+    }
+    $results | ConvertTo-Json -Depth 3 -Compress
+  `;
+  const result = await runPowerShell(script, 120000);
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
+});
+
+// ==========================================================================
+// CHECK PENDING REBOOT — Check if hosts need a reboot via PsExec + registry
+// ==========================================================================
+app.post('/api/power/check-pending', async (req, res) => {
+  const { hostnames, credential } = req.body;
+  const hostList = hostnames.map(sanitizeHost);
+  const pstools = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
+  const script = `
+    $results = @()
+    foreach ($h in @('${hostList.join("','")}')) {
+      try {
+        $check = "& '${pstools}psexec.exe' \\\\$h -accepteula -s -h powershell -NoProfile -Command \"if ((Test-Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending') -or (Test-Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired')) { 'PENDING' } else { 'NONE' }\""
+        $output = Invoke-Expression $check 2>&1 | Out-String
+        $pending = $output -match 'PENDING'
+        $results += @{ hostname = $h; pendingReboot = $pending; status = if ($pending) { 'pending' } else { 'none' } }
+      } catch {
+        $results += @{ hostname = $h; pendingReboot = $false; error = $_.Exception.Message }
+      }
+    }
+    $results | ConvertTo-Json -Depth 3 -Compress
+  `;
+  const result = await runPowerShell(script, 60000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 

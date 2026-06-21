@@ -1,94 +1,104 @@
 /* ==========================================================================
-   SupportHubLAN SQLite Database Layer with AES-256-GCM Encryption
+   SupportHubLAN Data Layer — Encrypted JSON File Storage
    ==========================================================================
-   Tables:
-     - inventories     : multiple named inventories (each = one tab in UI)
-     - hosts           : hosts within an inventory
-     - credentials     : encrypted credentials (domain creds, service accounts)
-     - audit_log       : persistent audit trail
-     - jobs            : job history
-     - settings        : key/value settings store
+   All data is stored in a single file: data/supporthublan-data.enc
 
-   Encryption:
-     - Master passphrase from .env DB_PASSPHRASE (default: 'supporthublan-default')
-     - Per-row AES-256-GCM with random 16-byte IV per encryption
-     - Stored format: base64(iv(16) + ciphertext + tag(16))
+   The ENTIRE file is encrypted with AES-256-GCM. The encryption key is
+   derived from DB_PASSPHRASE (set in .env) using PBKDF2 (100k iterations,
+   SHA-256). Without the passphrase, the data is unrecoverable.
+
+   File format:
+     bytes 0-15:   salt (random, generated on first run)
+     bytes 16-27:  IV (random, per save)
+     bytes 28-end: AES-256-GCM ciphertext + 16-byte auth tag
+
+   The decrypted content is JSON with this structure:
+     {
+       inventories: [...],
+       hosts: [...],
+       credentials: [...],  // passwords ALSO individually encrypted
+       audit_log: [...],
+       jobs: [...],
+       settings: {...}
+     }
+
+   No external dependencies. No native modules. Pure Node.js crypto.
    ========================================================================== */
-
-// Try to load better-sqlite3 (native module). If it fails (not installed or
-// platform mismatch), fall back to JSON file storage so the app still works
-// without `npm install`. This makes the app runnable from a plain Node.js
-// runtime with zero dependencies installed.
-let Database = null;
-let USE_JSON_FALLBACK = false;
-try {
-  Database = require('better-sqlite3');
-} catch (e) {
-  USE_JSON_FALLBACK = true;
-  console.log('[db] better-sqlite3 not available — using JSON file fallback (no npm install needed)');
-  console.log('[db] To enable SQLite + encrypted credentials, run: npm install better-sqlite3');
-}
 
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 
-const DB_PATH = path.join(__dirname, 'data', 'supporthublan.db');
-const JSON_PATH = path.join(__dirname, 'data', 'supporthublan-data.json');
-const DB_PASSPHRASE = process.env.DB_PASSPHRASE || 'supporthublan-default';
+const DATA_DIR = path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'supporthublan-data.enc');
+const DB_PASSPHRASE = process.env.DB_PASSPHRASE || 'supporthublan-default-change-me';
 
 // Ensure data directory exists
-const dataDir = path.dirname(DB_PATH);
-if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// ---- JSON fallback store (used when better-sqlite3 is not installed) ----
-// Stores all data in a single JSON file. Not as robust as SQLite but works
-// with zero dependencies — perfect for the portable installer.
-let _jsonStore = null;
-function loadJsonStore() {
-  if (_jsonStore) return _jsonStore;
-  try {
-    if (fs.existsSync(JSON_PATH)) {
-      _jsonStore = JSON.parse(fs.readFileSync(JSON_PATH, 'utf8'));
-    } else {
-      _jsonStore = {
-        inventories: [{ id: 1, name: 'Main Inventory', description: 'Default inventory', color: 'blue', is_active: 1, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }],
-        hosts: [],
-        credentials: [],
-        audit_log: [],
-        jobs: [],
-        settings: {},
-        _nextId: { inventories: 2, hosts: 1, credentials: 1, audit_log: 1 },
-      };
-      saveJsonStore();
-    }
-  } catch (e) {
-    _jsonStore = { inventories: [], hosts: [], credentials: [], audit_log: [], jobs: [], settings: {}, _nextId: {} };
+// ---- Derive master key from passphrase ----
+// The salt is stored at the beginning of the data file. On first run, we
+// generate a random salt. On subsequent runs, we read it from the file.
+let _salt = null;
+let _masterKey = null;
+
+function getMasterKey() {
+  if (_masterKey) return _masterKey;
+  // If the data file exists, read the salt from it
+  if (fs.existsSync(DATA_FILE)) {
+    try {
+      const buf = fs.readFileSync(DATA_FILE);
+      if (buf.length > 16) {
+        _salt = buf.slice(0, 16);
+      }
+    } catch (e) {}
   }
-  return _jsonStore;
+  if (!_salt) {
+    _salt = crypto.randomBytes(16);
+  }
+  _masterKey = crypto.pbkdf2Sync(DB_PASSPHRASE, _salt, 100000, 32, 'sha256');
+  return _masterKey;
 }
-function saveJsonStore() {
-  if (!_jsonStore) return;
+
+// ---- AES-256-GCM encrypt/decrypt for the entire data file ----
+function encryptData(jsonString) {
+  const key = getMasterKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const enc = Buffer.concat([cipher.update(jsonString, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  // Pack: salt(16) + iv(12) + ciphertext + tag(16)
+  return Buffer.concat([_salt, iv, enc, tag]);
+}
+
+function decryptData(buf) {
+  if (buf.length < 44) return null; // minimum: salt(16) + iv(12) + tag(16)
   try {
-    fs.writeFileSync(JSON_PATH, JSON.stringify(_jsonStore, null, 2), 'utf8');
+    _salt = buf.slice(0, 16);
+    const key = crypto.pbkdf2Sync(DB_PASSPHRASE, _salt, 100000, 32, 'sha256');
+    _masterKey = key;
+    const iv = buf.slice(16, 28);
+    const tag = buf.slice(buf.length - 16);
+    const ciphertext = buf.slice(28, buf.length - 16);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    const dec = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return dec.toString('utf8');
   } catch (e) {
-    console.error('[db] Failed to save JSON store:', e.message);
+    console.error('[db] Failed to decrypt data file:', e.message);
+    console.error('[db] Wrong DB_PASSPHRASE? Data cannot be recovered without the correct passphrase.');
+    return null;
   }
 }
-function jsonNextId(table) {
-  const s = loadJsonStore();
-  if (!s._nextId[table]) s._nextId[table] = 1;
-  return s._nextId[table]++;
-}
 
-// Derive a 256-bit key from the passphrase using PBKDF2 (100k iterations, SHA-256)
-const MASTER_KEY = crypto.pbkdf2Sync(DB_PASSPHRASE, 'supporthublan-salt-v1', 100000, 32, 'sha256');
-
-// ---- AES-256-GCM encrypt/decrypt helpers ----
+// ---- AES-256-GCM encrypt/decrypt for individual credential passwords ----
+// This adds a SECOND layer of encryption for credential passwords — even if
+// the main data file is decrypted, individual passwords remain encrypted.
 function encryptField(plaintext) {
   if (plaintext === null || plaintext === undefined) return null;
+  const key = getMasterKey();
   const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const enc = Buffer.concat([cipher.update(String(plaintext), 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
   return Buffer.concat([iv, enc, tag]).toString('base64');
@@ -97,11 +107,12 @@ function encryptField(plaintext) {
 function decryptField(b64) {
   if (!b64) return null;
   try {
+    const key = getMasterKey();
     const buf = Buffer.from(b64, 'base64');
     const iv = buf.slice(0, 16);
     const tag = buf.slice(buf.length - 16);
     const ciphertext = buf.slice(16, buf.length - 16);
-    const decipher = crypto.createDecipheriv('aes-256-gcm', MASTER_KEY, iv);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
     decipher.setAuthTag(tag);
     const dec = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
     return dec.toString('utf8');
@@ -110,191 +121,120 @@ function decryptField(b64) {
   }
 }
 
-// ---- Open DB (or use JSON fallback) ----
-let db = null;
-if (!USE_JSON_FALLBACK) {
+// ---- In-memory store ----
+let _store = null;
+let _nextId = { inventories: 1, hosts: 1, credentials: 1, audit_log: 1 };
+
+function loadStore() {
+  if (_store) return _store;
   try {
-    db = new Database(DB_PATH);
-    db.pragma('journal_mode = WAL');
-    db.pragma('foreign_keys = ON');
+    if (fs.existsSync(DATA_FILE)) {
+      const buf = fs.readFileSync(DATA_FILE);
+      const json = decryptData(buf);
+      if (json) {
+        _store = JSON.parse(json);
+        // Restore _nextId counters from existing data
+        if (_store.inventories && _store.inventories.length > 0) {
+          _nextId.inventories = Math.max(..._store.inventories.map(i => i.id)) + 1;
+        }
+        if (_store.hosts && _store.hosts.length > 0) {
+          _nextId.hosts = Math.max(..._store.hosts.map(h => h.id)) + 1;
+        }
+        if (_store.credentials && _store.credentials.length > 0) {
+          _nextId.credentials = Math.max(..._store.credentials.map(c => c.id)) + 1;
+        }
+        if (_store.audit_log && _store.audit_log.length > 0) {
+          _nextId.audit_log = Math.max(..._store.audit_log.map(a => a.id)) + 1;
+        }
+        return _store;
+      }
+    }
   } catch (e) {
-    console.log('[db] Failed to open SQLite, falling back to JSON:', e.message);
-    USE_JSON_FALLBACK = true;
-    db = null;
+    console.error('[db] Error loading store:', e.message);
+  }
+  // Create default store
+  _store = {
+    inventories: [{ id: 1, name: 'Main Inventory', description: 'Default inventory', color: 'blue', is_active: 1, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }],
+    hosts: [],
+    credentials: [],
+    audit_log: [],
+    jobs: [],
+    settings: {},
+  };
+  _nextId = { inventories: 2, hosts: 1, credentials: 1, audit_log: 1 };
+  saveStore();
+  return _store;
+}
+
+function saveStore() {
+  if (!_store) return;
+  try {
+    const json = JSON.stringify(_store, null, 2);
+    const encrypted = encryptData(json);
+    fs.writeFileSync(DATA_FILE, encrypted);
+  } catch (e) {
+    console.error('[db] Failed to save store:', e.message);
   }
 }
 
-// ---- Schema (only when using SQLite) ----
-if (db) {
-db.exec(`
-  CREATE TABLE IF NOT EXISTS inventories (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    description TEXT,
-    color TEXT DEFAULT 'blue',
-    is_active INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT (datetime('now')),
-    updated_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS hosts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    inventory_id INTEGER NOT NULL,
-    hostname TEXT NOT NULL,
-    ip_address TEXT,
-    mac_address TEXT,
-    fqdn TEXT,
-    os TEXT,
-    site TEXT,
-    owner TEXT,
-    department TEXT,
-    tags TEXT,
-    notes TEXT,
-    online_status TEXT DEFAULT 'unknown',
-    patch_state TEXT DEFAULT 'unknown',
-    pending_reboot INTEGER DEFAULT 0,
-    last_seen TEXT,
-    last_audit TEXT,
-    custom_fields TEXT,
-    created_at TEXT DEFAULT (datetime('now')),
-    updated_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (inventory_id) REFERENCES inventories(id) ON DELETE CASCADE,
-    UNIQUE(inventory_id, hostname)
-  );
-
-  CREATE TABLE IF NOT EXISTS credentials (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    inventory_id INTEGER,
-    name TEXT NOT NULL,
-    username TEXT NOT NULL,
-    password_encrypted TEXT NOT NULL,
-    domain TEXT,
-    type TEXT DEFAULT 'domain',
-    created_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (inventory_id) REFERENCES inventories(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT DEFAULT (datetime('now')),
-    action TEXT NOT NULL,
-    category TEXT,
-    target_type TEXT,
-    target_ids TEXT,
-    parameters TEXT,
-    result TEXT,
-    output TEXT,
-    user TEXT,
-    inventory_id INTEGER
-  );
-
-  CREATE TABLE IF NOT EXISTS jobs (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    status TEXT DEFAULT 'queued',
-    progress INTEGER DEFAULT 0,
-    step TEXT,
-    targets TEXT,
-    started_at TEXT,
-    completed_at TEXT,
-    output TEXT,
-    inventory_id INTEGER
-  );
-
-  CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT,
-    updated_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_hosts_inventory ON hosts(inventory_id);
-  CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
-  CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-`);
-
-// ---- Create a default inventory if none exists ----
-const countStmt = db.prepare('SELECT COUNT(*) as c FROM inventories');
-const { c: invCount } = countStmt.get();
-if (invCount === 0) {
-  db.prepare("INSERT INTO inventories (name, description, color, is_active) VALUES (?, ?, ?, 1)")
-    .run('Main Inventory', 'Default inventory', 'blue');
+function nextId(table) {
+  if (!_nextId[table]) _nextId[table] = 1;
+  return _nextId[table]++;
 }
-} // end if (db)
 
 // ==========================================================================
 // INVENTORIES
 // ==========================================================================
-const inventories = USE_JSON_FALLBACK ? {
-  list: () => loadJsonStore().inventories,
-  get: (id) => loadJsonStore().inventories.find(i => i.id === id),
-  getActive: () => loadJsonStore().inventories.find(i => i.is_active === 1) || loadJsonStore().inventories[0],
+const inventories = {
+  list: () => loadStore().inventories,
+  get: (id) => loadStore().inventories.find(i => i.id === id),
+  getActive: () => loadStore().inventories.find(i => i.is_active === 1) || loadStore().inventories[0],
   create: (name, description, color) => {
     try {
-      const s = loadJsonStore();
-      const id = jsonNextId('inventories');
+      const s = loadStore();
+      const id = nextId('inventories');
       s.inventories.push({ id, name, description: description || '', color: color || 'blue', is_active: 0, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
-      saveJsonStore();
+      saveStore();
       return { success: true, id };
     } catch (e) { return { success: false, error: e.message }; }
   },
   rename: (id, name, description) => {
-    const s = loadJsonStore();
+    const s = loadStore();
     const inv = s.inventories.find(i => i.id === id);
-    if (inv) { inv.name = name; inv.description = description || ''; inv.updated_at = new Date().toISOString(); saveJsonStore(); return { success: true }; }
+    if (inv) { inv.name = name; inv.description = description || ''; inv.updated_at = new Date().toISOString(); saveStore(); return { success: true }; }
+    return { success: false, error: 'not found' };
+  },
+  setColor: (id, color) => {
+    const s = loadStore();
+    const inv = s.inventories.find(i => i.id === id);
+    if (inv) { inv.color = color; saveStore(); return { success: true }; }
     return { success: false, error: 'not found' };
   },
   setActive: (id) => {
-    const s = loadJsonStore();
+    const s = loadStore();
     s.inventories.forEach(i => { i.is_active = (i.id === id) ? 1 : 0; });
-    saveJsonStore();
+    saveStore();
     return { success: true };
   },
   delete: (id) => {
-    const s = loadJsonStore();
+    const s = loadStore();
     if (s.inventories.length <= 1) return { success: false, error: 'Cannot delete the last inventory' };
     s.inventories = s.inventories.filter(i => i.id !== id);
     s.hosts = s.hosts.filter(h => h.inventory_id !== id);
-    saveJsonStore();
+    saveStore();
     return { success: true };
-  },
-} : {
-  list: () => db.prepare('SELECT * FROM inventories ORDER BY id').all(),
-  get: (id) => db.prepare('SELECT * FROM inventories WHERE id = ?').get(id),
-  getActive: () => db.prepare('SELECT * FROM inventories WHERE is_active = 1 LIMIT 1').get(),
-  create: (name, description, color) => {
-    try {
-      const info = db.prepare('INSERT INTO inventories (name, description, color) VALUES (?, ?, ?)').run(name, description || '', color || 'blue');
-      return { success: true, id: info.lastInsertRowid };
-    } catch (e) { return { success: false, error: e.message }; }
-  },
-  rename: (id, name, description) => {
-    try {
-      db.prepare('UPDATE inventories SET name = ?, description = ?, updated_at = datetime(\'now\') WHERE id = ?').run(name, description || '', id);
-      return { success: true };
-    } catch (e) { return { success: false, error: e.message }; }
-  },
-  setActive: (id) => {
-    db.prepare('UPDATE inventories SET is_active = 0').run();
-    db.prepare('UPDATE inventories SET is_active = 1, updated_at = datetime(\'now\') WHERE id = ?').run(id);
-    return { success: true };
-  },
-  delete: (id) => {
-    try {
-      db.prepare('DELETE FROM inventories WHERE id = ?').run(id);
-      return { success: true };
-    } catch (e) { return { success: false, error: e.message }; }
   },
 };
 
 // ==========================================================================
-// HOSTS (within an inventory)
+// HOSTS
 // ==========================================================================
-const hosts = USE_JSON_FALLBACK ? {
-  list: (inventoryId) => loadJsonStore().hosts.filter(h => h.inventory_id === inventoryId).sort((a, b) => a.hostname.localeCompare(b.hostname)),
-  get: (id) => loadJsonStore().hosts.find(h => h.id === id),
-  getByHostname: (inventoryId, hostname) => loadJsonStore().hosts.find(h => h.inventory_id === inventoryId && h.hostname === hostname),
+const hosts = {
+  list: (inventoryId) => loadStore().hosts.filter(h => h.inventory_id === inventoryId).sort((a, b) => a.hostname.localeCompare(b.hostname)),
+  get: (id) => loadStore().hosts.find(h => h.id === id),
+  getByHostname: (inventoryId, hostname) => loadStore().hosts.find(h => h.inventory_id === inventoryId && h.hostname === hostname),
   upsert: (inventoryId, host) => {
-    const s = loadJsonStore();
+    const s = loadStore();
     const existing = s.hosts.find(h => h.inventory_id === inventoryId && h.hostname === host.hostname);
     if (existing) {
       Object.assign(existing, {
@@ -305,10 +245,10 @@ const hosts = USE_JSON_FALLBACK ? {
         tags: host.tags || null, notes: host.notes || null,
         updated_at: new Date().toISOString(),
       });
-      saveJsonStore();
+      saveStore();
       return { success: true, id: existing.id, updated: true };
     }
-    const id = jsonNextId('hosts');
+    const id = nextId('hosts');
     s.hosts.push({
       id, inventory_id: inventoryId, hostname: host.hostname,
       ip_address: host.ipAddress || host.ip_address || null,
@@ -319,29 +259,29 @@ const hosts = USE_JSON_FALLBACK ? {
       online_status: 'unknown', patch_state: 'unknown', pending_reboot: 0,
       created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
     });
-    saveJsonStore();
+    saveStore();
     return { success: true, id, updated: false };
   },
   update: (id, fields) => {
-    const s = loadJsonStore();
+    const s = loadStore();
     const h = s.hosts.find(x => x.id === id);
     if (!h) return { success: false, error: 'not found' };
     const allowed = ['hostname', 'ip_address', 'mac_address', 'fqdn', 'os', 'site', 'owner', 'department', 'tags', 'notes', 'online_status', 'patch_state', 'pending_reboot', 'last_seen', 'last_audit', 'custom_fields'];
     for (const k of allowed) { if (fields[k] !== undefined) h[k] = fields[k]; }
     h.updated_at = new Date().toISOString();
-    saveJsonStore();
+    saveStore();
     return { success: true };
   },
   delete: (id) => {
-    const s = loadJsonStore();
+    const s = loadStore();
     s.hosts = s.hosts.filter(h => h.id !== id);
-    saveJsonStore();
+    saveStore();
     return { success: true };
   },
   deleteAll: (inventoryId) => {
-    const s = loadJsonStore();
+    const s = loadStore();
     s.hosts = s.hosts.filter(h => h.inventory_id !== inventoryId);
-    saveJsonStore();
+    saveStore();
     return { success: true };
   },
   bulkUpsert: (inventoryId, hostList) => {
@@ -352,122 +292,50 @@ const hosts = USE_JSON_FALLBACK ? {
     }
     return { success: true, inserted, updated, failed };
   },
-} : {
-  list: (inventoryId) => db.prepare('SELECT * FROM hosts WHERE inventory_id = ? ORDER BY hostname').all(inventoryId),
-  get: (id) => db.prepare('SELECT * FROM hosts WHERE id = ?').get(id),
-  getByHostname: (inventoryId, hostname) => db.prepare('SELECT * FROM hosts WHERE inventory_id = ? AND hostname = ?').get(inventoryId, hostname),
-  upsert: (inventoryId, host) => {
-    const existing = db.prepare('SELECT id FROM hosts WHERE inventory_id = ? AND hostname = ?').get(inventoryId, host.hostname);
-    if (existing) {
-      db.prepare(`UPDATE hosts SET
-        ip_address = ?, mac_address = ?, fqdn = ?, os = ?, site = ?, owner = ?, department = ?,
-        tags = ?, notes = ?, updated_at = datetime('now')
-        WHERE id = ?`).run(
-        host.ipAddress || host.ip_address || null,
-        host.macAddress || host.mac_address || null,
-        host.fqdn || null, host.os || null, host.site || null,
-        host.owner || null, host.department || null,
-        host.tags || null, host.notes || null, existing.id
-      );
-      return { success: true, id: existing.id, updated: true };
-    }
-    const info = db.prepare(`INSERT INTO hosts
-      (inventory_id, hostname, ip_address, mac_address, fqdn, os, site, owner, department, tags, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      inventoryId, host.hostname,
-      host.ipAddress || host.ip_address || null,
-      host.macAddress || host.mac_address || null,
-      host.fqdn || null, host.os || null, host.site || null,
-      host.owner || null, host.department || null,
-      host.tags || null, host.notes || null
-    );
-    return { success: true, id: info.lastInsertRowid, updated: false };
-  },
-  update: (id, fields) => {
-    const allowed = ['hostname', 'ip_address', 'mac_address', 'fqdn', 'os', 'site', 'owner', 'department', 'tags', 'notes', 'online_status', 'patch_state', 'pending_reboot', 'last_seen', 'last_audit', 'custom_fields'];
-    const sets = []; const vals = [];
-    for (const k of allowed) { if (fields[k] !== undefined) { sets.push(`${k} = ?`); vals.push(fields[k]); } }
-    if (sets.length === 0) return { success: false, error: 'No valid fields' };
-    sets.push(`updated_at = datetime('now')`); vals.push(id);
-    db.prepare(`UPDATE hosts SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
-    return { success: true };
-  },
-  delete: (id) => { db.prepare('DELETE FROM hosts WHERE id = ?').run(id); return { success: true }; },
-  deleteAll: (inventoryId) => { db.prepare('DELETE FROM hosts WHERE inventory_id = ?').run(inventoryId); return { success: true }; },
-  bulkUpsert: (inventoryId, hostList) => {
-    let inserted = 0, updated = 0, failed = 0;
-    const tx = db.transaction((items) => {
-      for (const h of items) {
-        const r = hosts.upsert(inventoryId, h);
-        if (r.success) { r.updated ? updated++ : inserted++; } else { failed++; }
-      }
-    });
-    tx(hostList);
-    return { success: true, inserted, updated, failed };
-  },
 };
 
 // ==========================================================================
-// CREDENTIALS (encrypted at rest — only when SQLite is available;
-//              JSON fallback stores passwords in plaintext with a warning)
+// CREDENTIALS — passwords encrypted with AES-256-GCM (double encryption:
+//              the whole data file is encrypted, AND each password is
+//              individually encrypted within the JSON)
 // ==========================================================================
-const credentials = USE_JSON_FALLBACK ? {
+const credentials = {
   list: (inventoryId) => {
-    const s = loadJsonStore();
+    const s = loadStore();
     return s.credentials
       .filter(c => !inventoryId || c.inventory_id === inventoryId || c.inventory_id === null)
       .map(c => ({ id: c.id, inventory_id: c.inventory_id, name: c.name, username: c.username, domain: c.domain, type: c.type, created_at: c.created_at }));
   },
   get: (id) => {
-    const c = loadJsonStore().credentials.find(x => x.id === id);
-    if (c) return { ...c, password: c.password_encrypted }; // plaintext in JSON fallback
+    const c = loadStore().credentials.find(x => x.id === id);
+    if (c) return { ...c, password: decryptField(c.password_encrypted) };
     return null;
   },
   create: (inventoryId, name, username, password, domain, type) => {
     try {
-      const s = loadJsonStore();
-      const id = jsonNextId('credentials');
-      s.credentials.push({ id, inventory_id: inventoryId || null, name, username, password_encrypted: password, domain: domain || null, type: type || 'domain', created_at: new Date().toISOString() });
-      saveJsonStore();
+      const s = loadStore();
+      const id = nextId('credentials');
+      s.credentials.push({ id, inventory_id: inventoryId || null, name, username, password_encrypted: encryptField(password), domain: domain || null, type: type || 'domain', created_at: new Date().toISOString() });
+      saveStore();
       return { success: true, id };
     } catch (e) { return { success: false, error: e.message }; }
   },
   delete: (id) => {
-    const s = loadJsonStore();
+    const s = loadStore();
     s.credentials = s.credentials.filter(c => c.id !== id);
-    saveJsonStore();
+    saveStore();
     return { success: true };
   },
-} : {
-  list: (inventoryId) => {
-    const rows = inventoryId
-      ? db.prepare('SELECT id, inventory_id, name, username, domain, type, created_at FROM credentials WHERE inventory_id = ? OR inventory_id IS NULL ORDER BY name').all(inventoryId)
-      : db.prepare('SELECT id, inventory_id, name, username, domain, type, created_at FROM credentials ORDER BY name').all();
-    return rows;
-  },
-  get: (id) => {
-    const row = db.prepare('SELECT * FROM credentials WHERE id = ?').get(id);
-    if (row) row.password = decryptField(row.password_encrypted);
-    return row;
-  },
-  create: (inventoryId, name, username, password, domain, type) => {
-    try {
-      const info = db.prepare('INSERT INTO credentials (inventory_id, name, username, password_encrypted, domain, type) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(inventoryId || null, name, username, encryptField(password), domain || null, type || 'domain');
-      return { success: true, id: info.lastInsertRowid };
-    } catch (e) { return { success: false, error: e.message }; }
-  },
-  delete: (id) => { db.prepare('DELETE FROM credentials WHERE id = ?').run(id); return { success: true }; },
 };
 
 // ==========================================================================
 // AUDIT LOG
 // ==========================================================================
-const audit = USE_JSON_FALLBACK ? {
+const audit = {
   add: (entry) => {
-    const s = loadJsonStore();
+    const s = loadStore();
     s.audit_log.push({
-      id: jsonNextId('audit_log'), timestamp: new Date().toISOString(),
+      id: nextId('audit_log'), timestamp: new Date().toISOString(),
       action: entry.action || '', category: entry.category || null,
       target_type: entry.targetType || null,
       target_ids: entry.targetIds ? JSON.stringify(entry.targetIds) : null,
@@ -475,47 +343,26 @@ const audit = USE_JSON_FALLBACK ? {
       result: entry.result || 'unknown', output: entry.output || null,
       user: entry.user || 'admin', inventory_id: entry.inventoryId || null,
     });
-    if (s.audit_log.length > 1000) s.audit_log = s.audit_log.slice(-1000);
-    saveJsonStore();
+    if (s.audit_log.length > 5000) s.audit_log = s.audit_log.slice(-5000);
+    saveStore();
     return { success: true };
   },
-  list: (limit = 200, offset = 0) => loadJsonStore().audit_log.slice().reverse().slice(offset, offset + limit),
+  list: (limit = 200, offset = 0) => loadStore().audit_log.slice().reverse().slice(offset, offset + limit),
   search: (query, limit = 200) => {
     const q = query.toLowerCase();
-    return loadJsonStore().audit_log.filter(e =>
+    return loadStore().audit_log.filter(e =>
       (e.action || '').toLowerCase().includes(q) || (e.output || '').toLowerCase().includes(q) || (e.parameters || '').toLowerCase().includes(q)
     ).reverse().slice(0, limit);
   },
-  clear: () => { const s = loadJsonStore(); s.audit_log = []; saveJsonStore(); return { success: true }; },
-} : {
-  add: (entry) => {
-    db.prepare(`INSERT INTO audit_log (action, category, target_type, target_ids, parameters, result, output, user, inventory_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      entry.action || '', entry.category || null, entry.targetType || null,
-      entry.targetIds ? JSON.stringify(entry.targetIds) : null,
-      entry.parameters ? JSON.stringify(entry.parameters) : null,
-      entry.result || 'unknown', entry.output || null, entry.user || 'admin', entry.inventoryId || null
-    );
-    return { success: true };
-  },
-  list: (limit = 200, offset = 0) => db.prepare('SELECT * FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?').all(limit, offset),
-  search: (query, limit = 200) => {
-    const q = `%${query}%`;
-    return db.prepare(`SELECT * FROM audit_log WHERE action LIKE ? OR output LIKE ? OR parameters LIKE ? ORDER BY id DESC LIMIT ?`).all(q, q, q, limit);
-  },
-  clear: (olderThanDays = null) => {
-    if (olderThanDays) { db.prepare(`DELETE FROM audit_log WHERE timestamp < datetime('now', ?)`).run(`-${olderThanDays} days`); }
-    else { db.prepare('DELETE FROM audit_log').run(); }
-    return { success: true };
-  },
+  clear: () => { const s = loadStore(); s.audit_log = []; saveStore(); return { success: true }; },
 };
 
 // ==========================================================================
 // JOBS
 // ==========================================================================
-const jobs = USE_JSON_FALLBACK ? {
+const jobs = {
   upsert: (job) => {
-    const s = loadJsonStore();
+    const s = loadStore();
     const existing = s.jobs.find(j => j.id === job.id);
     if (existing) {
       if (job.status) existing.status = job.status;
@@ -532,65 +379,33 @@ const jobs = USE_JSON_FALLBACK ? {
         output: job.output || null, inventory_id: job.inventory_id || null,
       });
     }
-    saveJsonStore();
+    saveStore();
     return { success: true };
   },
-  list: (limit = 100) => loadJsonStore().jobs.slice().reverse().slice(0, limit),
-  clear: () => { const s = loadJsonStore(); s.jobs = []; saveJsonStore(); return { success: true }; },
-} : {
-  upsert: (job) => {
-    db.prepare(`INSERT INTO jobs (id, name, status, progress, step, targets, started_at, completed_at, output, inventory_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        status = COALESCE(excluded.status, status),
-        progress = COALESCE(excluded.progress, progress),
-        step = COALESCE(excluded.step, step),
-        completed_at = COALESCE(excluded.completed_at, completed_at),
-        output = COALESCE(excluded.output, output)
-    `).run(
-      job.id, job.name || '', job.status || 'queued', job.progress || 0,
-      job.step || null, job.targets ? JSON.stringify(job.targets) : null,
-      job.started_at || null, job.completed_at || null,
-      job.output || null, job.inventory_id || null
-    );
-    return { success: true };
-  },
-  list: (limit = 100) => db.prepare('SELECT * FROM jobs ORDER BY started_at DESC LIMIT ?').all(limit),
-  clear: () => { db.prepare('DELETE FROM jobs').run(); return { success: true }; },
+  list: (limit = 100) => loadStore().jobs.slice().reverse().slice(0, limit),
+  clear: () => { const s = loadStore(); s.jobs = []; saveStore(); return { success: true }; },
 };
 
 // ==========================================================================
-// SETTINGS (key/value)
+// SETTINGS
 // ==========================================================================
-const settings = USE_JSON_FALLBACK ? {
+const settings = {
   get: (key, defaultValue = null) => {
-    const s = loadJsonStore();
+    const s = loadStore();
     return s.settings[key] !== undefined ? s.settings[key] : defaultValue;
   },
   set: (key, value) => {
-    const s = loadJsonStore();
+    const s = loadStore();
     s.settings[key] = String(value);
-    saveJsonStore();
+    saveStore();
     return { success: true };
   },
-  getAll: () => loadJsonStore().settings,
-} : {
-  get: (key, defaultValue = null) => {
-    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
-    return row ? row.value : defaultValue;
-  },
-  set: (key, value) => {
-    db.prepare('INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime(\'now\')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime(\'now\')').run(key, String(value));
-    return { success: true };
-  },
-  getAll: () => {
-    const rows = db.prepare('SELECT key, value FROM settings').all();
-    const obj = {}; rows.forEach(r => obj[r.key] = r.value); return obj;
-  },
+  getAll: () => loadStore().settings,
 };
 
 module.exports = {
-  db, encryptField, decryptField,
+  encryptField, decryptField,
   inventories, hosts, credentials, audit, jobs, settings,
-  USE_JSON_FALLBACK,
+  USE_JSON_FALLBACK: true, // kept for backward compat (server.js checks this)
+  db: null, // kept for backward compat
 };

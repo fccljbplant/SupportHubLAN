@@ -1,5 +1,5 @@
 /* ==========================================================================
-   SupportHubLAN Backend Server v1.4.7
+   SupportHubLAN Backend Server v2.0.0
    ==========================================================================
    This server runs on a Windows machine with admin privileges and performs
    REAL Windows administration tasks on remote hosts via:
@@ -177,7 +177,7 @@ app.get('/api/health', (req, res) => {
     success: true,
     data: {
       server: 'SupportHubLAN Backend',
-      version: '1.4.7',
+      version: '2.0.0',
       platform: os.platform(),
       hostname: os.hostname(),
       port: PORT,
@@ -243,11 +243,7 @@ app.put('/api/inventories/:id', (req, res) => {
   const id = parseInt(req.params.id, 10);
   const { name, description, color } = req.body;
   const r = db.inventories.rename(id, name, description || '');
-  if (color && db.db) db.db.prepare('UPDATE inventories SET color = ? WHERE id = ?').run(color, id);
-  else if (color && db.USE_JSON_FALLBACK) {
-    const inv = db.inventories.get(id);
-    if (inv) { inv.color = color; }
-  }
+  if (color) db.inventories.setColor(id, color);
   res.json(r);
 });
 
@@ -1303,7 +1299,7 @@ server.listen(PORT, BIND_ADDRESS, () => {
   const displayIp = BIND_ADDRESS === '0.0.0.0' ? 'localhost' : BIND_ADDRESS;
   console.log(`
 ╔══════════════════════════════════════════════════════════════════╗
-║  SupportHubLAN Backend Server v1.4.7                             ║
+║  SupportHubLAN Backend Server v2.0.0                             ║
 ║  Listening on http://${displayIp}:${PORT}                            ║
 ║                                                                  ║
 ║  ✓ Serving frontend at /                                         ║

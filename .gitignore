@@ -5,8 +5,13 @@ node_modules/
 Thumbs.db
 *.bps
 
-# SQLite database + WAL files (contains encrypted credentials + audit log)
+# Encrypted data file (contains all app data — inventories, hosts, credentials, audit log)
 supporthublan-server/data/
+*.enc
 *.db
 *.db-wal
 *.db-shm
+
+# Build artifacts
+SupportHubLAN-Setup.exe
+build-installer.bat.local

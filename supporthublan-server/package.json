@@ -1,6 +1,6 @@
 {
   "name": "supporthublan-server",
-  "version": "4.0.0",
+  "version": "4.0.4",
   "description": "SupportHubLAN Backend — Modular Windows endpoint management via PsTools",
   "main": "server.js",
   "scripts": {

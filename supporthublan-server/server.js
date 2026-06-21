@@ -48,7 +48,7 @@ app.get('/supporthublan.html', function(req, res) { if (fs.existsSync(FRONTEND_P
 // Health check
 app.get('/api/health', function(req, res) {
   const pstoolsInstalled = fs.existsSync(path.join(process.env.PSTOOLS_PATH || 'C:\\PSTools\\', 'psexec.exe'));
-  res.json({ success: true, data: { server: 'SupportHubLAN Backend', version: '4.0.2', platform: os.platform(), hostname: os.hostname(), port: PORT, uptime: process.uptime(), pstoolsPath: process.env.PSTOOLS_PATH || 'C:\\PSTools\\', pstoolsInstalled: pstoolsInstalled } });
+  res.json({ success: true, data: { server: 'SupportHubLAN Backend', version: "4.0.4", platform: os.platform(), hostname: os.hostname(), port: PORT, uptime: process.uptime(), pstoolsPath: process.env.PSTOOLS_PATH || 'C:\\PSTools\\', pstoolsInstalled: pstoolsInstalled } });
 });
 
 // Auth routes
@@ -117,6 +117,7 @@ app.use('/api/power', require('./routes/power')(db));
 app.use('/api/scripts', require('./routes/scripts')(db));
 app.use('/api/deploy', require('./routes/deploy')(db));
 app.use('/api/updates', require('./routes/updates')(db));
+app.use('/api/hardware', require('./routes/hardware')(db));
 app.use('/api/queues', require('./routes/queues')(db, broadcastUpdate));
 app.use('/api', require('./routes/scan')(db, broadcastUpdate));
 app.use('/api/laps', require('./routes/laps')(db));
@@ -166,7 +167,7 @@ app.use(function(err, req, res, next) {
 // Start
 server.listen(PORT, BIND_ADDRESS, function() {
   var displayIp = BIND_ADDRESS === '0.0.0.0' ? 'localhost' : BIND_ADDRESS;
-  console.log('\nSupportHubLAN Backend v4.0.2 — http://' + displayIp + ':' + PORT + '\n');
+  console.log('\nSupportHubLAN Backend v4.0.4 — http://' + displayIp + ':' + PORT + '\n');
   if (AUTO_OPEN && process.platform === 'win32') {
     require('child_process').exec('start http://localhost:' + PORT);
   }

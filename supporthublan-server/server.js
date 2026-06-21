@@ -1432,10 +1432,10 @@ app.post('/api/hosts/:hostname/hardware', async (req, res) => {
     $hw | ConvertTo-Json -Depth 4 -Compress
   `;
 
-  // Encode the script and run via PsExec
+  // Encode the script and run via PsExec using the call operator (&)
   const encodedScript = Buffer.from(psScript, 'utf16le').toString('base64');
-  const cmd = `"${pstools}psexec.exe" \\\\${safeHost} -accepteula -s -h powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encodedScript}`;
-  const result = await runPowerShell(cmd, 60000);
+  const script = `& "${pstools}psexec.exe" \\\\${safeHost} -accepteula -s -h powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encodedScript} 2>&1 | Out-String`;
+  const result = await runPowerShell(script, 60000);
 
   if (result.success && result.stdout) {
     try {

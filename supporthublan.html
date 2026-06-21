@@ -2830,7 +2830,7 @@
         if (json.success && json.data.length > 0) {
           setInventories(json.data);
           const active = json.data.find(i => i.is_active === 1) || json.data[0];
-          setActiveId(active.id);
+          setActiveHostId(active.id);
         }
       } catch (e) {
         // Backend not connected — show only "Local" tab
@@ -2841,7 +2841,7 @@
     useEffect(() => { load(); }, []);
 
     const activate = async (id) => {
-      setActiveId(id);
+      setActiveHostId(id);
       try { localStorage.setItem('supporthublan:active-inventory', String(id)); } catch {}
       if (id > 0) {
         try {

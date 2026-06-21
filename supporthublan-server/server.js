@@ -87,24 +87,9 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS || '*';
 app.use(cors({ origin: ALLOWED_ORIGINS === '*' ? true : ALLOWED_ORIGINS.split(',') }));
 app.use(bodyParser.json({ limit: '50mb' }));
 
-// ---- Optional Basic Auth (only enabled if ADMIN_USER + ADMIN_PASS set) ----
-if (ADMIN_USER && ADMIN_PASS) {
-  app.use((req, res, next) => {
-    // Skip auth for WebSocket upgrade requests and static frontend assets from same origin
-    if (req.path === '/ws' || req.path === '/' || req.path.startsWith('/vendor/') || req.path.endsWith('.html')) {
-      return next();
-    }
-    const auth = req.headers.authorization;
-    if (!auth || !auth.startsWith('Basic ')) {
-      res.setHeader('WWW-Authenticate', 'Basic realm="SupportHubLAN"');
-      return res.status(401).send('Authentication required');
-    }
-    const [user, pass] = Buffer.from(auth.slice(6), 'base64').toString().split(':');
-    if (user === ADMIN_USER && pass === ADMIN_PASS) return next();
-    res.setHeader('WWW-Authenticate', 'Basic realm="SupportHubLAN"');
-    return res.status(401).send('Invalid credentials');
-  });
-}
+// Auth middleware — registered after body-parser, before any routes
+// (defined later but applied here via hoisted function declaration)
+app.use((req, res, next) => requireAuth(req, res, next));
 
 // ---- Static frontend: serve ../supporthublan.html and /vendor/* ----
 const FRONTEND_PATH = path.join(__dirname, '..', 'supporthublan.html');
@@ -166,6 +151,61 @@ function sendResult(res, result) {
 // ---- Helper: Validate hostname/IP (prevent injection) ----
 function sanitizeHost(h) {
   return String(h).replace(/[^a-zA-Z0-9._\-:]/g, '');
+}
+
+// ==========================================================================
+// AUTHENTICATION — Simple single-user login (no invites, no user management)
+// Username + password from .env: APP_USER / APP_PASS
+// Returns a session token (stored in memory — lost on restart)
+// ==========================================================================
+const SESSION_TOKENS = new Set();
+
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body;
+  if (!APP_USER || !APP_PASS) {
+    // If no credentials configured, allow access without login
+    const token = 'no-auth-' + Date.now();
+    SESSION_TOKENS.add(token);
+    return res.json({ success: true, token, user: { username: 'admin', role: 'Admin' } });
+  }
+  if (username === APP_USER && password === APP_PASS) {
+    const token = crypto.randomBytes(32).toString('hex');
+    SESSION_TOKENS.add(token);
+    db.audit.add({ action: 'auth.login', category: 'Security', result: 'success', parameters: { username } });
+    return res.json({ success: true, token, user: { username, role: 'Admin' } });
+  }
+  db.audit.add({ action: 'auth.login', category: 'Security', result: 'failed', parameters: { username } });
+  res.json({ success: false, error: 'Invalid username or password' });
+});
+
+app.post('/api/auth/check', (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!APP_USER || !APP_PASS) {
+    return res.json({ success: true, authenticated: true, user: { username: 'admin', role: 'Admin' } });
+  }
+  if (token && SESSION_TOKENS.has(token)) {
+    return res.json({ success: true, authenticated: true, user: { username: APP_USER, role: 'Admin' } });
+  }
+  res.json({ success: true, authenticated: false });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (token) SESSION_TOKENS.delete(token);
+  res.json({ success: true });
+});
+
+// Auth middleware — only applied when APP_USER + APP_PASS are set
+function requireAuth(req, res, next) {
+  if (!APP_USER || !APP_PASS) return next(); // No auth configured
+  // Skip auth for health check, login, static files, WebSocket
+  if (req.path === '/api/health' || req.path === '/api/auth/login' || req.path === '/api/auth/check' ||
+      req.path === '/' || req.path.startsWith('/vendor/') || req.path.endsWith('.html') || req.path === '/ws') {
+    return next();
+  }
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (token && SESSION_TOKENS.has(token)) return next();
+  res.status(401).json({ success: false, error: 'Not authenticated' });
 }
 
 // ==========================================================================

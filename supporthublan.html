@@ -1643,7 +1643,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v2.0.1';
+  const APP_VERSION = 'v3.0.0';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -1652,7 +1652,7 @@
     { id: 'updates',     label: 'Windows Updates',     icon: 'ShieldCheck', badgeKey: 'updates' },
     { id: 'deployments', label: 'Software Deployment', icon: 'Package' },
     { id: 'scripts',     label: 'Scripts & Commands',  icon: 'Terminal' },
-    { id: 'services',    label: 'Services & Processes', icon: 'Activity' },
+    { id: 'services',    label: 'Services',            icon: 'Activity' },
     { id: 'power',       label: 'Power & Wake-on-LAN', icon: 'Power' },
     { id: 'queue',       label: 'Job Queue',           icon: 'ListOrdered', badgeKey: 'jobs' },
     { id: 'scheduler',   label: 'Scheduler',           icon: 'CalendarClock' },
@@ -1666,7 +1666,7 @@
   const useApp = () => useContext(AppCtx);
 
   // ---- Top Header (56px) ----
-  const TopHeader = ({ onMenuToggle }) => {
+  const TopHeader = ({ onMenuToggle, onLogout, currentUser }) => {
     const { navigate, search, setSearch, hosts, activeJobs, theme, toggleTheme } = useApp();
     const [searchFocused, setSearchFocused] = useState(false);
     const searchRef = useRef(null);
@@ -1809,11 +1809,11 @@
 
           {/* Profile */}
           <div className="relative">
-            <button onClick={() => setProfileOpen(o => !o)} className="flex items-center gap-1.5 px-1.5 py-1 rounded hover:bg-surface-raised" title={CURRENT_USER.username + ' — ' + CURRENT_USER.role}>
-              <div className="w-7 h-7 rounded-full bg-primary/20 border border-primary/40 flex items-center justify-center text-xs font-semibold text-primary">JM</div>
+            <button onClick={() => setProfileOpen(o => !o)} className="flex items-center gap-1.5 px-1.5 py-1 rounded hover:bg-surface-raised" title={(currentUser?.username || 'admin') + ' — ' + (currentUser?.role || 'Admin')}>
+              <div className="w-7 h-7 rounded-full bg-primary/20 border border-primary/40 flex items-center justify-center text-xs font-semibold text-primary">{(currentUser?.username || 'A').charAt(0).toUpperCase()}</div>
               <div className="hidden lg:block text-left">
-                <div className="text-xs font-medium text-text leading-tight">{CURRENT_USER.username}</div>
-                <div className="text-[10px] text-text-dim leading-tight">{CURRENT_USER.role}</div>
+                <div className="text-xs font-medium text-text leading-tight">{currentUser?.username || 'admin'}</div>
+                <div className="text-[10px] text-text-dim leading-tight">{currentUser?.role || 'Admin'}</div>
               </div>
               <Icon name="ChevronDown" size={12} className="hidden sm:block text-text-dim" />
             </button>
@@ -1822,17 +1822,15 @@
                 <div className="fixed inset-0 z-40" onClick={() => setProfileOpen(false)} />
                 <div className="absolute right-0 top-full mt-1 w-56 bg-surface border border-border rounded-lg shadow-raised z-50">
                   <div className="p-2.5 border-b border-border">
-                    <div className="text-xs font-semibold text-text">{CURRENT_USER.username}</div>
-                    <div className="text-[11px] text-text-dim">{CURRENT_USER.email}</div>
-                    <div className="mt-1"><Badge color="primary">{CURRENT_USER.role}</Badge></div>
+                    <div className="text-xs font-semibold text-text">{currentUser?.username || 'admin'}</div>
+                    <div className="mt-1"><Badge color="primary">{currentUser?.role || 'Admin'}</Badge></div>
                   </div>
                   <div className="py-1">
-                    <button className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-text hover:bg-surface-raised"><Icon name="User" size={13} /> Profile</button>
                     <button onClick={() => navigate('settings')} className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-text hover:bg-surface-raised"><Icon name="Settings" size={13} /> Settings</button>
                     <button onClick={() => { toggleTheme(); }} className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-text hover:bg-surface-raised"><Icon name={theme === 'dark' ? 'Sun' : 'Moon'} size={13} /> {theme === 'dark' ? 'Switch to Light mode' : 'Switch to Dark mode'}</button>
                   </div>
                   <div className="py-1 border-t border-border">
-                    <button className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-danger hover:bg-danger/10"><Icon name="LogOut" size={13} /> Sign out</button>
+                    <button onClick={() => { setProfileOpen(false); onLogout && onLogout(); }} className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-danger hover:bg-danger/10"><Icon name="LogOut" size={13} /> Sign out</button>
                   </div>
                 </div>
               </>
@@ -3852,7 +3850,7 @@
           {output && (
             <div>
               <div className="text-meta text-text-dim uppercase mb-1">Output</div>
-              <pre className="p-2 bg-[#0c0e16] border border-border rounded text-[11px] text-gray-300 max-h-60 overflow-y-auto font-mono whitespace-pre-wrap">{output}</pre>
+              <pre className="p-2 bg-surface border border-border rounded text-[11px] text-text max-h-60 overflow-y-auto font-mono whitespace-pre-wrap">{output}</pre>
             </div>
           )}
         </div>
@@ -8042,6 +8040,85 @@
      APP ROOT — wires routing, drawer, toasts, renders AppShell + active screen
      ====================================================================== */
 
+  // ============================================================
+  // LOGIN SCREEN — Single username/password, no invites
+  // ============================================================
+  const LoginScreen = ({ onLogin }) => {
+    const [username, setUsername] = useState('');
+    const [password, setPassword] = useState('');
+    const [error, setError] = useState('');
+    const [loading, setLoading] = useState(false);
+
+    const handleSubmit = async (e) => {
+      e.preventDefault();
+      if (!username.trim() || !password.trim()) { setError('Enter username and password'); return; }
+      setLoading(true);
+      setError('');
+      const result = await onLogin(username.trim(), password);
+      if (!result.success) { setError(result.error || 'Login failed'); }
+      setLoading(false);
+    };
+
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-bg p-4">
+        <div className="w-full max-w-sm">
+          {/* Logo */}
+          <div className="flex flex-col items-center mb-6">
+            <div className="w-14 h-14 rounded-xl bg-primary flex items-center justify-center mb-3">
+              <Icon name="Grid3x3" size={28} className="text-white" />
+            </div>
+            <h1 className="text-xl font-bold text-text">SupportHubLAN</h1>
+            <p className="text-xs text-text-dim mt-1">Windows Endpoint Administration</p>
+          </div>
+
+          {/* Login form */}
+          <form onSubmit={handleSubmit} className="bg-surface border border-border rounded-lg p-6 space-y-4">
+            <div>
+              <label className="block text-xs font-medium text-text-dim mb-1.5">Username</label>
+              <input
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                autoFocus
+                disabled={loading}
+                className="w-full px-3 py-2 text-sm bg-surface-raised border border-border rounded text-text focus:border-primary focus:outline-none"
+                placeholder="admin"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-text-dim mb-1.5">Password</label>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                disabled={loading}
+                className="w-full px-3 py-2 text-sm bg-surface-raised border border-border rounded text-text focus:border-primary focus:outline-none"
+                placeholder="••••••••"
+              />
+            </div>
+            {error && (
+              <div className="p-2 bg-danger/10 border border-danger/30 rounded text-xs text-danger flex items-center gap-1.5">
+                <Icon name="AlertCircle" size={12} /> {error}
+              </div>
+            )}
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full py-2 text-sm font-medium text-white bg-primary hover:bg-primary-hover rounded transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+            >
+              {loading ? (<><Icon name="Loader2" size={14} className="animate-spin" /> Signing in…</>) : 'Sign In'}
+            </button>
+          </form>
+
+          {/* Footer */}
+          <p className="text-center text-[10px] text-text-dim mt-4">
+            Configure credentials in <code className="font-mono text-text-dim">.env</code> (APP_USER, APP_PASS)
+          </p>
+        </div>
+      </div>
+    );
+  };
+
   const App = () => {
     // ---- Load persisted state from localStorage (if available) ----
     const loadPersisted = (key, fallback) => {
@@ -8058,8 +8135,66 @@
     const [drawer, setDrawer] = useState({ open: false, kind: null, data: null });
     const [mobileNavOpen, setMobileNavOpen] = useState(false);
     const [lastRefresh, setLastRefresh] = useState(new Date().toISOString());
-    const [theme, setTheme] = useState(() => loadPersisted('theme', 'dark'));
+    const [theme, setTheme] = useState(() => loadPersisted('theme', 'system'));
     const [showShortcuts, setShowShortcuts] = useState(false);
+
+    // ---- Auth state (single username/password login) ----
+    const [authToken, setAuthToken] = useState(() => { try { return localStorage.getItem('supporthublan:auth-token') || ''; } catch { return ''; } });
+    const [currentUser, setCurrentUser] = useState(null);
+    const [authChecking, setAuthChecking] = useState(true);
+
+    // Check auth on mount
+    useEffect(() => {
+      (async () => {
+        try {
+          const resp = await fetch((window.SUPPORTHUBLAN_API_URL || '') + '/api/auth/check', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken },
+          });
+          const json = await resp.json();
+          if (json.success && json.authenticated) {
+            setCurrentUser(json.user);
+          } else if (json.success && !json.authenticated && window._supporthublanBackendStatus === 'connected') {
+            // Backend requires auth but we're not logged in
+            setCurrentUser(null);
+          } else {
+            // No backend or no auth required — allow access
+            setCurrentUser({ username: 'admin', role: 'Admin' });
+          }
+        } catch (e) {
+          // No backend — allow access (demo mode)
+          setCurrentUser({ username: 'demo', role: 'Demo' });
+        }
+        setAuthChecking(false);
+      })();
+    }, [authToken]);
+
+    const login = async (username, password) => {
+      try {
+        const resp = await fetch((window.SUPPORTHUBLAN_API_URL || '') + '/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password }),
+        });
+        const json = await resp.json();
+        if (json.success && json.token) {
+          setAuthToken(json.token);
+          setCurrentUser(json.user);
+          try { localStorage.setItem('supporthublan:auth-token', json.token); } catch {}
+          return { success: true };
+        }
+        return { success: false, error: json.error || 'Login failed' };
+      } catch (e) {
+        return { success: false, error: e.message };
+      }
+    };
+
+    const logout = async () => {
+      try { await fetch((window.SUPPORTHUBLAN_API_URL || '') + '/api/auth/logout', { method: 'POST', headers: { 'Authorization': 'Bearer ' + authToken } }); } catch {}
+      setAuthToken('');
+      setCurrentUser(null);
+      try { localStorage.removeItem('supporthublan:auth-token'); } catch {}
+    };
 
     // ---- Stateful data (initialized from localStorage or seed consts; mutable) ----
     const [hosts, setHosts] = useState(() => loadPersisted('hosts', HOSTS));
@@ -8731,8 +8866,18 @@
     return (
       <AppCtx.Provider value={ctx}>
         <ToastProvider>
+          {/* Auth gate — show login screen if not authenticated and backend requires auth */}
+          {authChecking ? (
+            <div className="flex items-center justify-center h-screen bg-bg">
+              <div className="text-text-dim text-sm flex items-center gap-2">
+                <Icon name="Loader2" size={16} className="animate-spin" /> Loading…
+              </div>
+            </div>
+          ) : !currentUser ? (
+            <LoginScreen onLogin={login} />
+          ) : (
           <div className="flex flex-col h-screen overflow-hidden">
-            <TopHeader onMenuToggle={() => { setSidebarCollapsed(c => !c); setMobileNavOpen(o => !o); }} />
+            <TopHeader onMenuToggle={() => { setSidebarCollapsed(c => !c); setMobileNavOpen(o => !o); }} onLogout={logout} currentUser={currentUser} />
             <div className="flex flex-1 overflow-hidden">
               {/* Desktop sidebar */}
               <div className="hidden lg:block">
@@ -8769,6 +8914,7 @@
             <StatusBar />
             <ShortcutsOverlay open={showShortcuts} onClose={() => setShowShortcuts(false)} />
           </div>
+          )}
         </ToastProvider>
       </AppCtx.Provider>
     );
@@ -9028,7 +9174,7 @@
     }
 
     return (
-      <div className="flex-shrink-0 bg-[#0c0e16] border-t-2 border-border flex flex-col relative" style={{ height: height + 'px' }}>
+      <div className="flex-shrink-0 bg-surface border-t-2 border-border flex flex-col relative" style={{ height: height + 'px' }}>
         {/* Resize handle — drag up/down to resize the panel */}
         <div
           onMouseDown={startResize}
@@ -9039,7 +9185,7 @@
           <div className="absolute top-0 left-1/2 -translate-x-1/2 w-12 h-1 bg-border group-hover:bg-primary rounded-b" />
         </div>
         {/* Tab bar */}
-        <div className="flex items-center justify-between border-b border-[#1f2230] bg-[#0f1117] px-1">
+        <div className="flex items-center justify-between border-b border-border bg-surface-raised px-1">
           <div className="flex">
             {[
               { id: 'all', label: 'All', icon: 'List' },
@@ -9048,37 +9194,37 @@
               { id: 'terminal', label: 'Terminal', icon: 'Terminal' },
             ].map(t => (
               <button key={t.id} onClick={() => { setActiveTab(t.id); if (t.id === 'terminal') setTimeout(() => inputRef.current?.focus(), 100); }}
-                className={`flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium border-b-2 -mb-px ${activeTab === t.id ? 'border-primary text-primary' : 'border-transparent text-gray-400 hover:text-gray-200'}`}>
+                className={`flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium border-b-2 -mb-px ${activeTab === t.id ? 'border-primary text-primary' : 'border-transparent text-text-dim hover:text-text'}`}>
                 <Icon name={t.icon} size={11} />{t.label}
                 {t.id === 'errors' && lines.filter(l => l.stream === 'stderr').length > 0 && (
-                  <span className="ml-1 px-1 text-[9px] bg-red-500/20 text-red-400 rounded">{lines.filter(l => l.stream === 'stderr').length}</span>
+                  <span className="ml-1 px-1 text-[9px] bg-red-500/20 text-danger rounded">{lines.filter(l => l.stream === 'stderr').length}</span>
                 )}
               </button>
             ))}
           </div>
           <div className="flex items-center gap-1">
-            <button onClick={() => setAutoScroll(a => !a)} title="Toggle auto-scroll" className={`p-1 rounded ${autoScroll ? 'text-primary' : 'text-gray-500'} hover:bg-[#1f2230]`}>
+            <button onClick={() => setAutoScroll(a => !a)} title="Toggle auto-scroll" className={`p-1 rounded ${autoScroll ? 'text-primary' : 'text-text-dim'} hover:bg-border`}>
               <Icon name="ArrowDownToLine" size={12} />
             </button>
-            <button onClick={() => setLines([])} title="Clear (Ctrl+L)" className="p-1 rounded text-gray-400 hover:bg-[#1f2230]">
+            <button onClick={() => setLines([])} title="Clear (Ctrl+L)" className="p-1 rounded text-text-dim hover:bg-border">
               <Icon name="Trash2" size={12} />
             </button>
-            <button onClick={() => setCollapsed(true)} title="Collapse panel" className="p-1 rounded text-gray-400 hover:bg-[#1f2230]">
+            <button onClick={() => setCollapsed(true)} title="Collapse panel" className="p-1 rounded text-text-dim hover:bg-border">
               <Icon name="ChevronDown" size={12} />
             </button>
           </div>
         </div>
 
         {/* Output area */}
-        <div ref={scrollRef} className="flex-1 overflow-y-auto font-mono text-[12px] leading-[1.4] p-2 text-gray-300" style={{ fontFamily: 'JetBrains Mono, Consolas, "Courier New", monospace' }}>
+        <div ref={scrollRef} className="flex-1 overflow-y-auto font-mono text-[12px] leading-[1.4] p-2 text-text" style={{ fontFamily: 'JetBrains Mono, Consolas, "Courier New", monospace' }}>
           {filteredLines.length === 0 ? (
-            <div className="text-gray-600 italic px-1 py-2">
-              No output yet. Type a PsTools command below (e.g. <code className="text-gray-400">psinfo \\pc-01</code>) or run an action from the inventory.
+            <div className="text-muted italic px-1 py-2">
+              No output yet. Type a PsTools command below (e.g. <code className="text-text-dim">psinfo \\pc-01</code>) or run an action from the inventory.
             </div>
           ) : (
             filteredLines.map((l, i) => (
-              <div key={i} className={`whitespace-pre-wrap break-all ${l.stream === 'stderr' ? 'text-red-400' : l.stream === 'stdout' ? 'text-gray-300' : l.stream === 'command' ? 'text-cyan-400' : 'text-gray-500'}`}>
-                <span className="text-gray-600 mr-2">{l.ts}</span>
+              <div key={i} className={`whitespace-pre-wrap break-all ${l.stream === 'stderr' ? 'text-danger' : l.stream === 'stdout' ? 'text-text' : l.stream === 'command' ? 'text-info' : 'text-text-dim'}`}>
+                <span className="text-muted mr-2">{l.ts}</span>
                 {renderLine(l.line)}
               </div>
             ))
@@ -9086,7 +9232,7 @@
         </div>
 
         {/* Command input */}
-        <div className="border-t border-[#1f2230] bg-[#0f1117] flex items-center px-2 py-1.5">
+        <div className="border-t border-border bg-surface-raised flex items-center px-2 py-1.5">
           <span className="text-success font-mono text-[12px] mr-2 flex-shrink-0">ps&gt;</span>
           <input
             ref={inputRef}
@@ -9095,13 +9241,13 @@
             onChange={(e) => setCommand(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder="Type a PsTools command — e.g.  psexec \\pc-01 cmd   |   psinfo \\pc-01   |   ping pc-01   |   powershell Get-Service"
-            className="flex-1 bg-transparent border-0 outline-none font-mono text-[12px] text-gray-200 placeholder-gray-600"
+            className="flex-1 bg-transparent border-0 outline-none font-mono text-[12px] text-text placeholder-gray-600"
             style={{ fontFamily: 'JetBrains Mono, Consolas, "Courier New", monospace' }}
             disabled={running}
           />
           {running && (
             <button onClick={() => window._supporthublanWs?.send(JSON.stringify({ type: 'terminal-kill', sessionId }))}
-              className="ml-2 px-2 py-0.5 text-[10px] bg-red-500/20 text-red-400 rounded hover:bg-red-500/30">
+              className="ml-2 px-2 py-0.5 text-[10px] bg-red-500/20 text-danger rounded hover:bg-red-500/30">
               Stop
             </button>
           )}

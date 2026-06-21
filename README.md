@@ -1,6 +1,6 @@
 # SupportHubLAN
 
-> Windows endpoint administration web app for LAN admins — built as an open-source alternative to BatchPatch Pro.
+> Windows endpoint administration web app for LAN admins for LAN administrators.
 > Uses **PsTools** for remote execution. No WMI, no PowerShell Remoting required on targets.
 
 [![Live Demo](https://img.shields.io/badge/demo-GitHub%20Pages-blue)](https://fccljbplant.github.io/SupportHubLAN/supporthublan.html)
@@ -158,7 +158,7 @@ A browser is sandboxed — JavaScript in an HTML page **cannot** directly spawn 
 4. **Run the backend as a low-privilege service account** that is local admin only on target hosts (not Domain Admin)
 5. **Audit log** — every API call is logged to SQLite with timestamp, action, parameters, and result
 
-This is the same architecture used by every web-based RMM tool (Action1, NinjaRMM, ManageEngine, BatchPatch's web UI). The browser is just a UI; the security boundary is the backend's HTTP listener.
+This is the same architecture used by every web-based RMM tool (Action1, NinjaRMM, ManageEngine). The browser is just a UI; the security boundary is the backend's HTTP listener.
 
 ---
 

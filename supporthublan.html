@@ -157,7 +157,7 @@
     input[type=number]::-webkit-inner-spin-button,
     input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
 
-    /* ---- Professional toolbar styling (BatchPatch-inspired) ---- */
+    /* ---- Professional toolbar styling (Professional) ---- */
     .toolbar-group {
       display: flex;
       align-items: center;
@@ -1576,7 +1576,7 @@
   };
 
   /* ------------------------------------------------------------------------
-     CONTEXT MENU — Right-click menu for host rows (like BatchPatch grid)
+     CONTEXT MENU — Right-click menu for host rows (for host rows)
   ------------------------------------------------------------------------ */
   const ContextMenu = ({ x, y, items, onClose }) => {
     useEffect(() => {
@@ -1610,7 +1610,7 @@
   };
 
   /* ------------------------------------------------------------------------
-     ACTION TOOLBAR — BatchPatch-style icon toolbar above the grid
+     ACTION TOOLBAR — Professional icon toolbar above the grid
   ------------------------------------------------------------------------ */
   const ActionToolbar = ({ groups }) => (
     <div className="flex items-center flex-wrap gap-0 p-1.5 bg-surface border border-border rounded-lg mb-2 overflow-x-auto">
@@ -3274,7 +3274,7 @@
 
             <BulkActionBar selectedCount={selectedIds.length} actions={bulkActions} onClear={() => setSelectedIds([])} />
 
-            {/* BatchPatch-style Action Toolbar */}
+            {/* Action Toolbar */}
             <ActionToolbar groups={[
               { label: 'Hosts', items: [
                 { icon: 'Plus', label: 'Add', onClick: () => { setAddModalMethod(null); setShowAddModal(true); } },
@@ -8313,7 +8313,7 @@
         }
         // t → toggle theme
         if (e.key === 't' && !e.ctrlKey && !e.metaKey) { e.preventDefault(); toggleTheme(); return; }
-        // Ctrl+B → toggle grid border style (BatchPatch feature)
+        // Ctrl+B → toggle grid border style
         if ((e.ctrlKey || e.metaKey) && e.key === 'b') { e.preventDefault(); document.documentElement.classList.toggle('grid-borderless'); toast.info(`Grid border style: ${document.documentElement.classList.contains('grid-borderless') ? 'borderless' : 'default'}`); return; }
         // / → focus search (already handled in TopHeader, but also handle here as fallback)
         if (e.key === '/' && !e.ctrlKey && !e.metaKey) { e.preventDefault(); document.querySelector('input[placeholder*="Search hosts"]')?.focus(); return; }

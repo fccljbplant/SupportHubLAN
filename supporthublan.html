@@ -522,6 +522,17 @@
         // Batch status check — ping multiple hostnames in parallel
         checkHostStatus: (hostnames) => apiCall('/api/hosts/status-check', { hostnames }),
 
+        // Hardware audit — comprehensive wmic + PsInfo + PsLoggedOn
+        getHardwareInfo: (hostname) => apiCall('/api/hosts/' + hostname + '/hardware', {}),
+        getSavedHardware: (hostname) => apiGet('/api/hosts/' + hostname + '/hardware'),
+
+        // Command logs — view WHY commands failed
+        getCommandLogs: (limit = 100) => apiGet('/api/logs?limit=' + limit),
+
+        // WinRM management
+        testWinRM: (hostname) => apiCall('/api/winrm/test', { hostname }),
+        enableWinRM: (hostname) => apiCall('/api/winrm/enable', { hostname }),
+
         // Remote desktop
         launchRemote: (hostname, ip, protocol, port) => apiCall('/api/remote/connect', { hostname, ip, protocol, port }),
 
@@ -1646,7 +1657,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v4.1.4';
+  const APP_VERSION = 'v4.2.0';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [

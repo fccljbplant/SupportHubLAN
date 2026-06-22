@@ -63,6 +63,13 @@ const crypto = require('crypto');
 // ---- SQLite + AES-256 encrypted credential storage ----
 const db = require('./db');
 
+// ---- Lib modules (wmic, powershell, winrm, pstools, logger) ----
+const wmic = require('./lib/wmic');
+const powershell = require('./lib/powershell');
+const winrm = require('./lib/winrm');
+const pstools = require('./lib/pstools');
+const { logCommand, analyzeError, getRecentLogs } = require('./lib/logger');
+
 // ---- Load .env (manual parser — no dotenv dependency needed) ----
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
@@ -217,6 +224,37 @@ function pingSweepParallel(ips, concurrency = 64, timeoutMs = 3000) {
 // ==========================================================================
 // HEALTH CHECK — Used by frontend to detect LIVE vs DEMO mode
 // ==========================================================================
+// ==========================================================================
+// COMMAND LOG — Returns recent command execution logs with error reasons
+// ==========================================================================
+// Shows WHY each command succeeded or failed, which service is required
+// on the remote PC, and how to fix common errors.
+app.get('/api/logs', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+  const logs = getRecentLogs(limit);
+  res.json({ success: true, data: logs, count: logs.length });
+});
+
+// ==========================================================================
+// WINRM TEST — Test if WinRM is available on a remote host
+// ==========================================================================
+app.post('/api/winrm/test', async (req, res) => {
+  const { hostname } = req.body;
+  const safeHost = sanitizeHost(hostname);
+  const result = await winrm.testWinRM(safeHost);
+  res.json({ success: result.available, data: result });
+});
+
+// ==========================================================================
+// WINRM ENABLE — Try to enable WinRM on a remote host via PsExec
+// ==========================================================================
+app.post('/api/winrm/enable', async (req, res) => {
+  const { hostname } = req.body;
+  const safeHost = sanitizeHost(hostname);
+  const result = await winrm.enableWinRM(safeHost, PSTOOLS_PATH);
+  res.json({ success: result.success, data: result });
+});
+
 app.get('/api/health', (req, res) => {
   const pstoolsInstalled = fs.existsSync(path.join(PSTOOLS_PATH, 'psexec.exe'));
   const psWindowsUpdateAvailable = true; // Checked at runtime
@@ -560,7 +598,7 @@ app.post('/api/scan', async (req, res) => {
   res.json({ success: true, data: { jobId: jobScanId, total: safeIps.length } });
 
   // Run fast parallel ping sweep (64 concurrent pings, 3s timeout each)
-  const results = await pingSweepParallel(safeIps, 64, 3000);
+  const results = await pstools.pingParallel(safeIps, 64, 3000);
 
   // Try to resolve hostnames for alive IPs via DNS reverse lookup
   const dns = require('dns');
@@ -593,7 +631,7 @@ app.post('/api/hosts/status-check', async (req, res) => {
     return res.json({ success: true, data: JSON.stringify([]) });
   }
   const hostList = hostnames.map(sanitizeHost).filter(Boolean).slice(0, 500);
-  const results = await pingSweepParallel(hostList, 64, 2000);
+  const results = await pstools.pingParallel(hostList, 64, 2000);
   const formatted = results.map(r => ({
     hostname: r.ip, // r.ip is actually the hostname here
     online: r.online,
@@ -709,25 +747,43 @@ app.post('/api/updates/history', async (req, res) => {
 // ==========================================================================
 app.post('/api/scripts/execute', async (req, res) => {
   const { hostnames, script: userScript, credential, language, timeout } = req.body;
-  const hostList = hostnames.map(sanitizeHost).join("','");
   const timeoutSec = timeout || 60;
-  const psScript = `
-    ${credential ? buildCredentialBlock(credential) : ''}
-    $results = @()
-    foreach ($h in @('${hostList}')) {
-      try {
-        $params = @{ ComputerName = $h; ScriptBlock = { ${userScript} }; ErrorAction = 'Stop' }
-        ${credential ? '$params.Credential = $cred' : ''}
-        $output = Invoke-Command @params
-        $results += @{ hostname = $h; success = $true; output = ($output | Out-String) }
-      } catch {
-        $results += @{ hostname = $h; success = $false; error = $_.Exception.Message }
-      }
+  const results = [];
+
+  for (const rawHost of hostnames) {
+    const safeHost = sanitizeHost(rawHost);
+    let result = null;
+
+    // METHOD 1: Try WinRM first (Invoke-Command) — fastest, no PsExec overhead
+    const winrmResult = await powershell.runRemoteViaWinRM(safeHost, userScript, timeoutSec * 1000);
+    if (winrmResult.success) {
+      results.push({ hostname: safeHost, success: true, output: winrmResult.stdout, method: 'winrm' });
+      continue;
     }
-    $results | ConvertTo-Json -Depth 4 -Compress
-  `;
-  const result = await runPowerShell(psScript, timeoutSec * 1000);
-  res.json({ success: result.success, data: result.stdout, error: result.stderr });
+
+    // METHOD 2: Fall back to PsExec + PowerShell (no WinRM needed, uses SMB)
+    const psexecResult = await powershell.runRemoteViaPsExec(safeHost, userScript, PSTOOLS_PATH, timeoutSec * 1000);
+    if (psexecResult.success) {
+      results.push({ hostname: safeHost, success: true, output: psexecResult.stdout, method: 'psexec' });
+      continue;
+    }
+
+    // Both methods failed — return combined error with reasons
+    results.push({
+      hostname: safeHost,
+      success: false,
+      error: `WinRM: ${winrmResult.reason || winrmResult.error} | PsExec: ${psexecResult.reason || psexecResult.error}`,
+      winrmError: winrmResult,
+      psexecError: psexecResult,
+    });
+  }
+
+  res.json({
+    success: results.every(r => r.success),
+    results,
+    data: JSON.stringify(results),
+    errors: results.filter(r => !r.success),
+  });
 });
 
 // ==========================================================================
@@ -1083,6 +1139,235 @@ app.post('/api/pstools/execute', async (req, res) => {
   const fullCmd = `"${pstoolsExe(exe)}" ${target} -accepteula ${args || ''}`;
   const result = await runPowerShell(fullCmd, 60000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
+});
+
+// ==========================================================================
+// HARDWARE AUDIT — Comprehensive hardware scan using wmic + PsInfo + PsLoggedOn
+// ==========================================================================
+// This endpoint runs multiple data retrieval methods in parallel:
+//   1. wmic (via PsExec) for: system, baseboard, bios, cpu, memory, disks, GPU, OS
+//   2. PsInfo for: system info, disk volumes, hotfixes, software
+//   3. PsLoggedOn for: currently logged-on user
+//
+// Fallback chain: if wmic via PsExec fails, it tries wmic /node:HOST (DCOM/RPC),
+// then falls back to PsInfo-only.
+//
+// All commands are logged with error reasons so the user can see WHY
+// something failed and which service is required on the remote PC.
+// ==========================================================================
+app.post('/api/hosts/:hostname/hardware', async (req, res) => {
+  const safeHost = sanitizeHost(req.params.hostname);
+  const results = {
+    hostname: safeHost,
+    scannedAt: new Date().toISOString(),
+    system: {}, motherboard: {}, bios: {}, processor: null,
+    memory: [], disks: [], logicalDisks: [], network: [], gpu: [],
+    os: {}, hotfixes: [], software: [], loggedInUser: null,
+    errors: [], // Collect error reasons for each failed command
+  };
+
+  try {
+    // Launch all queries in parallel
+    const [csRes, bbRes, biosRes, cpuRes, memRes, diskRes, ldRes, gpuRes, osRes,
+           psinfoRes, loggedOnRes] = await Promise.all([
+      // wmic queries via PsExec (SMB-based, no WinRM needed)
+      wmic.runRemoteViaPsExec(safeHost, 'computersystem', 'Manufacturer,Model,SerialNumber,SystemType,TotalPhysicalMemory,Domain,NumberOfProcessors,NumberOfLogicalProcessors', PSTOOLS_PATH),
+      wmic.runRemoteViaPsExec(safeHost, 'baseboard', 'Manufacturer,Product,Version,SerialNumber', PSTOOLS_PATH),
+      wmic.runRemoteViaPsExec(safeHost, 'bios', 'Manufacturer,Name,SMBIOSBIOSVersion,ReleaseDate,SerialNumber', PSTOOLS_PATH),
+      wmic.runRemoteViaPsExec(safeHost, 'cpu', 'Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,CurrentClockSpeed,SocketDesignation', PSTOOLS_PATH),
+      wmic.runRemoteViaPsExec(safeHost, 'memorychip', 'Capacity,Manufacturer,PartNumber,Speed,DeviceLocator,SerialNumber', PSTOOLS_PATH),
+      wmic.runRemoteViaPsExec(safeHost, 'diskdrive', 'Model,Size,InterfaceType,SerialNumber,Partitions,Index,MediaType', PSTOOLS_PATH),
+      wmic.runRemoteViaPsExec(safeHost, 'logicaldisk', 'DeviceID,Size,FreeSpace,FileSystem,VolumeName', PSTOOLS_PATH, 'where', 'DriveType=3'), // special case
+      wmic.runRemoteViaPsExec(safeHost, 'path win32_videocontroller', 'Name,AdapterCompatibility,AdapterRAM,DriverVersion,DriverDate', PSTOOLS_PATH),
+      wmic.runRemoteViaPsExec(safeHost, 'os', 'Caption,Version,BuildNumber,InstallDate,LastBootUpTime,SerialNumber,OSArchitecture,RegisteredOrganization,RegisteredUser', PSTOOLS_PATH),
+      // PsInfo for hotfixes + software
+      pstools.runPsInfo(safeHost, ['-h', '-s', '-c']),
+      // PsLoggedOn for logged-in user
+      pstools.runPsLoggedOn(safeHost),
+    ]);
+
+    // Parse wmic results
+    if (csRes.success && csRes.records.length > 0) {
+      const cs = csRes.records[0];
+      results.system = {
+        manufacturer: cs.Manufacturer || '',
+        model: cs.Model || '',
+        serial: cs.SerialNumber || '',
+        systemType: cs.SystemType || '',
+        domain: cs.Domain || '',
+        totalRamMB: cs.TotalPhysicalMemory ? Math.round(parseInt(cs.TotalPhysicalMemory) / (1024 * 1024)) : 0,
+      };
+    } else if (csRes.reason) {
+      results.errors.push({ command: 'wmic computersystem', ...csRes });
+    }
+
+    if (bbRes.success && bbRes.records.length > 0) {
+      const bb = bbRes.records[0];
+      results.motherboard = {
+        manufacturer: bb.Manufacturer || '',
+        product: bb.Product || '',
+        version: bb.Version || '',
+        serial: bb.SerialNumber || '',
+      };
+    } else if (bbRes.reason) {
+      results.errors.push({ command: 'wmic baseboard', ...bbRes });
+    }
+
+    if (biosRes.success && biosRes.records.length > 0) {
+      const bios = biosRes.records[0];
+      results.bios = {
+        manufacturer: bios.Manufacturer || '',
+        name: bios.Name || '',
+        version: bios.SMBIOSBIOSVersion || '',
+        serial: bios.SerialNumber || '',
+        releaseDate: bios.ReleaseDate || '',
+      };
+    } else if (biosRes.reason) {
+      results.errors.push({ command: 'wmic bios', ...biosRes });
+    }
+
+    if (cpuRes.success && cpuRes.records.length > 0) {
+      const cpus = cpuRes.records;
+      results.processor = {
+        name: cpus[0].Name || 'Unknown',
+        manufacturer: cpus[0].Manufacturer || '',
+        cores: cpus.reduce((s, c) => s + parseInt(c.NumberOfCores || '0', 10), 0),
+        threads: cpus.reduce((s, c) => s + parseInt(c.NumberOfLogicalProcessors || '0', 10), 0),
+        maxSpeedMHz: parseInt(cpus[0].MaxClockSpeed || '0', 10),
+        currentSpeedMHz: parseInt(cpus[0].CurrentClockSpeed || '0', 10),
+        socket: cpus[0].SocketDesignation || '',
+      };
+    } else if (cpuRes.reason) {
+      results.errors.push({ command: 'wmic cpu', ...cpuRes });
+    }
+
+    if (memRes.success && memRes.records.length > 0) {
+      results.memory = memRes.records.filter(m => m.Capacity).map(m => ({
+        capacityGB: Math.round(parseInt(m.Capacity) / (1024 * 1024 * 1024) * 10) / 10,
+        manufacturer: m.Manufacturer || '',
+        partNumber: m.PartNumber || '',
+        speed: parseInt(m.Speed || '0', 10),
+        deviceLocator: m.DeviceLocator || '',
+      }));
+    }
+
+    if (diskRes.success && diskRes.records.length > 0) {
+      results.disks = diskRes.records.filter(d => d.Model).map((d, i) => ({
+        model: d.Model || '',
+        sizeGB: Math.round(parseInt(d.Size || '0', 10) / (1024 * 1024 * 1024) * 10) / 10,
+        interface: d.InterfaceType || d.MediaType || '',
+        serialNumber: d.SerialNumber || '',
+        partitions: parseInt(d.Partitions || '0', 10),
+      }));
+    }
+
+    if (ldRes.success && ldRes.records.length > 0) {
+      results.logicalDisks = ldRes.records.filter(d => d.DeviceID).map(d => ({
+        drive: d.DeviceID,
+        sizeGB: Math.round(parseInt(d.Size || '0', 10) / (1024 * 1024 * 1024) * 10) / 10,
+        freeGB: Math.round(parseInt(d.FreeSpace || '0', 10) / (1024 * 1024 * 1024) * 10) / 10,
+        fileSystem: d.FileSystem || '',
+        volumeName: d.VolumeName || '',
+      }));
+    }
+
+    if (gpuRes.success && gpuRes.records.length > 0) {
+      results.gpu = gpuRes.records.filter(g => g.Name).map(g => ({
+        name: g.Name || '',
+        manufacturer: g.AdapterCompatibility || '',
+        ramMB: Math.round(parseInt(g.AdapterRAM || '0', 10) / (1024 * 1024)),
+        driverVersion: g.DriverVersion || '',
+      }));
+    }
+
+    if (osRes.success && osRes.records.length > 0) {
+      const osInfo = osRes.records[0];
+      results.os = {
+        name: osInfo.Caption || '',
+        version: osInfo.Version || '',
+        build: osInfo.BuildNumber || '',
+        architecture: osInfo.OSArchitecture || '',
+        installDate: osInfo.InstallDate || '',
+        lastBoot: osInfo.LastBootUpTime || '',
+        serial: osInfo.SerialNumber || '',
+      };
+    }
+
+    // Parse PsInfo for hotfixes and software (if wmic didn't get some data)
+    if (psinfoRes.success && psinfoRes.stdout) {
+      // Try to parse as CSV — psinfo -c output is a single comma-delimited line
+      const tokens = psinfoRes.stdout.split(/[\n,]/).map(t => t.trim()).filter(Boolean);
+      // Find hotfix entries (KB numbers) and software entries
+      let foundSoftware = false;
+      for (const token of tokens) {
+        const kbMatch = token.match(/KB\d+/i);
+        if (kbMatch && !foundSoftware) {
+          results.hotfixes.push(kbMatch[0].toUpperCase());
+        } else if (!foundSoftware && /^n\/a/i.test(token)) {
+          continue;
+        } else {
+          foundSoftware = true;
+          if (!results.hotfixes.includes(token)) {
+            results.software.push({ name: token });
+          }
+        }
+      }
+    }
+
+    // Parse logged-on user
+    if (loggedOnRes.success && loggedOnRes.stdout) {
+      const userMatch = loggedOnRes.stdout.match(/([A-Za-z0-9._-]+\\[A-Za-z0-9._-]+)/);
+      if (userMatch) results.loggedInUser = userMatch[1];
+    }
+
+    // Save to database (merge with previous data)
+    const key = 'hardware:' + safeHost;
+    try {
+      const prev = db.settings.get(key, null);
+      let prevHw = null;
+      if (prev) { try { prevHw = JSON.parse(prev); } catch {} }
+      let finalResult = results;
+      if (prevHw) {
+        // Merge: keep old data for sections where new scan returned empty
+        finalResult = { ...prevHw, ...results };
+        finalResult.system = Object.keys(results.system).length > 0 ? { ...prevHw.system, ...results.system } : prevHw.system;
+        finalResult.motherboard = Object.keys(results.motherboard).length > 0 ? { ...prevHw.motherboard, ...results.motherboard } : prevHw.motherboard;
+        finalResult.bios = Object.keys(results.bios).length > 0 ? { ...prevHw.bios, ...results.bios } : prevHw.bios;
+        finalResult.processor = results.processor || prevHw.processor;
+        finalResult.memory = results.memory.length > 0 ? results.memory : prevHw.memory || [];
+        finalResult.disks = results.disks.length > 0 ? results.disks : prevHw.disks || [];
+        finalResult.logicalDisks = results.logicalDisks.length > 0 ? results.logicalDisks : prevHw.logicalDisks || [];
+        finalResult.os = Object.keys(results.os).length > 0 ? { ...prevHw.os, ...results.os } : prevHw.os;
+      }
+      db.settings.set(key, JSON.stringify(finalResult));
+    } catch {}
+
+    res.json({
+      success: true,
+      data: results,
+      errorCount: results.errors.length,
+      errors: results.errors,
+    });
+
+  } catch (e) {
+    res.json({ success: false, error: e.message, data: results });
+  }
+});
+
+// GET endpoint to retrieve saved hardware data (no scan)
+app.get('/api/hosts/:hostname/hardware', (req, res) => {
+  const safeHost = sanitizeHost(req.params.hostname);
+  const key = 'hardware:' + safeHost;
+  try {
+    const saved = db.settings.get(key, null);
+    if (saved) {
+      res.json({ success: true, data: JSON.parse(saved) });
+    } else {
+      res.json({ success: false, error: 'No saved hardware data. Run a scan first.' });
+    }
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
 });
 
 app.post('/api/pstools/psinfo', async (req, res) => {

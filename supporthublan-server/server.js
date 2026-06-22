@@ -165,6 +165,14 @@ function buildCredentialBlock(credential) {
   `;
 }
 
+// Shared PsTools mapping (used by /api/pstools/execute and WebSocket terminal)
+const PSTOOLS_TOOLMAP = {
+  psexec: 'psexec.exe', psinfo: 'psinfo.exe', pslist: 'pslist.exe',
+  pskill: 'pskill.exe', psservice: 'psservice.exe', psloggedon: 'psloggedon.exe',
+  psshutdown: 'psshutdown.exe', psfile: 'psfile.exe', psgetsid: 'psgetsid.exe',
+  pssuspend: 'pssuspend.exe'
+};
+
 // ---- Helper: Standard response wrapper ----
 function sendResult(res, result) {
   res.json({ success: result.success, data: result.data, error: result.error, stdout: result.stdout, stderr: result.stderr });
@@ -180,53 +188,8 @@ function sanitizeHost(h) {
 // Returns array of { ip, online, hostname? }
 // Much faster than PowerShell Test-Connection runspace pool — ping.exe
 // starts in ~50ms vs PowerShell's ~3-5s startup.
-function pingSweepParallel(ips, concurrency = 64, timeoutMs = 3000) {
-  return new Promise((resolve) => {
-    const results = new Array(ips.length);
-    let completed = 0;
-    let nextIndex = 0;
-
-    function launchNext() {
-      if (nextIndex >= ips.length) return;
-      const idx = nextIndex++;
-      const ip = ips[idx];
-
-      const proc = spawn('ping.exe', ['-n', '1', '-w', String(timeoutMs), ip], { windowsHide: true });
-      let stdout = '';
-      proc.stdout.on('data', (d) => { stdout += d.toString(); });
-      proc.stderr.on('data', () => {}); // discard
-      proc.on('error', () => {
-        results[idx] = { ip, online: false };
-        completed++;
-        if (completed === ips.length) resolve(results);
-        else launchNext();
-      });
-      proc.on('close', () => {
-        const online = /\bReply from\b/i.test(stdout) && !/Destination host unreachable/i.test(stdout);
-        results[idx] = { ip, online };
-        completed++;
-        if (completed === ips.length) resolve(results);
-        else launchNext();
-      });
-
-      // Hard timeout — kill if ping.exe hangs
-      setTimeout(() => {
-        try { proc.kill(); } catch {}
-      }, timeoutMs + 2000);
-    }
-
-    if (ips.length === 0) { resolve([]); return; }
-    // Launch initial batch (up to `concurrency` parallel pings)
-    const initialBatch = Math.min(concurrency, ips.length);
-    for (let i = 0; i < initialBatch; i++) launchNext();
-  });
-}
-
 // ==========================================================================
 // HEALTH CHECK — Used by frontend to detect LIVE vs DEMO mode
-// ==========================================================================
-// ==========================================================================
-// COMMAND LOG — Returns recent command execution logs with error reasons
 // ==========================================================================
 // Shows WHY each command succeeded or failed, which service is required
 // on the remote PC, and how to fix common errors.
@@ -1396,12 +1359,7 @@ function pstoolsExe(name) {
 
 app.post('/api/pstools/execute', async (req, res) => {
   const { tool, hostname, args, credential } = req.body;
-  const toolMap = {
-    psexec: 'psexec.exe', psinfo: 'psinfo.exe', pslist: 'pslist.exe',
-    pskill: 'pskill.exe', psservice: 'psservice.exe', psloggedon: 'psloggedon.exe',
-    psshutdown: 'psshutdown.exe', psfile: 'psfile.exe', psgetsid: 'psgetsid.exe',
-    pssuspend: 'pssuspend.exe'
-  };
+  const toolMap = PSTOOLS_TOOLMAP;
   const exe = toolMap[tool] || 'psexec.exe';
   const safeHost = sanitizeHost(hostname);
   const target = `\\\\${safeHost}`;
@@ -2176,12 +2134,7 @@ wss.on('connection', (ws) => {
         let exe, args;
         const parts = trimmed.split(/\s+/);
         const cmd = parts[0].toLowerCase();
-        const toolMap = {
-          psexec: 'psexec.exe', psinfo: 'psinfo.exe', pslist: 'pslist.exe',
-          pskill: 'pskill.exe', psservice: 'psservice.exe', psloggedon: 'psloggedon.exe',
-          psshutdown: 'psshutdown.exe', psfile: 'psfile.exe', psgetsid: 'psgetsid.exe',
-          pssuspend: 'pssuspend.exe'
-        };
+        const toolMap = PSTOOLS_TOOLMAP;
         if (toolMap[cmd]) {
           exe = path.join(PSTOOLS_PATH, toolMap[cmd]);
           // Add -accepteula if not already in args
@@ -2214,7 +2167,7 @@ wss.on('connection', (ws) => {
           ws.send(JSON.stringify({ type: 'terminal-output', sessionId, line: `\r\n\x1b[33m[Process exited with code ${code}]\x1b[0m\r\n`, stream: 'exit' }));
           ws.send(JSON.stringify({ type: 'terminal-complete', sessionId, exitCode: code }));
           if (ws._terminalProcs) ws._terminalProcs.delete(sessionId);
-          db.audit.add({ action: 'terminal.run', category: 'Terminal', result: code === 0 ? 'success' : 'failed', parameters: { command: trimmed }, output: `exit=${code}` });
+          audit.add(db, { actionType: 'terminal.run', targetHost: hostname || 'local', tool: 'terminal', command: trimmed, success: code === 0, outputSummary: `exit=${code}`, initiatedBy: 'admin', initiatedFrom: ws._socket?.remoteAddress || 'unknown' });
         });
         proc.on('error', (err) => {
           ws.send(JSON.stringify({ type: 'terminal-error', sessionId, error: err.message }));

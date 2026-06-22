@@ -1694,7 +1694,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v4.2.0.5';
+  const APP_VERSION = 'v4.2.0.6';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -6481,53 +6481,98 @@
     const [fleetSearchResults, setFleetSearchResults] = useState(null);
 
     // Fleet search: query all hosts for a service/process by name
-    const doFleetSearch = () => {
+    const doFleetSearch = async () => {
       const q = fleetSearchQuery.trim().toLowerCase();
       if (!q) { toast.warning('Enter a service or process name to search.'); return; }
       toast.info(`Searching fleet for "${fleetSearchQuery}"…`);
-      // Simulate a fleet-wide query: ~60% of online hosts "have" the service running
-      const results = hosts.filter(h => h.onlineStatus === 'online').map(h => {
-        const found = Math.random() < 0.6;
-        return {
-          id: h.id,
-          hostname: h.hostname,
-          found,
-          status: found ? 'Running' : 'Not running',
-          details: found ? `PID ${Math.floor(Math.random() * 9000) + 1000} · ${(Math.random() * 15).toFixed(1)}% CPU${(h.loggedOnUsers && h.loggedOnUsers.length > 0) ? ' · user: ' + h.loggedOnUsers[0] : ''}` : 'Process not found',
-        };
-      });
+      const results = [];
+      if (window.SupportHubLANAPI) {
+        for (const h of hosts.filter(h => h.onlineStatus === 'online')) {
+          try {
+            const svcResult = await window.SupportHubLANAPI.getServices(h.hostname, null);
+            if (svcResult && svcResult.success && !svcResult.demo) {
+              let svcs = [];
+              try { svcs = JSON.parse(svcResult.data); } catch { svcs = []; }
+              const found = Array.isArray(svcs) ? svcs.find(s => (s.Name || s.name || '').toLowerCase().includes(q) && (s.State === 'Running' || s.status === 'Running')) : null;
+              results.push({ id: h.id, hostname: h.hostname, found: !!found, status: found ? 'Running' : 'Not running', details: found ? `${found.DisplayName || found.display || found.Name} (${found.State || found.status})` : 'Service not found' });
+            } else {
+              results.push({ id: h.id, hostname: h.hostname, found: false, status: 'Error', details: 'Backend not connected' });
+            }
+          } catch (e) {
+            results.push({ id: h.id, hostname: h.hostname, found: false, status: 'Error', details: e.message });
+          }
+        }
+      } else {
+        // Demo fallback
+        hosts.filter(h => h.onlineStatus === 'online').forEach(h => {
+          results.push({ id: h.id, hostname: h.hostname, found: false, status: 'Demo', details: 'Backend not connected' });
+        });
+      }
       setFleetSearchResults(results);
       const foundCount = results.filter(r => r.found).length;
       appendAudit({ action: 'services.fleet-search', actionCategory: 'Scripts', targetType: 'Host', targetIds: results.map(r => r.id), parameters: { query: fleetSearchQuery, foundCount, totalSearched: results.length }, result: 'success' });
       toast.success(`Searched ${results.length} hosts — "${fleetSearchQuery}" found on ${foundCount}.`);
     };
 
-    // Stateful service list — Start/Stop/Restart mutates this
-    const [services, setServices] = useState([
-      { name: 'wuauserv', display: 'Windows Update', status: 'Running', startType: 'Manual', pid: 1234, logOnAs: 'LocalSystem' },
-      { name: 'BITS', display: 'Background Intelligent Transfer Service', status: 'Running', startType: 'Automatic', pid: 892, logOnAs: 'LocalSystem' },
-      { name: 'Spooler', display: 'Print Spooler', status: 'Stopped', startType: 'Automatic', pid: null, logOnAs: 'LocalSystem' },
-      { name: 'WinRM', display: 'Windows Remote Management (WS-Management)', status: 'Running', startType: 'Automatic', pid: 4, logOnAs: 'NetworkService' },
-      { name: 'MSSQLSERVER', display: 'SQL Server', status: 'Running', startType: 'Automatic', pid: 1024, logOnAs: '.\\MSSQL' },
-      { name: 'W3SVC', display: 'World Wide Web Publishing Service', status: 'Running', startType: 'Automatic', pid: 2048, logOnAs: 'LocalSystem' },
-    ]);
-    const [processes, setProcesses] = useState([
-      { pid: 4, name: 'System', cpu: 1.2, mem: 0.5, user: 'SYSTEM', startTime: '2026-05-03 08:14' },
-      { pid: 512, name: 'svchost.exe', cpu: 0.4, mem: 24, user: 'SYSTEM', startTime: '2026-05-03 08:14' },
-      { pid: 1024, name: 'sqlservr.exe', cpu: 12.5, mem: 4520, user: 'MSSQL', startTime: '2026-05-03 08:15' },
-      { pid: 2048, name: 'chrome.exe', cpu: 4.2, mem: 580, user: 'a.garcia', startTime: '2026-06-20 06:30' },
-      { pid: 3072, name: 'w3wp.exe', cpu: 8.1, mem: 1240, user: 'IIS_IUSRS', startTime: '2026-06-13 06:00' },
-      { pid: 4096, name: 'explorer.exe', cpu: 0.8, mem: 95, user: 'a.garcia', startTime: '2026-06-20 06:30' },
-    ]);
+    // Stateful service/process list — loaded from backend when a host is selected
+    const [services, setServices] = useState([]);
+    const [processes, setProcesses] = useState([]);
+    const [loadingServices, setLoadingServices] = useState(false);
+
+    // Load services + processes when target host changes
+    useEffect(() => {
+      if (!targetHost || !window.SupportHubLANAPI) return;
+      let cancelled = false;
+      (async () => {
+        setLoadingServices(true);
+        try {
+          const svcResult = await window.SupportHubLANAPI.getServices(targetHost.hostname, null);
+          if (cancelled) return;
+          if (svcResult && svcResult.success && !svcResult.demo) {
+            let svcs = [];
+            try { svcs = JSON.parse(svcResult.data); } catch { svcs = []; }
+            const arr = Array.isArray(svcs) ? svcs : [svcs];
+            setServices(arr.map(s => ({
+              name: s.Name || s.name || '',
+              display: s.DisplayName || s.display || s.Name || '',
+              status: s.State || s.status || 'Unknown',
+              startType: s.StartMode || s.startType || '',
+              pid: null,
+              logOnAs: s.StartName || s.logOnAs || '',
+            })));
+          } else {
+            setServices([]);
+          }
+        } catch (e) { if (!cancelled) setServices([]); }
+
+        try {
+          const procResult = await window.SupportHubLANAPI.getProcesses(targetHost.hostname, null);
+          if (cancelled) return;
+          if (procResult && procResult.success && !procResult.demo) {
+            let procs = [];
+            try { procs = JSON.parse(procResult.data); } catch { procs = []; }
+            const arr = Array.isArray(procs) ? procs : [procs];
+            setProcesses(arr.map(p => ({
+              pid: p.ProcessId || p.pid || 0,
+              name: p.Name || p.name || '',
+              cpu: parseFloat(p.PercentProcessorTime || p.cpu || 0),
+              mem: parseFloat(p.WorkingSetSize || p.mem || 0) / 1024,
+              user: '',
+              startTime: p.CreationDate || p.startTime || '',
+            })));
+          } else {
+            setProcesses([]);
+          }
+        } catch (e) { if (!cancelled) setProcesses([]); }
+        if (!cancelled) setLoadingServices(false);
+      })();
+      return () => { cancelled = true; };
+    }, [selectedTargets[0]]);
 
     const targetHost = hosts.find(h => h.id === selectedTargets[0]);
 
     const setServiceStatus = (name, status) => {
-      setServices(prev => prev.map(s => s.name === name ? {
-        ...s,
-        status,
-        pid: status === 'Running' ? Math.floor(Math.random() * 9000) + 1000 : null,
-      } : s));
+      setServices(prev => prev.map(s => s.name === name ? { ...s, status, pid: null } : s));
     };
 
     const startService = async (s) => {
@@ -9539,7 +9584,7 @@
     }, [hosts, addJob, appendAudit, updateHosts, updateJob, addJobLog]);
 
     // ---- Execute deployment: create a job that progresses through Copying → Extracting → Installing → Verifying ----
-    const executeDeployment = useCallback(({ profile, targetIds }) => {
+    const executeDeployment = useCallback(async ({ profile, targetIds }) => {
       const jobId = 'job-' + Date.now();
       const targetNames = hosts.filter(h => targetIds.includes(h.id)).map(h => h.hostname);
       const phases = ['Copying (1/4)', 'Extracting (2/4)', 'Installing (3/4)', 'Verifying (4/4)'];
@@ -9569,7 +9614,28 @@
         parameters: { jobId, profileId: profile.id, profileName: profile.name, hostnames: targetNames },
         result: 'success',
       });
-      // Advance through phases every 1.8s
+
+      // Try real API first
+      if (window.SupportHubLANAPI) {
+        try {
+          const available = await window.SupportHubLANAPI.isBackendAvailable();
+          if (available) {
+            const result = await window.SupportHubLANAPI.deployPackage(targetNames, profile.path || profile.packagePath, profile.args || profile.arguments, null, profile.rebootBehavior || 'never');
+            if (result && result.success && !result.demo) {
+              updateJob(jobId, { progress: 100, step: 'Complete', status: 'complete', completedAt: new Date().toISOString() });
+              updateHosts(prev => prev.map(h => targetIds.includes(h.id) ? { ...h, lastSeen: new Date().toISOString() } : h));
+              addJobLog({ id: 'jl-' + Date.now(), queueName: `Deploy ${profile.name}`, startedAt: new Date().toISOString(), duration: '—', steps: 1, targets: targetIds.length, result: 'success' });
+              appendAudit({ action: 'deployments.complete', actionCategory: 'Deployments', targetType: 'Host', targetIds, parameters: { jobId, profileName: profile.name }, result: 'success' });
+              toast.success(`Deployment complete on ${targetNames.length} host(s)`);
+              return jobId;
+            }
+          }
+        } catch (e) {
+          // Backend call failed — fall through to simulation
+        }
+      }
+
+      // Fallback: simulate phases (demo mode or backend unavailable)
       let phaseIdx = 0;
       const interval = setInterval(() => {
         phaseIdx += 1;

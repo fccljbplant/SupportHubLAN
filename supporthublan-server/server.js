@@ -489,16 +489,13 @@ app.post('/api/audit', (req, res) => {
 // POST /api/audit/clear — clear old logs
 app.post('/api/audit/clear', (req, res) => {
   const { olderThanDays } = req.body;
-  if (olderThanDays) {
-    // Clear logs older than N days
-    const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000).toISOString();
-    const store = db.audit.list(100000, 0);
-    // Use db.audit.clear() then re-add kept entries — simpler approach
-    db.audit.clear();
-    res.json({ success: true, cleared: 'all logs older than ' + olderThanDays + ' days' });
+  if (olderThanDays && olderThanDays > 0) {
+    // Clear only logs older than N days — use audit.cleanup which filters by date
+    const result = audit.cleanup(db);
+    res.json({ success: true, removed: result.removed || 0, message: 'Cleared logs older than ' + olderThanDays + ' days' });
   } else {
     db.audit.clear();
-    res.json({ success: true });
+    res.json({ success: true, message: 'Cleared all audit logs' });
   }
 });
 

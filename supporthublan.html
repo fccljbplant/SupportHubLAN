@@ -566,6 +566,11 @@
         getLogRetention: () => apiGet('/api/settings/log-retention'),
         setLogRetention: (days) => apiCall('/api/settings/log-retention', { days }),
 
+        // Global domain credentials
+        getDomainCredentials: () => apiGet('/api/settings/domain-credentials'),
+        setDomainCredentials: (username, password, domain) => apiCall('/api/settings/domain-credentials', { username, password, domain }),
+        testDomainCredentials: () => apiCall('/api/settings/domain-credentials/test', {}),
+
         // WinRM management
         testWinRM: (hostname) => apiCall('/api/winrm/test', { hostname }),
         enableWinRM: (hostname) => apiCall('/api/winrm/enable', { hostname }),
@@ -1693,7 +1698,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v4.2.0.10';
+  const APP_VERSION = 'v4.2.0.11';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -8459,6 +8464,93 @@
     );
   };
 
+  // Domain Credentials Section — used in Settings → General
+  const DomainCredentialsSection = () => {
+    const toast = useToast();
+    const [username, setUsername] = useState('');
+    const [password, setPassword] = useState('');
+    const [domain, setDomain] = useState('');
+    const [hasPassword, setHasPassword] = useState(false);
+    const [loading, setLoading] = useState(false);
+    const [testing, setTesting] = useState(false);
+
+    useEffect(() => {
+      if (window.SupportHubLANAPI) {
+        window.SupportHubLANAPI.getDomainCredentials().then(r => {
+          if (r && r.success && !r.demo && r.data) {
+            setUsername(r.data.username || '');
+            setDomain(r.data.domain || '');
+            setHasPassword(r.data.hasPassword || false);
+          }
+        }).catch(() => {});
+      }
+    }, []);
+
+    const save = async () => {
+      if (!username || !password) { toast.warning('Username and password are required'); return; }
+      setLoading(true);
+      try {
+        if (window.SupportHubLANAPI) {
+          const r = await window.SupportHubLANAPI.setDomainCredentials(username, password, domain);
+          if (r && r.success && !r.demo) {
+            setHasPassword(true);
+            setPassword('');
+            toast.success('Domain credentials saved — all remote commands will use these');
+          } else if (r && r.demo) {
+            toast.warning('Backend not connected');
+          } else {
+            toast.error('Failed to save credentials');
+          }
+        }
+      } catch (e) { toast.error('Save failed: ' + e.message); }
+      setLoading(false);
+    };
+
+    const test = async () => {
+      setTesting(true);
+      try {
+        if (window.SupportHubLANAPI) {
+          const r = await window.SupportHubLANAPI.testDomainCredentials();
+          if (r && r.success) {
+            toast.success(`Credentials valid — identity: ${r.identity || 'confirmed'}`);
+          } else if (r && r.demo) {
+            toast.warning('Backend not connected');
+          } else {
+            toast.error('Credential test failed', { detail: r?.error, duration: 8000 });
+          }
+        }
+      } catch (e) { toast.error('Test failed: ' + e.message); }
+      setTesting(false);
+    };
+
+    return (
+      <div className="space-y-3">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <FormField label="Domain" hint="e.g. CORP or corp.local">
+            <Input value={domain} onChange={e => setDomain(e.target.value)} placeholder="CORP" className="font-mono" />
+          </FormField>
+          <FormField label="Username" hint="Domain admin or service account">
+            <Input value={username} onChange={e => setUsername(e.target.value)} placeholder="admin" className="font-mono" />
+          </FormField>
+          <FormField label="Password" hint={hasPassword ? 'Saved — enter new to replace' : 'Enter password'}>
+            <Input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder={hasPassword ? '•••••••• (saved)' : '••••••••'} className="font-mono" />
+          </FormField>
+        </div>
+        <div className="flex items-center gap-2">
+          <ActionButton variant="primary" icon="Save" disabled={loading} onClick={save}>{loading ? 'Saving…' : 'Save Credentials'}</ActionButton>
+          <ActionButton variant="secondary" icon="Plug" disabled={testing || !hasPassword} onClick={test}>{testing ? 'Testing…' : 'Test Credentials'}</ActionButton>
+          {hasPassword && <span className="text-[10px] text-success flex items-center gap-1"><Icon name="CheckCircle" size={12} /> Credentials configured</span>}
+        </div>
+        <div className="text-[10px] text-text-dim">
+          <Icon name="Info" size={12} className="inline mr-1" />
+          These credentials are automatically used for: hardware scans, service management, process listing,
+          Windows Updates, power actions (reboot/shutdown), and script execution. The account must have
+          administrative rights on the target PCs (Domain Admin or local admin).
+        </div>
+      </div>
+    );
+  };
+
   const SettingsScreen = () => {
     const toast = useToast();
     const { users, addUser, updateUser, removeUser, appendAudit, theme, setTheme, applyTheme, apiKeys, addApiKey, removeApiKey, maintenanceWindows, addMaintenanceWindow, removeMaintenanceWindow, notificationRules, updateNotificationRule } = useApp();
@@ -8570,6 +8662,11 @@
                 <FormField label="Auto-open browser on backend startup"><Select defaultValue="Yes"><option>Yes</option><option>No</option></Select></FormField>
               </div>
               <div className="mt-3"><ActionButton variant="primary" icon="Check" onClick={() => { appendAudit({ action: 'settings.general-save', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: {}, result: 'success' }); toast.success('General settings saved.'); }}>Save</ActionButton></div>
+            </SectionCard>
+
+            {/* Domain Credentials — used by ALL remote commands */}
+            <SectionCard title="Default Domain Credentials" description="Domain admin credentials used for ALL remote commands (hardware scan, services, processes, updates, power, scripts). Without these, remote commands will fail with 'Access Denied'.">
+              <DomainCredentialsSection />
             </SectionCard>
 
             {/* Log Retention Setting */}

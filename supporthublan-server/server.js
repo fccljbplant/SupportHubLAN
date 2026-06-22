@@ -509,6 +509,85 @@ app.post('/api/settings/log-retention', (req, res) => {
   res.json(result);
 });
 
+// ==========================================================================
+// GLOBAL DOMAIN CREDENTIALS — stored in db.settings, used by ALL remote
+// commands (hardware scan, ping, services, scripts, updates, power, etc.)
+// Password is encrypted with db.encryptField (AES-256-GCM, same as credentials)
+// ==========================================================================
+
+// Helper: get global domain credentials (decrypted)
+function getGlobalCredentials() {
+  try {
+    const username = db.settings.get('globalCredUsername', '') || '';
+    const encryptedPassword = db.settings.get('globalCredPassword', '') || '';
+    const domain = db.settings.get('globalCredDomain', '') || '';
+    const password = encryptedPassword ? db.decryptField(encryptedPassword) : '';
+    if (username && password) {
+      return { username, password, domain, fullUsername: domain ? domain + '\\' + username : username };
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// GET /api/settings/domain-credentials — retrieve (password masked)
+app.get('/api/settings/domain-credentials', (req, res) => {
+  const creds = getGlobalCredentials();
+  if (creds) {
+    res.json({ success: true, data: { username: creds.username, domain: creds.domain, hasPassword: true } });
+  } else {
+    res.json({ success: true, data: { username: '', domain: '', hasPassword: false } });
+  }
+});
+
+// POST /api/settings/domain-credentials — save global domain credentials
+app.post('/api/settings/domain-credentials', (req, res) => {
+  const { username, password, domain } = req.body;
+  if (!username || !password) {
+    return res.json({ success: false, error: 'Username and password are required' });
+  }
+  try {
+    db.settings.set('globalCredUsername', username);
+    db.settings.set('globalCredPassword', db.encryptField(password));
+    db.settings.set('globalCredDomain', domain || '');
+    res.json({ success: true, message: 'Domain credentials saved' });
+  } catch (e) {
+    res.json({ success: false, error: 'Failed to save credentials: ' + e.message });
+  }
+});
+
+// POST /api/settings/domain-credentials/test — test credentials by running a simple command
+app.post('/api/settings/domain-credentials/test', async (req, res) => {
+  const creds = getGlobalCredentials();
+  if (!creds) {
+    return res.json({ success: false, error: 'No domain credentials configured' });
+  }
+  // Test by running a simple whoami command via PowerShell with the credentials
+  const script = `
+    $secPass = ConvertTo-SecureString '${creds.password.replace(/'/g, "''")}' -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential('${creds.fullUsername.replace(/'/g, "''")}', $secPass)
+    try {
+      $result = Invoke-Command -ComputerName localhost -Credential $cred -ScriptBlock { whoami } -ErrorAction Stop
+      Write-Output ('<<<JSON>>>{"success":true,"identity":"' + $result + '"}<<<END>>>')
+    } catch {
+      Write-Output ('<<<JSON>>>{"success":false,"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>')
+    }
+  `;
+  const result = await runPowerShell(script, 15000);
+  const markerMatch = /<<<JSON>>>([\s\S]*?)<<<END>>>/.exec(result.stdout || '');
+  if (markerMatch) {
+    try {
+      const parsed = JSON.parse(markerMatch[1].trim());
+      res.json(parsed);
+    } catch {
+      res.json({ success: false, error: 'Could not parse test result' });
+    }
+  } else {
+    res.json({ success: false, error: result.stderr || 'Credential test failed' });
+  }
+});
+
 
 // ==========================================================================
 // JOBS — Persistent job history
@@ -630,13 +709,16 @@ app.post('/api/hosts/:hostname/info', async (req, res) => {
   const { hostname } = req.params;
   const { credential } = req.body;
   const safeHost = sanitizeHost(hostname);
-  const credBlock = credential ? buildCredentialBlock(credential) : '';
+  // Use request credential, or fall back to global domain credentials
+  const cred = credential || getGlobalCredentials();
+  const credBlock = cred ? buildCredentialBlock(cred) : '';
+  const credParam = cred ? '$params.Credential = $cred' : '';
 
   const script = `
     ${credBlock}
     try {
       $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
-      ${credential ? '$params.Credential = $cred' : ''}
+      ${credParam}
 
       $os = Get-CimInstance Win32_OperatingSystem @params
       $cs = Get-CimInstance Win32_ComputerSystem @params
@@ -779,11 +861,12 @@ app.post('/api/hosts/status-check', async (req, res) => {
 app.post('/api/updates/scan', async (req, res) => {
   const { hostnames, credential } = req.body;
   const hostList = hostnames.map(sanitizeHost).join("','");
-  const credParam = credential ? '-Credential $cred' : '';
+  const cred = credential || getGlobalCredentials();
+  const credParam = cred ? '-Credential $cred' : '';
   const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
   const startTime = Date.now();
   const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
+    ${cred ? buildCredentialBlock(cred) : ''}
     Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
     $results = @()
     foreach ($h in @('${hostList}')) {
@@ -1043,11 +1126,12 @@ app.post('/api/services/:hostname/list', async (req, res) => {
   const { hostname } = req.params;
   const { credential } = req.body;
   const safeHost = sanitizeHost(hostname);
+  const cred = credential || getGlobalCredentials();
   const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
+    ${cred ? buildCredentialBlock(cred) : ''}
     try {
       $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
-      ${credential ? '$params.Credential = $cred' : ''}
+      ${cred ? '$params.Credential = $cred' : ''}
       Get-CimInstance Win32_Service @params | Select-Object Name, DisplayName, State, StartMode, StartName | ConvertTo-Json -Compress
     } catch {
       @{ error = $_.Exception.Message } | ConvertTo-Json -Compress
@@ -1062,8 +1146,9 @@ app.post('/api/services/:hostname/action', async (req, res) => {
   const { serviceName, action, credential } = req.body;
   const safeHost = sanitizeHost(hostname);
   const safeService = sanitizeHost(serviceName);
-  const credBlock = credential ? buildCredentialBlock(credential) : '';
-  const credParam = credential ? '-Credential $cred' : '';
+  const cred = credential || getGlobalCredentials();
+  const credBlock = cred ? buildCredentialBlock(cred) : '';
+  const credParam = cred ? '-Credential $cred' : '';
   const script = `
     ${credBlock}
     try {
@@ -1086,11 +1171,12 @@ app.post('/api/processes/:hostname/list', async (req, res) => {
   const { hostname } = req.params;
   const { credential } = req.body;
   const safeHost = sanitizeHost(hostname);
+  const cred = credential || getGlobalCredentials();
   const script = `
-    ${credential ? buildCredentialBlock(credential) : ''}
+    ${cred ? buildCredentialBlock(cred) : ''}
     try {
       $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
-      ${credential ? '$params.Credential = $cred' : ''}
+      ${cred ? '$params.Credential = $cred' : ''}
       Get-CimInstance Win32_Process @params | Select-Object ProcessId, Name, @{N='MemMB';E={[math]::Round($_.WorkingSetSize/1MB,1)}}, @{N='CPU';E={$_.UserModeTime/1e7}} | ConvertTo-Json -Compress
     } catch {
       @{ error = $_.Exception.Message } | ConvertTo-Json -Compress
@@ -1125,8 +1211,9 @@ app.post('/api/processes/:hostname/kill', async (req, res) => {
 app.post('/api/power/action', async (req, res) => {
   const { hostname, action, credential, message, timeout } = req.body;
   const safeHost = sanitizeHost(hostname);
-  const credBlock = credential ? buildCredentialBlock(credential) : '';
-  const credParam = credential ? '-Credential $cred' : '';
+  const cred = credential || getGlobalCredentials();
+  const credBlock = cred ? buildCredentialBlock(cred) : '';
+  const credParam = cred ? '-Credential $cred' : '';
   const msgParam = message ? `-Force` : `-Force`;
   const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
   const startTime = Date.now();
@@ -2245,11 +2332,6 @@ function broadcastUpdate(data) {
 // ==========================================================================
 // START SERVER
 // ==========================================================================
-// Check PSWindowsUpdate availability at startup (async, non-blocking)
-checkPSWindowsUpdate().then(available => {
-  console.log(`[startup] PSWindowsUpdate module: ${available ? 'available' : 'NOT installed (Windows Update features will not work on this server)'}`);
-}).catch(() => {});
-
 server.listen(PORT, BIND_ADDRESS, () => {
   const displayIp = BIND_ADDRESS === '0.0.0.0' ? 'localhost' : BIND_ADDRESS;
   console.log(`
@@ -2294,4 +2376,11 @@ server.listen(PORT, BIND_ADDRESS, () => {
   } else if (AUTO_OPEN) {
     console.log('  (Auto-open is Windows-only. Open http://localhost:' + PORT + ' in your browser.)');
   }
+
+  // Check PSWindowsUpdate availability AFTER server is listening (non-blocking)
+  checkPSWindowsUpdate().then(available => {
+    console.log(`[startup] PSWindowsUpdate module: ${available ? 'available' : 'NOT installed (Windows Update features will not work on this server)'}`);
+  }).catch(() => {
+    console.log('[startup] PSWindowsUpdate check failed (non-critical)');
+  });
 });

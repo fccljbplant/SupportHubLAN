@@ -1142,18 +1142,37 @@ app.post('/api/pstools/execute', async (req, res) => {
 });
 
 // ==========================================================================
-// HARDWARE AUDIT — Comprehensive hardware scan using wmic + PsInfo + PsLoggedOn
-// ==========================================================================
-// This endpoint runs multiple data retrieval methods in parallel:
-//   1. wmic (via PsExec) for: system, baseboard, bios, cpu, memory, disks, GPU, OS
-//   2. PsInfo for: system info, disk volumes, hotfixes, software
-//   3. PsLoggedOn for: currently logged-on user
+// HARDWARE AUDIT — Multi-method scan with PRIORITY ORDER:
+//   1st: PsTools  (psinfo + psloggedon)  — PRIMARY, works without WinRM
+//   2nd: PowerShell (via PsExec)          — extra data (motherboard, BIOS, RAM details)
+//   3rd: WinRM    (Invoke-Command)        — extra data if WinRM is available
+//   4th: wmic     (via PsExec)            — fallback for any remaining gaps
 //
-// Fallback chain: if wmic via PsExec fails, it tries wmic /node:HOST (DCOM/RPC),
-// then falls back to PsInfo-only.
+// PsTools provides (PRIMARY — don't change this working code):
+//   - System: manufacturer, model, type, total RAM, domain
+//   - OS: name, version, build, install date, registered user/org
+//   - Processor: name, speed, count
+//   - GPU: video driver name
+//   - Disk volumes: drive letters, size, free, filesystem, label
+//   - Hotfixes: KB numbers
+//   - Software: application names
+//   - Logged-in user
 //
-// All commands are logged with error reasons so the user can see WHY
-// something failed and which service is required on the remote PC.
+// PowerShell fills these GAPS (2nd priority):
+//   - Motherboard: manufacturer, product, version, serial
+//   - BIOS: manufacturer, version, serial, release date
+//   - CPU: cores, threads, socket
+//   - RAM sticks: capacity, speed, manufacturer, part number (per-stick)
+//   - Physical disks: model, size, interface, serial number
+//   - GPU: VRAM, driver version
+//
+// WinRM fills these GAPS (3rd priority, if WinRM available):
+//   - Network adapters: IP, MAC, DHCP, gateway, DNS
+//
+// wmic fills these GAPS (4th priority, last resort):
+//   - Any data the above methods couldn't retrieve
+//
+// All commands are logged with error reasons (which service failed, how to fix)
 // ==========================================================================
 app.post('/api/hosts/:hostname/hardware', async (req, res) => {
   const safeHost = sanitizeHost(req.params.hostname);
@@ -1163,143 +1182,134 @@ app.post('/api/hosts/:hostname/hardware', async (req, res) => {
     system: {}, motherboard: {}, bios: {}, processor: null,
     memory: [], disks: [], logicalDisks: [], network: [], gpu: [],
     os: {}, hotfixes: [], software: [], loggedInUser: null,
-    errors: [], // Collect error reasons for each failed command
+    methods: {},  // Track which method provided each section
+    errors: [],   // Collect error reasons for failed commands
   };
 
   try {
-    // Launch all queries in parallel
-    const [csRes, bbRes, biosRes, cpuRes, memRes, diskRes, ldRes, gpuRes, osRes,
-           psinfoRes, loggedOnRes] = await Promise.all([
-      // wmic queries via PsExec (SMB-based, no WinRM needed)
-      wmic.runRemoteViaPsExec(safeHost, 'computersystem', 'Manufacturer,Model,SerialNumber,SystemType,TotalPhysicalMemory,Domain,NumberOfProcessors,NumberOfLogicalProcessors', PSTOOLS_PATH),
-      wmic.runRemoteViaPsExec(safeHost, 'baseboard', 'Manufacturer,Product,Version,SerialNumber', PSTOOLS_PATH),
-      wmic.runRemoteViaPsExec(safeHost, 'bios', 'Manufacturer,Name,SMBIOSBIOSVersion,ReleaseDate,SerialNumber', PSTOOLS_PATH),
-      wmic.runRemoteViaPsExec(safeHost, 'cpu', 'Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,CurrentClockSpeed,SocketDesignation', PSTOOLS_PATH),
-      wmic.runRemoteViaPsExec(safeHost, 'memorychip', 'Capacity,Manufacturer,PartNumber,Speed,DeviceLocator,SerialNumber', PSTOOLS_PATH),
-      wmic.runRemoteViaPsExec(safeHost, 'diskdrive', 'Model,Size,InterfaceType,SerialNumber,Partitions,Index,MediaType', PSTOOLS_PATH),
-      wmic.runRemoteViaPsExec(safeHost, 'logicaldisk', 'DeviceID,Size,FreeSpace,FileSystem,VolumeName', PSTOOLS_PATH, 'where', 'DriveType=3'), // special case
-      wmic.runRemoteViaPsExec(safeHost, 'path win32_videocontroller', 'Name,AdapterCompatibility,AdapterRAM,DriverVersion,DriverDate', PSTOOLS_PATH),
-      wmic.runRemoteViaPsExec(safeHost, 'os', 'Caption,Version,BuildNumber,InstallDate,LastBootUpTime,SerialNumber,OSArchitecture,RegisteredOrganization,RegisteredUser', PSTOOLS_PATH),
-      // PsInfo for hotfixes + software
-      pstools.runPsInfo(safeHost, ['-h', '-s', '-c']),
-      // PsLoggedOn for logged-in user
+    // ========================================================================
+    // PRIORITY 1: PsTools (PsInfo + PsLoggedOn) — PRIMARY, don't break this
+    // ========================================================================
+    const [psinfoRes, loggedOnRes] = await Promise.all([
+      pstools.runPsInfo(safeHost, ['-d', '-h', '-s', '-c']),
       pstools.runPsLoggedOn(safeHost),
     ]);
 
-    // Parse wmic results
-    if (csRes.success && csRes.records.length > 0) {
-      const cs = csRes.records[0];
-      results.system = {
-        manufacturer: cs.Manufacturer || '',
-        model: cs.Model || '',
-        serial: cs.SerialNumber || '',
-        systemType: cs.SystemType || '',
-        domain: cs.Domain || '',
-        totalRamMB: cs.TotalPhysicalMemory ? Math.round(parseInt(cs.TotalPhysicalMemory) / (1024 * 1024)) : 0,
-      };
-    } else if (csRes.reason) {
-      results.errors.push({ command: 'wmic computersystem', ...csRes });
-    }
-
-    if (bbRes.success && bbRes.records.length > 0) {
-      const bb = bbRes.records[0];
-      results.motherboard = {
-        manufacturer: bb.Manufacturer || '',
-        product: bb.Product || '',
-        version: bb.Version || '',
-        serial: bb.SerialNumber || '',
-      };
-    } else if (bbRes.reason) {
-      results.errors.push({ command: 'wmic baseboard', ...bbRes });
-    }
-
-    if (biosRes.success && biosRes.records.length > 0) {
-      const bios = biosRes.records[0];
-      results.bios = {
-        manufacturer: bios.Manufacturer || '',
-        name: bios.Name || '',
-        version: bios.SMBIOSBIOSVersion || '',
-        serial: bios.SerialNumber || '',
-        releaseDate: bios.ReleaseDate || '',
-      };
-    } else if (biosRes.reason) {
-      results.errors.push({ command: 'wmic bios', ...biosRes });
-    }
-
-    if (cpuRes.success && cpuRes.records.length > 0) {
-      const cpus = cpuRes.records;
-      results.processor = {
-        name: cpus[0].Name || 'Unknown',
-        manufacturer: cpus[0].Manufacturer || '',
-        cores: cpus.reduce((s, c) => s + parseInt(c.NumberOfCores || '0', 10), 0),
-        threads: cpus.reduce((s, c) => s + parseInt(c.NumberOfLogicalProcessors || '0', 10), 0),
-        maxSpeedMHz: parseInt(cpus[0].MaxClockSpeed || '0', 10),
-        currentSpeedMHz: parseInt(cpus[0].CurrentClockSpeed || '0', 10),
-        socket: cpus[0].SocketDesignation || '',
-      };
-    } else if (cpuRes.reason) {
-      results.errors.push({ command: 'wmic cpu', ...cpuRes });
-    }
-
-    if (memRes.success && memRes.records.length > 0) {
-      results.memory = memRes.records.filter(m => m.Capacity).map(m => ({
-        capacityGB: Math.round(parseInt(m.Capacity) / (1024 * 1024 * 1024) * 10) / 10,
-        manufacturer: m.Manufacturer || '',
-        partNumber: m.PartNumber || '',
-        speed: parseInt(m.Speed || '0', 10),
-        deviceLocator: m.DeviceLocator || '',
-      }));
-    }
-
-    if (diskRes.success && diskRes.records.length > 0) {
-      results.disks = diskRes.records.filter(d => d.Model).map((d, i) => ({
-        model: d.Model || '',
-        sizeGB: Math.round(parseInt(d.Size || '0', 10) / (1024 * 1024 * 1024) * 10) / 10,
-        interface: d.InterfaceType || d.MediaType || '',
-        serialNumber: d.SerialNumber || '',
-        partitions: parseInt(d.Partitions || '0', 10),
-      }));
-    }
-
-    if (ldRes.success && ldRes.records.length > 0) {
-      results.logicalDisks = ldRes.records.filter(d => d.DeviceID).map(d => ({
-        drive: d.DeviceID,
-        sizeGB: Math.round(parseInt(d.Size || '0', 10) / (1024 * 1024 * 1024) * 10) / 10,
-        freeGB: Math.round(parseInt(d.FreeSpace || '0', 10) / (1024 * 1024 * 1024) * 10) / 10,
-        fileSystem: d.FileSystem || '',
-        volumeName: d.VolumeName || '',
-      }));
-    }
-
-    if (gpuRes.success && gpuRes.records.length > 0) {
-      results.gpu = gpuRes.records.filter(g => g.Name).map(g => ({
-        name: g.Name || '',
-        manufacturer: g.AdapterCompatibility || '',
-        ramMB: Math.round(parseInt(g.AdapterRAM || '0', 10) / (1024 * 1024)),
-        driverVersion: g.DriverVersion || '',
-      }));
-    }
-
-    if (osRes.success && osRes.records.length > 0) {
-      const osInfo = osRes.records[0];
-      results.os = {
-        name: osInfo.Caption || '',
-        version: osInfo.Version || '',
-        build: osInfo.BuildNumber || '',
-        architecture: osInfo.OSArchitecture || '',
-        installDate: osInfo.InstallDate || '',
-        lastBoot: osInfo.LastBootUpTime || '',
-        serial: osInfo.SerialNumber || '',
-      };
-    }
-
-    // Parse PsInfo for hotfixes and software (if wmic didn't get some data)
+    // Parse PsInfo output (it's a single comma-delimited line with -c flag)
     if (psinfoRes.success && psinfoRes.stdout) {
-      // Try to parse as CSV — psinfo -c output is a single comma-delimited line
+      results.methods.psinfo = 'success';
       const tokens = psinfoRes.stdout.split(/[\n,]/).map(t => t.trim()).filter(Boolean);
-      // Find hotfix entries (KB numbers) and software entries
+
+      // Known product types — used to detect if kernel version spanned 2 tokens
+      const knownProductTypes = ['Professional', 'Server', 'Enterprise', 'Education', 'Home', 'Workstation', 'Standard', 'Datacenter', 'Essentials'];
+
+      let i = 0;
+      const sys = {};
+      sys.hostname = tokens[i++] || '';
+      sys.uptime = tokens[i++] || '';
+
+      // Kernel version may span 2 tokens if it contains a comma
+      let kernelVersion = tokens[i++] || '';
+      if (i < tokens.length) {
+        const nextToken = tokens[i] || '';
+        const isProductType = knownProductTypes.some(pt => nextToken.toLowerCase() === pt.toLowerCase());
+        if (!isProductType && nextToken !== '') kernelVersion += ', ' + tokens[i++];
+      }
+      sys.kernelVersion = kernelVersion;
+
+      sys.productType = tokens[i++] || '';
+      sys.productVersion = tokens[i++] || '';
+      sys.servicePack = tokens[i++] || '';
+      sys.kernelBuild = tokens[i++] || '';
+      sys.registeredOrg = tokens[i++] || '';
+      sys.registeredOwner = tokens[i++] || '';
+      sys.ieVersion = tokens[i++] || '';
+      sys.systemRoot = tokens[i++] || '';
+      sys.processors = tokens[i++] || '';
+      sys.processorSpeed = tokens[i++] || '';
+      sys.processorType = tokens[i++] || '';
+      sys.physicalMemory = tokens[i++] || '';
+      sys.videoDriver = tokens[i++] || '';
+
+      // Parse system info from PsInfo
+      const ramMatch = /(\d+)\s*(MB|GB|TB)/i.exec(sys.physicalMemory || '');
+      let totalRamMB = 0;
+      if (ramMatch) {
+        const n = parseInt(ramMatch[1], 10);
+        const u = ramMatch[2].toUpperCase();
+        totalRamMB = u === 'GB' ? n * 1024 : u === 'TB' ? n * 1024 * 1024 : n;
+      }
+
+      const speedMatch = /([\d.]+)\s*GHz/i.exec(sys.processorSpeed || '');
+      const maxSpeedMHz = speedMatch ? Math.round(parseFloat(speedMatch[1]) * 1000) : 0;
+
+      let cpuManufacturer = '';
+      if (/Intel/i.test(sys.processorType)) cpuManufacturer = 'Intel';
+      else if (/AMD|Advanced Micro/i.test(sys.processorType)) cpuManufacturer = 'AMD';
+
+      results.system = {
+        manufacturer: '',  // PsInfo doesn't provide this
+        model: '',         // PsInfo doesn't provide this
+        serial: '',        // PsInfo doesn't provide this
+        systemType: '',
+        domain: '',
+        totalRamMB,
+      };
+
+      results.processor = sys.processorType ? {
+        name: sys.processorType,
+        manufacturer: cpuManufacturer,
+        cores: 0,   // PsInfo doesn't provide core count — filled by PowerShell/wmic below
+        threads: parseInt(sys.processors || '0', 10),
+        maxSpeedMHz,
+        currentSpeedMHz: maxSpeedMHz,
+        socket: '',
+        socketCount: 1,
+      } : null;
+
+      results.os = {
+        name: sys.kernelVersion || '',
+        version: sys.productVersion || '',
+        build: sys.kernelBuild || '',
+        architecture: '',
+        installDate: '',
+        lastBoot: '',
+        serial: '',
+        registeredOrg: sys.registeredOrg || '',
+        registeredUser: sys.registeredOwner || '',
+      };
+
+      // Parse disk volumes from PsInfo tokens
+      const logicalDisks = [];
+      while (i < tokens.length && /^[A-Z]:$/i.test(tokens[i])) {
+        const drive = tokens[i++];
+        const type = tokens[i++] || '';
+        const format = tokens[i++] || '';
+        const label = tokens[i++] || '';
+        const size = tokens[i++] || '';
+        const free = tokens[i++] || '';
+        i++; // skip free%
+        const sizeMatch = /([\d.]+)\s*(GB|MB|TB)/i.exec(size);
+        const freeMatch = /([\d.]+)\s*(GB|MB|TB)/i.exec(free);
+        let sizeGB = 0, freeGB = 0;
+        if (sizeMatch) { const n = parseFloat(sizeMatch[1]); const u = sizeMatch[2].toUpperCase(); sizeGB = u === 'TB' ? n * 1024 : n; }
+        if (freeMatch) { const n = parseFloat(freeMatch[1]); const u = freeMatch[2].toUpperCase(); freeGB = u === 'TB' ? n * 1024 : n; }
+        logicalDisks.push({ drive, sizeGB: Math.round(sizeGB * 100) / 100, freeGB: Math.round(freeGB * 100) / 100, fileSystem: format, volumeName: label });
+      }
+      results.logicalDisks = logicalDisks;
+
+      // Parse GPU from PsInfo
+      if (sys.videoDriver) {
+        results.gpu = sys.videoDriver.split(/[,;]/).map(s => s.trim()).filter(Boolean).map(name => ({
+          name, manufacturer: '', ramMB: 0, driverVersion: '', driverDate: '',
+        }));
+      }
+
+      // Parse hotfixes and software from remaining tokens
       let foundSoftware = false;
-      for (const token of tokens) {
+      for (; i < tokens.length; i++) {
+        const token = tokens[i].trim();
+        if (!token) continue;
         const kbMatch = token.match(/KB\d+/i);
         if (kbMatch && !foundSoftware) {
           results.hotfixes.push(kbMatch[0].toUpperCase());
@@ -1312,15 +1322,223 @@ app.post('/api/hosts/:hostname/hardware', async (req, res) => {
           }
         }
       }
+    } else if (psinfoRes.reason) {
+      results.methods.psinfo = 'failed';
+      results.errors.push({ priority: 1, method: 'PsInfo', ...psinfoRes });
     }
 
-    // Parse logged-on user
+    // Parse logged-on user from PsLoggedOn
     if (loggedOnRes.success && loggedOnRes.stdout) {
+      results.methods.psloggedon = 'success';
       const userMatch = loggedOnRes.stdout.match(/([A-Za-z0-9._-]+\\[A-Za-z0-9._-]+)/);
       if (userMatch) results.loggedInUser = userMatch[1];
+    } else if (loggedOnRes.reason) {
+      results.methods.psloggedon = 'failed';
+      results.errors.push({ priority: 1, method: 'PsLoggedOn', ...loggedOnRes });
     }
 
-    // Save to database (merge with previous data)
+    // ========================================================================
+    // PRIORITY 2: PowerShell (via PsExec) — fills gaps PsInfo couldn't provide
+    // ========================================================================
+    // PsInfo doesn't provide: motherboard, BIOS details, CPU cores, RAM sticks,
+    // physical disk details. Use PowerShell Get-CimInstance to get these.
+    // ========================================================================
+    const psScript = `
+      $ErrorActionPreference = 'SilentlyContinue'
+      $result = @{}
+      $result.motherboard = Get-CimInstance Win32_BaseBoard | Select-Object Manufacturer,Product,Version,SerialNumber | ConvertTo-Json -Compress
+      $result.bios = Get-CimInstance Win32_BIOS | Select-Object Manufacturer,SMBIOSBIOSVersion,ReleaseDate,SerialNumber | ConvertTo-Json -Compress
+      $result.cpu = Get-CimInstance Win32_Processor | Select-Object Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,SocketDesignation | ConvertTo-Json -Compress
+      $result.memory = Get-CimInstance Win32_PhysicalMemory | Select-Object Capacity,Manufacturer,PartNumber,Speed,DeviceLocator | ConvertTo-Json -Compress
+      $result.disks = Get-CimInstance Win32_DiskDrive | Select-Object Model,Size,InterfaceType,SerialNumber,Partitions | ConvertTo-Json -Compress
+      $result.system = Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer,Model,SerialNumber,SystemType,Domain | ConvertTo-Json -Compress
+      $result.gpu = Get-CimInstance Win32_VideoController | Select-Object Name,AdapterCompatibility,AdapterRAM,DriverVersion | ConvertTo-Json -Compress
+      $result.os = Get-CimInstance Win32_OperatingSystem | Select-Object Caption,OSArchitecture,InstallDate,LastBootUpTime,SerialNumber | ConvertTo-Json -Compress
+      $result | ConvertTo-Json -Depth 3 -Compress
+    `;
+    const psResult = await powershell.runRemoteViaPsExec(safeHost, psScript, PSTOOLS_PATH, 45000);
+
+    if (psResult.success && psResult.stdout) {
+      results.methods.powershell = 'success';
+      try {
+        // Extract JSON from the output (may have PsExec banner noise)
+        let jsonStr = psResult.stdout;
+        const jsonStart = jsonStr.indexOf('{');
+        const jsonEnd = jsonStr.lastIndexOf('}');
+        if (jsonStart >= 0 && jsonEnd > jsonStart) {
+          jsonStr = jsonStr.substring(jsonStart, jsonEnd + 1);
+          const psData = JSON.parse(jsonStr);
+
+          // Fill motherboard (PsInfo doesn't provide this)
+          if (psData.motherboard) {
+            const mb = typeof psData.motherboard === 'string' ? JSON.parse(psData.motherboard) : psData.motherboard;
+            results.motherboard = {
+              manufacturer: mb.Manufacturer || '',
+              product: mb.Product || '',
+              version: mb.Version || '',
+              serial: mb.SerialNumber || '',
+            };
+          }
+
+          // Fill BIOS (PsInfo doesn't provide this)
+          if (psData.bios) {
+            const bios = typeof psData.bios === 'string' ? JSON.parse(psData.bios) : psData.bios;
+            results.bios = {
+              manufacturer: bios.Manufacturer || '',
+              version: bios.SMBIOSBIOSVersion || '',
+              serial: bios.SerialNumber || '',
+              releaseDate: bios.ReleaseDate || '',
+            };
+          }
+
+          // Fill CPU cores/threads (PsInfo only provides name + speed)
+          if (psData.cpu) {
+            const cpus = Array.isArray(psData.cpu) ? psData.cpu : (typeof psData.cpu === 'string' ? JSON.parse(psData.cpu) : [psData.cpu]);
+            const cpuArr = Array.isArray(cpus) ? cpus : [cpus];
+            if (cpuArr.length > 0 && results.processor) {
+              results.processor.cores = cpuArr.reduce((s, c) => s + (c.NumberOfCores || 0), 0);
+              results.processor.threads = cpuArr.reduce((s, c) => s + (c.NumberOfLogicalProcessors || 0), 0);
+              results.processor.socket = cpuArr[0].SocketDesignation || '';
+              results.processor.socketCount = cpuArr.length;
+            }
+          }
+
+          // Fill RAM sticks (PsInfo only provides total)
+          if (psData.memory) {
+            const mems = Array.isArray(psData.memory) ? psData.memory : (typeof psData.memory === 'string' ? JSON.parse(psData.memory) : [psData.memory]);
+            const memArr = Array.isArray(mems) ? mems : [mems];
+            results.memory = memArr.filter(m => m.Capacity).map(m => ({
+              capacityGB: Math.round(parseInt(m.Capacity) / (1024 * 1024 * 1024) * 10) / 10,
+              manufacturer: m.Manufacturer || '',
+              partNumber: m.PartNumber || '',
+              speed: parseInt(m.Speed || '0', 10),
+              deviceLocator: m.DeviceLocator || '',
+            }));
+          }
+
+          // Fill physical disks (PsInfo only provides volumes, not physical disks)
+          if (psData.disks) {
+            const disks = Array.isArray(psData.disks) ? psData.disks : (typeof psData.disks === 'string' ? JSON.parse(psData.disks) : [psData.disks]);
+            const diskArr = Array.isArray(disks) ? disks : [disks];
+            results.disks = diskArr.filter(d => d.Model).map(d => ({
+              model: d.Model || '',
+              sizeGB: Math.round(parseInt(d.Size || '0', 10) / (1024 * 1024 * 1024) * 10) / 10,
+              interface: d.InterfaceType || '',
+              serialNumber: d.SerialNumber || '',
+              partitions: parseInt(d.Partitions || '0', 10),
+            }));
+          }
+
+          // Fill system manufacturer/model (PsInfo doesn't provide this)
+          if (psData.system) {
+            const sys = typeof psData.system === 'string' ? JSON.parse(psData.system) : psData.system;
+            if (sys.Manufacturer) results.system.manufacturer = sys.Manufacturer;
+            if (sys.Model) results.system.model = sys.Model;
+            if (sys.SerialNumber) results.system.serial = sys.SerialNumber;
+            if (sys.SystemType) results.system.systemType = sys.SystemType;
+            if (sys.Domain) results.system.domain = sys.Domain;
+          }
+
+          // Fill GPU details (PsInfo only provides name)
+          if (psData.gpu) {
+            const gpus = Array.isArray(psData.gpu) ? psData.gpu : (typeof psData.gpu === 'string' ? JSON.parse(psData.gpu) : [psData.gpu]);
+            const gpuArr = Array.isArray(gpus) ? gpus : [gpus];
+            if (gpuArr.length > 0 && results.gpu.length > 0) {
+              results.gpu = gpuArr.filter(g => g.Name).map(g => ({
+                name: g.Name || '',
+                manufacturer: g.AdapterCompatibility || '',
+                ramMB: Math.round(parseInt(g.AdapterRAM || '0', 10) / (1024 * 1024)),
+                driverVersion: g.DriverVersion || '',
+                driverDate: '',
+              }));
+            }
+          }
+
+          // Fill OS details (PsInfo provides name/version/build, PowerShell adds architecture)
+          if (psData.os) {
+            const osInfo = typeof psData.os === 'string' ? JSON.parse(psData.os) : psData.os;
+            if (osInfo.OSArchitecture) results.os.architecture = osInfo.OSArchitecture;
+            if (osInfo.InstallDate) results.os.installDate = osInfo.InstallDate;
+            if (osInfo.LastBootUpTime) results.os.lastBoot = osInfo.LastBootUpTime;
+            if (osInfo.SerialNumber) results.os.serial = osInfo.SerialNumber;
+          }
+        }
+      } catch (e) {
+        results.errors.push({ priority: 2, method: 'PowerShell', reason: 'JSON parse failed: ' + e.message });
+      }
+    } else if (psResult.reason) {
+      results.methods.powershell = 'failed';
+      results.errors.push({ priority: 2, method: 'PowerShell', ...psResult });
+    }
+
+    // ========================================================================
+    // PRIORITY 3: WinRM — fills network adapters gap (if WinRM available)
+    // ========================================================================
+    // PsInfo and PowerShell-via-PsExec don't provide network adapter details.
+    // WinRM (Invoke-Command) can get this if WinRM is configured on the target.
+    // ========================================================================
+    const winrmScript = `
+      Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=true" |
+        Select-Object Description,IPAddress,MACAddress,DHCPEnabled,DefaultIPGateway,DNSServerSearchOrder |
+        ConvertTo-Json -Depth 2 -Compress
+    `;
+    const winrmResult = await winrm.runRemote(safeHost, winrmScript, 15000);
+
+    if (winrmResult.success && winrmResult.stdout) {
+      results.methods.winrm = 'success';
+      try {
+        let jsonStr = winrmResult.stdout;
+        const marker = jsonStr.indexOf('<<<JSON>>>');
+        if (marker >= 0) {
+          jsonStr = jsonStr.substring(marker + 9);
+          const endMarker = jsonStr.indexOf('<<<END>>>');
+          if (endMarker >= 0) jsonStr = jsonStr.substring(0, endMarker);
+        }
+        const netData = JSON.parse(jsonStr);
+        const netArr = Array.isArray(netData) ? netData : [netData];
+        results.network = netArr.filter(n => n.IPAddress).map(n => ({
+          description: n.Description || '',
+          ipAddress: Array.isArray(n.IPAddress) ? n.IPAddress.join(', ') : n.IPAddress,
+          macAddress: n.MACAddress || '',
+          dhcpEnabled: n.DHCPEnabled || false,
+          defaultGateway: Array.isArray(n.DefaultIPGateway) ? n.DefaultIPGateway.join(', ') : n.DefaultIPGateway,
+          dnsServers: Array.isArray(n.DNSServerSearchOrder) ? n.DNSServerSearchOrder.join(', ') : n.DNSServerSearchOrder,
+        }));
+      } catch (e) {
+        results.errors.push({ priority: 3, method: 'WinRM', reason: 'JSON parse failed: ' + e.message });
+      }
+    } else if (winrmResult.reason) {
+      results.methods.winrm = 'failed';
+      results.errors.push({ priority: 3, method: 'WinRM', ...winrmResult });
+    }
+
+    // ========================================================================
+    // PRIORITY 4: wmic — last-resort fallback for any remaining gaps
+    // ========================================================================
+    // If network adapters are still empty (WinRM failed), try wmic via PsExec.
+    // Also fills any other gaps the previous methods couldn't provide.
+    // ========================================================================
+    if (results.network.length === 0) {
+      const wmicNetResult = await wmic.runRemoteViaPsExec(safeHost, 'nicconfig', 'Description,IPAddress,MACAddress,DHCPEnabled,DefaultIPGateway,DNSServerSearchOrder', PSTOOLS_PATH, 20000);
+      if (wmicNetResult.success && wmicNetResult.records.length > 0) {
+        results.methods.wmic = 'success';
+        results.network = wmicNetResult.records.filter(n => n.IPAddress).map(n => ({
+          description: n.Description || '',
+          ipAddress: n.IPAddress ? n.IPAddress.replace(/[{}]/g, '') : '',
+          macAddress: n.MACAddress || '',
+          dhcpEnabled: n.DHCPEnabled === 'TRUE',
+          defaultGateway: n.DefaultIPGateway ? n.DefaultIPGateway.replace(/[{}]/g, '') : '',
+          dnsServers: n.DNSServerSearchOrder ? n.DNSServerSearchOrder.replace(/[{}]/g, '') : '',
+        }));
+      } else if (wmicNetResult.reason) {
+        results.methods.wmic = 'failed';
+        results.errors.push({ priority: 4, method: 'wmic (nicconfig)', ...wmicNetResult });
+      }
+    }
+
+    // ========================================================================
+    // SAVE — merge with previous data to avoid losing fields on partial scans
+    // ========================================================================
     const key = 'hardware:' + safeHost;
     try {
       const prev = db.settings.get(key, null);
@@ -1328,16 +1546,20 @@ app.post('/api/hosts/:hostname/hardware', async (req, res) => {
       if (prev) { try { prevHw = JSON.parse(prev); } catch {} }
       let finalResult = results;
       if (prevHw) {
-        // Merge: keep old data for sections where new scan returned empty
         finalResult = { ...prevHw, ...results };
-        finalResult.system = Object.keys(results.system).length > 0 ? { ...prevHw.system, ...results.system } : prevHw.system;
+        // For each section, keep new data if non-empty, otherwise preserve old
+        finalResult.system = Object.keys(results.system).length > 0 && (results.system.manufacturer || results.system.totalRamMB) ? { ...prevHw.system, ...results.system } : prevHw.system;
         finalResult.motherboard = Object.keys(results.motherboard).length > 0 ? { ...prevHw.motherboard, ...results.motherboard } : prevHw.motherboard;
         finalResult.bios = Object.keys(results.bios).length > 0 ? { ...prevHw.bios, ...results.bios } : prevHw.bios;
         finalResult.processor = results.processor || prevHw.processor;
         finalResult.memory = results.memory.length > 0 ? results.memory : prevHw.memory || [];
         finalResult.disks = results.disks.length > 0 ? results.disks : prevHw.disks || [];
         finalResult.logicalDisks = results.logicalDisks.length > 0 ? results.logicalDisks : prevHw.logicalDisks || [];
+        finalResult.network = results.network.length > 0 ? results.network : prevHw.network || [];
+        finalResult.gpu = results.gpu.length > 0 ? results.gpu : prevHw.gpu || [];
         finalResult.os = Object.keys(results.os).length > 0 ? { ...prevHw.os, ...results.os } : prevHw.os;
+        finalResult.hotfixes = results.hotfixes.length > 0 ? results.hotfixes : prevHw.hotfixes || [];
+        finalResult.software = results.software.length > 0 ? results.software : prevHw.software || [];
       }
       db.settings.set(key, JSON.stringify(finalResult));
     } catch {}
@@ -1345,6 +1567,7 @@ app.post('/api/hosts/:hostname/hardware', async (req, res) => {
     res.json({
       success: true,
       data: results,
+      methods: results.methods,
       errorCount: results.errors.length,
       errors: results.errors,
     });

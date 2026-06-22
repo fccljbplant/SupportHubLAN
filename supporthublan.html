@@ -1366,7 +1366,7 @@
   );
 
   // ---- DataTable: sortable, selectable, paginated ----
-  const DataTable = ({ columns, rows, selectable = true, selectedIds = [], onSelectionChange, onRowClick, density = 'default', emptyMessage = 'No data', maxRows, onContextMenu }) => {
+  const DataTable = ({ columns, rows, selectable = true, selectedIds = [], onSelectionChange, onRowClick, density = 'default', emptyMessage = 'No data', maxRows }) => {
     const [sortBy, setSortBy] = useState(null);
     const [sortDir, setSortDir] = useState('asc');
     const [page, setPage] = useState(0);
@@ -1440,7 +1440,6 @@
                   <tr
                     key={row.id}
                     onClick={() => onRowClick && onRowClick(row)}
-                    onContextMenu={(e) => { if (onContextMenu) { e.preventDefault(); onContextMenu(e, row); } }}
                     className={`border-b border-border/50 hover:bg-surface-raised transition-colors ${isSelected ? 'bg-primary/5' : ''} ${onRowClick ? 'cursor-pointer' : ''}`}
                     style={isSelected ? { boxShadow: 'inset 2px 0 0 #4f83ff' } : (row._rowColor ? { boxShadow: `inset 3px 0 0 ${row._rowColor}`, background: row._rowColor + '10' } : undefined)}
                     style={isSelected ? { boxShadow: 'inset 2px 0 0 #4f83ff' } : undefined}
@@ -1694,7 +1693,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v4.2.0.9';
+  const APP_VERSION = 'v4.2.0.10';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -3833,7 +3832,6 @@
     const [showColumnChooser, setShowColumnChooser] = useState(false);
     const [hiddenCols, setHiddenCols] = useState(new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials']));
     const [confirmReboot, setConfirmReboot] = useState(false);
-    const [contextMenu, setContextMenu] = useState(null);
     const [editingHost, setEditingHost] = useState(null);
     const [remoteDesktopProtocol, setRemoteDesktopProtocol] = useState(() => { try { return localStorage.getItem('supporthublan:rdp-protocol') || 'VNC'; } catch(e) { return 'VNC'; } });
 
@@ -3958,7 +3956,7 @@
 
     const allColumns = [
       { key: 'led', label: 'LED', sortable: false, headerRender: () => (
-        <span className="inline-flex items-center gap-1 cursor-pointer" title="Click: start/stop all · Middle-click: reset all" onClick={() => { updateHosts(prev => prev.map(h => ({...h, _ledStopped: !h._ledStopped }))); toast.info('LED monitoring toggled.'); }} onContextMenu={(e) => { e.preventDefault(); updateHosts(prev => prev.map(h => ({...h, _ledOverride: undefined, _ledBlue: undefined, _ledStopped: undefined }))); toast.info('All LEDs reset.'); }}>
+        <span className="inline-flex items-center gap-1 cursor-pointer" title="Click: start/stop all LED monitoring" onClick={() => { updateHosts(prev => prev.map(h => ({...h, _ledStopped: !h._ledStopped }))); toast.info('LED monitoring toggled.'); }}>
           <Icon name="Activity" size={11} className="text-success" />
         </span>
       ), render: (h) => {
@@ -4049,6 +4047,17 @@
     const rows = filteredHosts.map(h => ({ ...h, id: h.id, status: h.onlineStatus }));
 
     const bulkActions = [
+      { label: 'Refresh', icon: 'RefreshCw', onClick: () => {
+        if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; }
+        updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, lastSeen: new Date().toISOString() } : h));
+        appendAudit({ action: 'hosts.refresh', actionCategory: 'Inventory', targetType: 'Host', targetIds: [...selectedIds], parameters: {}, result: 'success' });
+        toast.success(`Refreshed ${selectedIds.length} host(s)`);
+      } },
+      { label: 'Edit', icon: 'Edit', onClick: () => {
+        if (selectedIds.length !== 1) { toast.warning('Select exactly one host to edit.'); return; }
+        const h = hosts.find(x => x.id === selectedIds[0]);
+        if (h) setEditingHost(h);
+      } },
       { label: 'Check Updates', icon: 'Search', onClick: () => {
         if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; }
         addJob({ id: 'job-' + Date.now(), name: `Scan — ${selectedIds.length} hosts`, targets: [...selectedIds], step: 'Scanning (1/3)', progress: 5, startedAt: new Date().toISOString(), status: 'running' });
@@ -4065,12 +4074,8 @@
       { label: 'Reboot', icon: 'Power', variant: 'danger', onClick: () => setConfirmReboot(true) },
       { label: 'Deploy', icon: 'Package', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; } navigate('deployments'); toast.info(`${selectedIds.length} hosts selected — open the deployment wizard to deploy to them.`); } },
       { label: 'Run Script', icon: 'Terminal', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; } navigate('scripts'); toast.info(`${selectedIds.length} hosts selected — compose your script and click Run Now.`); } },
-      { label: 'Refresh', icon: 'RefreshCw', onClick: () => {
-        if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; }
-        updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, lastSeen: new Date().toISOString() } : h));
-        appendAudit({ action: 'hosts.refresh', actionCategory: 'Inventory', targetType: 'Host', targetIds: [...selectedIds], parameters: {}, result: 'success' });
-        toast.success(`Refreshed ${selectedIds.length} host(s)`);
-      } },
+      { label: 'Connect', icon: 'Monitor', onClick: () => { if (selectedIds.length !== 1) { toast.warning('Select exactly one host to connect.'); return; } const h = hosts.find(x => x.id === selectedIds[0]); if (h) launchRemoteDesktop(h); } },
+      { label: 'Event Log', icon: 'FileText', onClick: () => { if (selectedIds.length !== 1) { toast.warning('Select exactly one host.'); return; } const h = hosts.find(x => x.id === selectedIds[0]); if (h) setLogHost(h); } },
       { label: 'Export', icon: 'Download', onClick: () => {
         const selectedHosts = hosts.filter(h => selectedIds.includes(h.id));
         const csv = ['hostname,ipAddress,osName,patchState,onlineStatus,site,owner'].concat(selectedHosts.map(h => [h.hostname, h.ipAddress, h.osName, h.patchState, h.onlineStatus, h.site, h.owner].join(','))).join('\n');
@@ -4362,47 +4367,6 @@
                 selectedIds={selectedIds}
                 onSelectionChange={setSelectedIds}
                 onRowClick={(row) => openHost(hosts.find(h => h.id === row.id))}
-                onContextMenu={(e, row) => {
-                  e.preventDefault();
-                  const h = hosts.find(x => x.id === row.id);
-                  if (!h) return;
-                  setContextMenu({
-                    x: e.clientX, y: e.clientY,
-                    items: [
-                      { label: h.hostname },
-                      { separator: true },
-                      { icon: 'Info', text: 'View Details', onClick: () => openHost(h) },
-                      { icon: 'Edit', text: 'Edit Host', onClick: () => { setEditingHost(h); } },
-                      { icon: 'RefreshCw', text: 'Refresh Host', onClick: () => { updateHosts(prev => prev.map(x => x.id === h.id ? { ...x, lastSeen: new Date().toISOString() } : x)); toast.success(`${h.hostname} refreshed.`); } },
-                      { separator: true },
-                      { icon: 'Trash', text: 'Delete Host', danger: true, onClick: async () => { if (!confirm(`Delete ${h.hostname}? This cannot be undone.`)) return; if (window.SupportHubLANAPI && h._fromBackend) { try { const dbId = h.id.replace('db-', ''); await fetch(window.SUPPORTHUBLAN_API_URL + '/api/hosts/' + dbId, { method: 'DELETE' }); } catch (e) {} } updateHosts(prev => prev.filter(x => x.id !== h.id)); toast.warning(`Deleted ${h.hostname}`); appendAudit({ action: 'host.delete', actionCategory: 'Inventory', targetType: 'Host', targetIds: [h.id], parameters: { hostname: h.hostname }, result: 'success' }); } },
-                      { separator: true },
-                      { icon: 'Search', text: 'Check for Updates', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `Scan — ${h.hostname}`, targets: [h.id], step: 'Scanning (1/3)', progress: 5, startedAt: new Date().toISOString(), status: 'running' }); toast.info(`Scanning ${h.hostname}…`); } },
-                      { icon: 'ShieldCheck', text: 'Install Updates', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `Install — ${h.hostname}`, targets: [h.id], step: 'Installing (1/4)', progress: 5, startedAt: new Date().toISOString(), status: 'running' }); setTimeout(() => { updateHosts(prev => prev.map(x => x.id === h.id ? { ...x, patchState: 'compliant', pendingReboot: false } : x)); toast.success(`${h.hostname} now compliant`); }, 6000); toast.info(`Installing on ${h.hostname}…`); } },
-                      { separator: true },
-                      { icon: 'Power', text: 'Reboot', danger: true, onClick: () => { executePowerAction({ action: 'reboot', targetIds: [h.id] }); toast.success(`Rebooting ${h.hostname}…`); } },
-                      { icon: 'PowerOff', text: 'Shutdown', danger: true, onClick: () => { executePowerAction({ action: 'shutdown', targetIds: [h.id] }); toast.warning(`Shutting down ${h.hostname}…`); } },
-                      { separator: true },
-                      { icon: 'Terminal', text: 'Run Script', onClick: () => navigate('scripts') },
-                      { icon: 'Package', text: 'Deploy Software', onClick: () => navigate('deployments') },
-                      { icon: remoteDesktopProtocol === 'VNC' ? 'Monitor' : 'MonitorSmartphone', text: `Connect (${remoteDesktopProtocol})`, onClick: () => launchRemoteDesktop(h) },
-                      { separator: true },
-                      { label: 'PsTools' },
-                      { icon: 'Info', text: 'PsInfo — System Info', onClick: () => runPsToolOnHost('psinfo', h.hostname, h.id, { label: 'PsInfo' }) },
-                      { icon: 'Users', text: 'PsLoggedOn — Who is logged on', onClick: () => runPsToolOnHost('psloggedon', h.hostname, h.id, { label: 'PsLoggedOn' }) },
-                      { icon: 'Activity', text: 'PsList — Running Processes', onClick: () => runPsToolOnHost('pslist', h.hostname, h.id, { label: 'PsList' }) },
-                      { icon: 'Server', text: 'PsService — Services', onClick: () => runPsToolOnHost('psservice', h.hostname, h.id, { label: 'PsService' }) },
-                      { icon: 'FileText', text: 'PsFile — Open Files', onClick: () => runPsToolOnHost('psfile', h.hostname, h.id, { label: 'PsFile' }) },
-                      { icon: 'Hash', text: 'PsGetSid — Get SID', onClick: () => runPsToolOnHost('psgetsid', h.hostname, h.id, { label: 'PsGetSid' }) },
-                      { icon: 'FileText', text: 'View PC Event Log', onClick: () => setLogHost(h) },
-                      { icon: 'Power', text: 'PsShutdown — Reboot', danger: true, onClick: () => { executePowerAction({ action: 'reboot', targetIds: [h.id] }); toast.success(`PsShutdown reboot sent to ${h.hostname}`); } },
-                      { icon: 'RefreshCw', text: 'Check Pending Reboot + Reboot if Req', onClick: () => { if (h.pendingReboot) { executePowerAction({ action: 'reboot', targetIds: [h.id] }); toast.success(`${h.hostname} had pending reboot — rebooting now.`); } else { toast.info(`${h.hostname} does not have a pending reboot flag.`); } } },
-                      { icon: 'MessageSquare', text: 'Send Message to User', onClick: () => { const msg = prompt('Enter message to display on remote screen:', 'IT Maintenance: Please save your work.'); if (msg) { addJob({ id: 'job-' + Date.now(), name: `Message — ${h.hostname}`, targets: [h.id], step: 'Sending (1/1)', progress: 50, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.message', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: { message: msg }, result: 'success' }); toast.success(`Message sent to ${h.hostname}`); } } },
-                      { icon: 'FileText', text: 'Get Windows Update Log', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `WU Log — ${h.hostname}`, targets: [h.id], step: 'Generating (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' }); toast.info(`Generating Windows Update log for ${h.hostname}…`); } },
-                      { icon: 'Lock', text: 'Enable RDP Remotely', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `Enable RDP — ${h.hostname}`, targets: [h.id], step: 'Enabling (1/1)', progress: 50, startedAt: new Date().toISOString(), status: 'running' }); appendAudit({ action: 'pstools.enable-rdp', actionCategory: 'Scripts', targetType: 'Host', targetIds: [h.id], parameters: {}, result: 'success' }); toast.success(`RDP enabled on ${h.hostname}`); } },
-                    ],
-                  });
-                }}
                 density={density}
                 emptyMessage="No hosts match your filters."
                 maxRows={15}
@@ -4489,16 +4453,6 @@
               </div>
             </div>
           </Modal>
-        )}
-
-        {/* Right-click Context Menu */}
-        {contextMenu && (
-          <ContextMenu
-            x={contextMenu.x}
-            y={contextMenu.y}
-            items={contextMenu.items}
-            onClose={() => setContextMenu(null)}
-          />
         )}
       </div>
     );

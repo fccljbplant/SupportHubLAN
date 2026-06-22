@@ -1363,6 +1363,102 @@ app.post('/api/pstools/execute', async (req, res) => {
 });
 
 // ==========================================================================
+// INSTALLED APPS — Uses PsExec + reg query (NO PowerShell) to list all
+// installed software from the Windows registry Uninstall keys.
+// ==========================================================================
+app.post('/api/hosts/:hostname/apps', async (req, res) => {
+  const safeHost = sanitizeHost(req.params.hostname);
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  const startTime = Date.now();
+
+  try {
+    // Query 3 registry locations in parallel via PsExec
+    const [reg64Res, reg32Res, regUserRes] = await Promise.all([
+      pstools.runPsExec(safeHost, 'reg.exe', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall', '/s'], 30000),
+      pstools.runPsExec(safeHost, 'reg.exe', ['query', 'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall', '/s'], 30000),
+      pstools.runPsExec(safeHost, 'reg.exe', ['query', 'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall', '/s'], 30000),
+    ]);
+
+    // Parse each registry output
+    const apps64 = parseRegUninstall(reg64Res.stdout);
+    const apps32 = parseRegUninstall(reg32Res.stdout);
+    const appsUser = parseRegUninstall(regUserRes.stdout);
+
+    // Merge, dedupe, sort
+    const allApps = [...apps64, ...apps32, ...appsUser];
+    const seen = new Set();
+    const deduped = allApps.filter(a => {
+      const key = (a.name + '|' + (a.version || '')).toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+    // Audit log
+    audit.add(db, {
+      actionType: 'apps.list',
+      targetHost: safeHost,
+      tool: 'psexec+reg',
+      command: `reg query Uninstall keys on ${safeHost}`,
+      success: true,
+      durationMs: Date.now() - startTime,
+      outputSummary: `Found ${deduped.length} apps (${apps64.length} 64-bit, ${apps32.length} 32-bit, ${appsUser.length} user)`,
+      initiatedBy: 'admin',
+      initiatedFrom,
+    });
+
+    res.json({
+      success: true,
+      apps: deduped,
+      count: deduped.length,
+      sources: { '64bit': apps64.length, '32bit': apps32.length, 'user': appsUser.length },
+    });
+  } catch (e) {
+    audit.add(db, {
+      actionType: 'apps.list',
+      targetHost: safeHost,
+      tool: 'psexec+reg',
+      command: `reg query Uninstall keys on ${safeHost}`,
+      success: false,
+      durationMs: Date.now() - startTime,
+      errorReason: e.message,
+      initiatedBy: 'admin',
+      initiatedFrom,
+    });
+    res.json({ success: false, error: e.message, apps: [] });
+  }
+});
+
+// Helper: parse reg query /s output into app objects
+function parseRegUninstall(raw) {
+  const out = (raw || '').replace(/\r/g, '');
+  const apps = [];
+  const lines = out.split('\n');
+  let current = {};
+  let hasName = false;
+
+  for (const line of lines) {
+    if (/^HKEY_/.test(line.trim())) {
+      if (hasName && current.name) apps.push(current);
+      current = {};
+      hasName = false;
+      continue;
+    }
+    const m = /^\s+(\S+)\s+REG_\S+\s*(.*)$/.exec(line);
+    if (m) {
+      const key = m[1];
+      const value = (m[2] || '').trim();
+      if (key === 'DisplayName' && value) { current.name = value; hasName = true; }
+      else if (key === 'DisplayVersion') { current.version = value; }
+      else if (key === 'Publisher') { current.publisher = value; }
+      else if (key === 'InstallDate') { current.installDate = value; }
+    }
+  }
+  if (hasName && current.name) apps.push(current);
+  return apps;
+}
+
+// ==========================================================================
 // HARDWARE AUDIT — Multi-method scan with PRIORITY ORDER:
 //   1st: PsTools  (psinfo + psloggedon)  — PRIMARY, works without WinRM
 //   2nd: PowerShell (via PsExec)          — extra data (motherboard, BIOS, RAM details)

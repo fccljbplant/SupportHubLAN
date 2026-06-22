@@ -529,6 +529,28 @@
         // Command logs — view WHY commands failed
         getCommandLogs: (limit = 100) => apiGet('/api/logs?limit=' + limit),
 
+        // Audit log — unified queryable log of ALL actions
+        getAuditLogs: (filters = {}) => {
+          const params = new URLSearchParams();
+          if (filters.host) params.set('host', filters.host);
+          if (filters.actionType) params.set('actionType', filters.actionType);
+          if (filters.user) params.set('user', filters.user);
+          if (filters.success !== undefined) params.set('success', filters.success);
+          if (filters.startDate) params.set('startDate', filters.startDate);
+          if (filters.endDate) params.set('endDate', filters.endDate);
+          if (filters.search) params.set('search', filters.search);
+          params.set('limit', filters.limit || 200);
+          params.set('offset', filters.offset || 0);
+          return apiGet('/api/audit?' + params.toString());
+        },
+        getHostAuditLogs: (hostname, limit = 100) => apiGet('/api/audit/host/' + hostname + '?limit=' + limit),
+        clearAuditLogs: (olderThanDays) => apiCall('/api/audit/clear', { olderThanDays }),
+        cleanupAuditLogs: () => apiCall('/api/audit/cleanup', {}),
+
+        // Log retention settings
+        getLogRetention: () => apiGet('/api/settings/log-retention'),
+        setLogRetention: (days) => apiCall('/api/settings/log-retention', { days }),
+
         // WinRM management
         testWinRM: (hostname) => apiCall('/api/winrm/test', { hostname }),
         enableWinRM: (hostname) => apiCall('/api/winrm/enable', { hostname }),
@@ -1657,7 +1679,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v4.2.0.0';
+  const APP_VERSION = 'v4.2.1.0';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -2067,6 +2089,154 @@
     );
   };
 
+  // ==========================================================================
+  // AuditTrailTab — shows ALL logs for a specific host (hardware scans,
+  // scripts, updates, power actions, etc.) from the unified audit log.
+  // Each entry shows: timestamp, action type, tool, success/failure,
+  // duration, who initiated it, from where, and error reason if failed.
+  // ==========================================================================
+  const AuditTrailTab = ({ host }) => {
+    const [logs, setLogs] = useState(null);
+    const [loading, setLoading] = useState(false);
+    const [filter, setFilter] = useState('all'); // all, success, failed
+
+    const fetchLogs = async () => {
+      if (!window.SupportHubLANAPI) return;
+      setLoading(true);
+      try {
+        const r = await window.SupportHubLANAPI.getHostAuditLogs(host.hostname, 100);
+        if (r && r.success && !r.demo) {
+          setLogs(r.data || []);
+        } else if (r && r.demo) {
+          setLogs([]);
+        } else {
+          setLogs([]);
+        }
+      } catch (e) { setLogs([]); }
+      setLoading(false);
+    };
+
+    useEffect(() => { fetchLogs(); }, [host.hostname]);
+
+    const filtered = useMemo(() => {
+      if (!logs) return [];
+      if (filter === 'success') return logs.filter(l => l.result === 'success');
+      if (filter === 'failed') return logs.filter(l => l.result !== 'success');
+      return logs;
+    }, [logs, filter]);
+
+    // Parse parameters to extract enhanced fields (tool, command, error reason, etc.)
+    const parseLogEntry = (entry) => {
+      let params = {};
+      try {
+        params = typeof entry.parameters === 'string' ? JSON.parse(entry.parameters) : (entry.parameters || {});
+      } catch {}
+      return {
+        timestamp: entry.timestamp,
+        action: entry.action || '',
+        result: entry.result || 'unknown',
+        user: entry.user || params.initiated_by || 'admin',
+        initiatedFrom: params.initiated_from || '',
+        tool: params.tool || '',
+        command: params.command || '',
+        durationMs: params.duration_ms || 0,
+        errorReason: params.error_reason || '',
+        requiredService: params.required_service || '',
+        fixSuggestion: params.fix_suggestion || '',
+        outputSummary: entry.output || params.output_summary || '',
+        targetHost: params.target_host || host.hostname,
+      };
+    };
+
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-meta text-text-dim uppercase">Audit Trail for {host.hostname}</span>
+          <div className="flex items-center gap-1">
+            <select value={filter} onChange={e => setFilter(e.target.value)} className="text-[10px] bg-surface border border-border rounded px-1 py-0.5 text-text">
+              <option value="all">All</option>
+              <option value="success">Success Only</option>
+              <option value="failed">Failed Only</option>
+            </select>
+            <ActionButton variant="secondary" size="sm" icon="RefreshCw" disabled={loading} onClick={fetchLogs}>
+              {loading ? 'Loading…' : 'Refresh'}
+            </ActionButton>
+          </div>
+        </div>
+
+        {loading && <div className="text-text-dim text-xs py-4 text-center">Loading audit logs…</div>}
+
+        {!loading && filtered.length === 0 && (
+          <div className="text-text-dim text-xs py-4 text-center">No audit logs found for this host.</div>
+        )}
+
+        {!loading && filtered.length > 0 && (
+          <div className="space-y-1 max-h-[500px] overflow-y-auto">
+            {filtered.map((entry, i) => {
+              const p = parseLogEntry(entry);
+              const isSuccess = p.result === 'success';
+              return (
+                <div key={i} className={`p-2 rounded border text-xs ${isSuccess ? 'bg-surface-raised border-border' : 'bg-danger/5 border-danger/30'}`}>
+                  {/* Header row: timestamp + action + result badge */}
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className="text-[10px] text-text-dim font-mono whitespace-nowrap">
+                        {new Date(p.timestamp).toLocaleString()}
+                      </span>
+                      <span className={`px-1 text-[9px] rounded whitespace-nowrap ${isSuccess ? 'bg-success/15 text-success' : 'bg-danger/15 text-danger'}`}>
+                        {isSuccess ? 'SUCCESS' : 'FAILED'}
+                      </span>
+                      <span className="font-mono text-text truncate">{p.action}</span>
+                    </div>
+                    {p.durationMs > 0 && (
+                      <span className="text-[9px] text-text-dim tnum whitespace-nowrap">
+                        {(p.durationMs / 1000).toFixed(1)}s
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Details row: tool + command */}
+                  {p.tool && (
+                    <div className="text-[10px] text-text-dim mt-1">
+                      <span className="text-text-dim">Tool:</span> <span className="text-text font-mono">{p.tool}</span>
+                    </div>
+                  )}
+                  {p.command && (
+                    <div className="text-[10px] text-text-dim mt-0.5">
+                      <span className="text-text-dim">Command:</span> <span className="text-text font-mono">{p.command}</span>
+                    </div>
+                  )}
+
+                  {/* Who initiated + from where */}
+                  <div className="text-[10px] text-text-dim mt-0.5">
+                    <span className="text-text-dim">By:</span> <span className="text-text">{p.user}</span>
+                    {p.initiatedFrom && <span> · <span className="text-text-dim">From:</span> <span className="text-text font-mono">{p.initiatedFrom}</span></span>}
+                  </div>
+
+                  {/* Output summary */}
+                  {p.outputSummary && (
+                    <div className="text-[10px] text-text-dim mt-0.5">
+                      <span className="text-text-dim">Result:</span> <span className="text-text">{p.outputSummary}</span>
+                    </div>
+                  )}
+
+                  {/* Error reason (if failed) */}
+                  {!isSuccess && p.errorReason && (
+                    <div className="mt-1 p-1 bg-danger/10 rounded text-[10px] text-danger">
+                      <div><strong>Error:</strong> {p.errorReason}</div>
+                      {p.requiredService && <div><strong>Required:</strong> {p.requiredService}</div>}
+                      {p.fixSuggestion && <div><strong>Fix:</strong> {p.fixSuggestion}</div>}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   // Host drawer tab content
   const HostDrawerTab = ({ tab, host }) => {
     const { activeJobs, hosts, updateHosts, addJob, appendAudit, executePowerAction } = useApp();
@@ -2279,15 +2449,7 @@
       );
     }
     if (tab === 'audit') {
-      return <div className="space-y-1.5">{AUDIT_EVENTS.filter(e => e.targetIds.includes(liveHost.id)).map(e => (
-        <div key={e.id} className="p-2 bg-surface-raised rounded border border-border">
-          <div className="flex items-center justify-between">
-            <span className="font-mono text-xs text-text">{e.action}</span>
-            <StatusBadge variant={e.result} size="xs" />
-          </div>
-          <div className="text-[10px] text-text-dim mt-0.5">{e.userName} · {fmtRel(e.timestamp)}</div>
-        </div>
-      ))}</div>;
+      return <AuditTrailTab host={liveHost} />;
     }
     return null;
   };
@@ -7420,6 +7582,36 @@
     const [showInvite, setShowInvite] = useState(false);
     const [confirmDelete, setConfirmDelete] = useState(null);
     const [newUser, setNewUser] = useState({ username: '', email: '', role: 'Operator', mfaEnabled: false });
+    const [logRetentionDays, setLogRetentionDays] = useState(7);
+    const [logRetentionLoading, setLogRetentionLoading] = useState(false);
+
+    // Load log retention setting from backend
+    useEffect(() => {
+      if (window.SupportHubLANAPI) {
+        window.SupportHubLANAPI.getLogRetention().then(r => {
+          if (r && r.success && !r.demo && r.days) setLogRetentionDays(r.days);
+        }).catch(() => {});
+      }
+    }, []);
+
+    const saveLogRetention = async (days) => {
+      setLogRetentionLoading(true);
+      try {
+        if (window.SupportHubLANAPI) {
+          const r = await window.SupportHubLANAPI.setLogRetention(days);
+          if (r && r.success && !r.demo) {
+            setLogRetentionDays(r.days || days);
+            toast.success(`Log retention set to ${r.days || days} days`);
+          } else if (r && r.demo) {
+            toast.warning('Backend not connected — setting saved locally only');
+            setLogRetentionDays(days);
+          } else {
+            toast.error('Failed to save log retention');
+          }
+        }
+      } catch (e) { toast.error('Failed: ' + e.message); }
+      setLogRetentionLoading(false);
+    };
 
     return (
       <div className="space-y-3">
@@ -7493,6 +7685,56 @@
                 <FormField label="Auto-open browser on backend startup"><Select defaultValue="Yes"><option>Yes</option><option>No</option></Select></FormField>
               </div>
               <div className="mt-3"><ActionButton variant="primary" icon="Check" onClick={() => { appendAudit({ action: 'settings.general-save', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: {}, result: 'success' }); toast.success('General settings saved.'); }}>Save</ActionButton></div>
+            </SectionCard>
+
+            {/* Log Retention Setting */}
+            <SectionCard title="Audit Log Retention" description="How long to keep action logs (hardware scans, scripts, updates, power actions). Older logs are automatically deleted.">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+                <FormField label="Log Retention Period (days)" hint="Default: 7 days. Min: 1, Max: 365.">
+                  <Input
+                    type="number"
+                    min="1"
+                    max="365"
+                    value={logRetentionDays}
+                    onChange={e => setLogRetentionDays(Math.max(1, Math.min(365, parseInt(e.target.value) || 7)))}
+                    className="font-mono"
+                  />
+                </FormField>
+                <ActionButton
+                  variant="primary"
+                  icon="Save"
+                  disabled={logRetentionLoading}
+                  onClick={() => saveLogRetention(logRetentionDays)}
+                >
+                  {logRetentionLoading ? 'Saving…' : 'Save Retention'}
+                </ActionButton>
+                <ActionButton
+                  variant="secondary"
+                  icon="Trash2"
+                  disabled={logRetentionLoading}
+                  onClick={async () => {
+                    if (!confirm('Clear ALL audit logs older than ' + logRetentionDays + ' days? This cannot be undone.')) return;
+                    if (window.SupportHubLANAPI) {
+                      const r = await window.SupportHubLANAPI.cleanupAuditLogs();
+                      if (r && r.success && !r.demo) {
+                        toast.success(`Cleaned up ${r.removed || 0} old log entries`);
+                      } else if (r && r.demo) {
+                        toast.warning('Backend not connected');
+                      } else {
+                        toast.error('Cleanup failed');
+                      }
+                    }
+                  }}
+                >
+                  Cleanup Old Logs Now
+                </ActionButton>
+              </div>
+              <div className="mt-2 text-xs text-text-dim">
+                <Icon name="Info" size={12} className="inline mr-1" />
+                Logs older than {logRetentionDays} day{logRetentionDays !== 1 ? 's' : ''} are automatically removed.
+                All actions are logged: hardware scans, script executions, Windows Updates, power actions, IP scans, etc.
+                Each log entry records: who initiated it, from where, which tool was used, success/failure, and error reasons.
+              </div>
             </SectionCard>
 
             <SectionCard title="Theme & Appearance" description="Visual customization — dark/light theme, accent colors, density">

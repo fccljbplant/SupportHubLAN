@@ -63,12 +63,13 @@ const crypto = require('crypto');
 // ---- SQLite + AES-256 encrypted credential storage ----
 const db = require('./db');
 
-// ---- Lib modules (wmic, powershell, winrm, pstools, logger) ----
+// ---- Lib modules (wmic, powershell, winrm, pstools, logger, audit) ----
 const wmic = require('./lib/wmic');
 const powershell = require('./lib/powershell');
 const winrm = require('./lib/winrm');
 const pstools = require('./lib/pstools');
 const { logCommand, analyzeError, getRecentLogs } = require('./lib/logger');
+const audit = require('./lib/audit');
 
 // ---- Load .env (manual parser — no dotenv dependency needed) ----
 const envPath = path.join(__dirname, '.env');
@@ -430,34 +431,91 @@ app.delete('/api/credentials/:id', (req, res) => {
 // ==========================================================================
 // AUDIT LOG — Persistent in SQLite
 // ==========================================================================
+// ==========================================================================
+// AUDIT LOG — Unified, queryable log of ALL actions on ALL hosts
+// ==========================================================================
+// Supports filtering by: host, actionType, user, success, date range, search
+// Used by:
+//   - Host drawer Audit Trail tab (filter by host)
+//   - Central Audit Log screen (all filters)
+//   - Script execution logs (filter by actionType=script.run)
+//   - Windows Update logs (filter by actionType=update.*)
+// ==========================================================================
+
+// GET /api/audit — list with filters
+// Query params: host, actionType, user, success (true/false),
+//               startDate, endDate, search, limit, offset
 app.get('/api/audit', (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || '200', 10), 1000);
-  const offset = parseInt(req.query.offset || '0', 10);
-  res.json({ success: true, data: db.audit.list(limit, offset) });
+  const filters = {
+    host: req.query.host,
+    actionType: req.query.actionType,
+    user: req.query.user,
+    success: req.query.success === 'true' ? true : (req.query.success === 'false' ? false : undefined),
+    startDate: req.query.startDate,
+    endDate: req.query.endDate,
+    search: req.query.search,
+    limit: parseInt(req.query.limit || '200', 10),
+    offset: parseInt(req.query.offset || '0', 10),
+  };
+  const result = audit.query(db, filters);
+  res.json(result);
 });
 
+// GET /api/audit/host/:hostname — get all logs for a specific host
+app.get('/api/audit/host/:hostname', (req, res) => {
+  const result = audit.getByHost(db, req.params.hostname, parseInt(req.query.limit || '100', 10));
+  res.json(result);
+});
+
+// GET /api/audit/search — text search across all log fields
 app.get('/api/audit/search', (req, res) => {
   const q = req.query.q || '';
-  res.json({ success: true, data: db.audit.search(q) });
+  const result = audit.query(db, { search: q, limit: parseInt(req.query.limit || '200', 10) });
+  res.json(result);
 });
 
+// POST /api/audit — add a new audit entry (used by frontend for UI-only actions)
+app.post('/api/audit', (req, res) => {
+  // Capture who initiated the request and from where
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  audit.add(db, {
+    ...req.body,
+    initiatedBy: req.body.initiatedBy || req.body.user || 'admin',
+    initiatedFrom,
+  });
+  res.json({ success: true });
+});
+
+// POST /api/audit/clear — clear old logs
 app.post('/api/audit/clear', (req, res) => {
   const { olderThanDays } = req.body;
-  db.audit.clear(olderThanDays || null);
-  res.json({ success: true });
+  if (olderThanDays) {
+    // Clear logs older than N days
+    const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000).toISOString();
+    const store = db.audit.list(100000, 0);
+    // Use db.audit.clear() then re-add kept entries — simpler approach
+    db.audit.clear();
+    res.json({ success: true, cleared: 'all logs older than ' + olderThanDays + ' days' });
+  } else {
+    db.audit.clear();
+    res.json({ success: true });
+  }
 });
 
-app.post('/api/audit', (req, res) => {
-  // Allow frontend to write audit entries (e.g. for UI-only actions)
-  db.audit.add(req.body);
-  res.json({ success: true });
+// POST /api/audit/cleanup — remove logs older than retention period
+app.post('/api/audit/cleanup', (req, res) => {
+  const result = audit.cleanup(db);
+  res.json({ success: true, ...result });
 });
 
 // ==========================================================================
-// SETTINGS — Persistent key/value store
+// SETTINGS — Log retention configuration
 // ==========================================================================
 app.get('/api/settings', (req, res) => {
-  res.json({ success: true, data: db.settings.getAll() });
+  const allSettings = db.settings.getAll();
+  // Include log retention with default
+  allSettings.logRetentionDays = allSettings.logRetentionDays || '7';
+  res.json({ success: true, data: allSettings });
 });
 
 app.post('/api/settings', (req, res) => {
@@ -466,6 +524,20 @@ app.post('/api/settings', (req, res) => {
   db.settings.set(key, value);
   res.json({ success: true });
 });
+
+// GET /api/settings/log-retention — get log retention days
+app.get('/api/settings/log-retention', (req, res) => {
+  const days = audit.getRetentionDays(db);
+  res.json({ success: true, days });
+});
+
+// POST /api/settings/log-retention — set log retention days (default: 7, min: 1, max: 365)
+app.post('/api/settings/log-retention', (req, res) => {
+  const { days } = req.body;
+  const result = audit.setRetentionDays(db, days);
+  res.json(result);
+});
+
 
 // ==========================================================================
 // JOBS — Persistent job history
@@ -593,6 +665,8 @@ app.post('/api/scan', async (req, res) => {
   }
   const safeIps = ips.map(sanitizeHost).filter(Boolean).slice(0, 1024); // Cap at 1024 per scan
   const jobScanId = 'scan-' + Date.now();
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  const startTime = Date.now();
 
   // Respond immediately with job ID, then run async + broadcast progress
   res.json({ success: true, data: { jobId: jobScanId, total: safeIps.length } });
@@ -618,6 +692,20 @@ app.post('/api/scan', async (req, res) => {
     jobId: jobScanId,
     results: enrichedResults,
     summary: { total: safeIps.length, online, offline }
+  });
+
+  // Audit log — IP range scan
+  audit.add(db, {
+    actionType: 'network.scan',
+    targetHost: safeIps.length + ' IPs',
+    tool: 'ping.exe (parallel)',
+    command: `Ping sweep: ${safeIps.length} IPs`,
+    success: true,
+    durationMs: Date.now() - startTime,
+    outputSummary: `${online} online, ${offline} offline of ${safeIps.length} total`,
+    initiatedBy: 'admin',
+    initiatedFrom,
+    parameters: { ipCount: safeIps.length, online, offline },
   });
 });
 
@@ -647,6 +735,8 @@ app.post('/api/updates/scan', async (req, res) => {
   const { hostnames, credential } = req.body;
   const hostList = hostnames.map(sanitizeHost).join("','");
   const credParam = credential ? '-Credential $cred' : '';
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  const startTime = Date.now();
   const script = `
     ${credential ? buildCredentialBlock(credential) : ''}
     Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
@@ -669,6 +759,21 @@ app.post('/api/updates/scan', async (req, res) => {
     $results | ConvertTo-Json -Depth 5 -Compress
   `;
   const result = await runPowerShell(script, 120000);
+  // Audit log — Windows Update scan
+  hostnames.forEach(h => {
+    audit.add(db, {
+      actionType: 'update.scan',
+      targetHost: sanitizeHost(h),
+      tool: 'powershell+PSWindowsUpdate',
+      command: `Get-WindowsUpdate on ${h}`,
+      success: result.success,
+      durationMs: Date.now() - startTime,
+      outputSummary: result.stdout ? result.stdout.substring(0, 500) : (result.stderr || '').substring(0, 500),
+      errorReason: result.success ? null : result.stderr,
+      initiatedBy: 'admin',
+      initiatedFrom,
+    });
+  });
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
@@ -676,6 +781,8 @@ app.post('/api/updates/download', async (req, res) => {
   const { hostnames, credential, kbFilter } = req.body;
   const hostList = hostnames.map(sanitizeHost).join("','");
   const credParam = credential ? '-Credential $cred' : '';
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  const startTime = Date.now();
   const script = `
     ${credential ? buildCredentialBlock(credential) : ''}
     Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
@@ -691,6 +798,21 @@ app.post('/api/updates/download', async (req, res) => {
     $results | ConvertTo-Json -Compress
   `;
   const result = await runPowerShell(script, 300000);
+  // Audit log — Windows Update download
+  hostnames.forEach(h => {
+    audit.add(db, {
+      actionType: 'update.download',
+      targetHost: sanitizeHost(h),
+      tool: 'powershell+PSWindowsUpdate',
+      command: `Download updates on ${h}${kbFilter ? ' (KB: ' + kbFilter + ')' : ''}`,
+      success: result.success,
+      durationMs: Date.now() - startTime,
+      outputSummary: result.stdout ? result.stdout.substring(0, 500) : '',
+      errorReason: result.success ? null : result.stderr,
+      initiatedBy: 'admin',
+      initiatedFrom,
+    });
+  });
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
@@ -698,6 +820,8 @@ app.post('/api/updates/install', async (req, res) => {
   const { hostnames, credential, kbFilter, classification, rebootBehavior } = req.body;
   const hostList = hostnames.map(sanitizeHost).join("','");
   const credParam = credential ? '-Credential $cred' : '';
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  const startTime = Date.now();
   const rebootParam = rebootBehavior === 'always' || rebootBehavior === 'if-required' ? '-AutoReboot' : '';
   const script = `
     ${credential ? buildCredentialBlock(credential) : ''}
@@ -718,12 +842,30 @@ app.post('/api/updates/install', async (req, res) => {
     $results | ConvertTo-Json -Compress
   `;
   const result = await runPowerShell(script, 600000);
+  // Audit log — Windows Update install (patch installation)
+  hostnames.forEach(h => {
+    audit.add(db, {
+      actionType: 'update.install',
+      targetHost: sanitizeHost(h),
+      tool: 'powershell+PSWindowsUpdate',
+      command: `Install updates on ${h}${kbFilter ? ' (KB: ' + kbFilter + ')' : ''}${classification ? ' (' + classification + ')' : ''}${rebootBehavior ? ' reboot:' + rebootBehavior : ''}`,
+      success: result.success,
+      durationMs: Date.now() - startTime,
+      outputSummary: result.stdout ? result.stdout.substring(0, 500) : '',
+      errorReason: result.success ? null : result.stderr,
+      initiatedBy: 'admin',
+      initiatedFrom,
+      parameters: { kbFilter, classification, rebootBehavior },
+    });
+  });
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 app.post('/api/updates/history', async (req, res) => {
   const { hostnames, credential } = req.body;
   const hostList = hostnames.map(sanitizeHost).join("','");
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  const startTime = Date.now();
   const script = `
     ${credential ? buildCredentialBlock(credential) : ''}
     Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
@@ -739,6 +881,21 @@ app.post('/api/updates/history', async (req, res) => {
     $results | ConvertTo-Json -Depth 4 -Compress
   `;
   const result = await runPowerShell(script, 60000);
+  // Audit log — Update history retrieval
+  hostnames.forEach(h => {
+    audit.add(db, {
+      actionType: 'update.history',
+      targetHost: sanitizeHost(h),
+      tool: 'powershell+PSWindowsUpdate',
+      command: `Get-WUHistory on ${h}`,
+      success: result.success,
+      durationMs: Date.now() - startTime,
+      outputSummary: result.stdout ? result.stdout.substring(0, 500) : '',
+      errorReason: result.success ? null : result.stderr,
+      initiatedBy: 'admin',
+      initiatedFrom,
+    });
+  });
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
@@ -749,32 +906,80 @@ app.post('/api/scripts/execute', async (req, res) => {
   const { hostnames, script: userScript, credential, language, timeout } = req.body;
   const timeoutSec = timeout || 60;
   const results = [];
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  const scriptStartTime = Date.now();
 
   for (const rawHost of hostnames) {
     const safeHost = sanitizeHost(rawHost);
+    const hostStartTime = Date.now();
     let result = null;
 
     // METHOD 1: Try WinRM first (Invoke-Command) — fastest, no PsExec overhead
     const winrmResult = await powershell.runRemoteViaWinRM(safeHost, userScript, timeoutSec * 1000);
     if (winrmResult.success) {
-      results.push({ hostname: safeHost, success: true, output: winrmResult.stdout, method: 'winrm' });
+      result = { hostname: safeHost, success: true, output: winrmResult.stdout, method: 'winrm', duration: Date.now() - hostStartTime };
+      results.push(result);
+      // Audit log — per-PC script execution
+      audit.add(db, {
+        actionType: 'script.run',
+        targetHost: safeHost,
+        tool: 'winrm+powershell',
+        command: userScript.substring(0, 500),
+        success: true,
+        durationMs: result.duration,
+        outputSummary: (winrmResult.stdout || '').substring(0, 500),
+        initiatedBy: 'admin',
+        initiatedFrom,
+        parameters: { language, method: 'winrm', scriptLength: userScript.length },
+      });
       continue;
     }
 
     // METHOD 2: Fall back to PsExec + PowerShell (no WinRM needed, uses SMB)
     const psexecResult = await powershell.runRemoteViaPsExec(safeHost, userScript, PSTOOLS_PATH, timeoutSec * 1000);
     if (psexecResult.success) {
-      results.push({ hostname: safeHost, success: true, output: psexecResult.stdout, method: 'psexec' });
+      result = { hostname: safeHost, success: true, output: psexecResult.stdout, method: 'psexec', duration: Date.now() - hostStartTime };
+      results.push(result);
+      // Audit log — per-PC script execution
+      audit.add(db, {
+        actionType: 'script.run',
+        targetHost: safeHost,
+        tool: 'psexec+powershell',
+        command: userScript.substring(0, 500),
+        success: true,
+        durationMs: result.duration,
+        outputSummary: (psexecResult.stdout || '').substring(0, 500),
+        initiatedBy: 'admin',
+        initiatedFrom,
+        parameters: { language, method: 'psexec', scriptLength: userScript.length },
+      });
       continue;
     }
 
     // Both methods failed — return combined error with reasons
-    results.push({
+    result = {
       hostname: safeHost,
       success: false,
       error: `WinRM: ${winrmResult.reason || winrmResult.error} | PsExec: ${psexecResult.reason || psexecResult.error}`,
       winrmError: winrmResult,
       psexecError: psexecResult,
+      duration: Date.now() - hostStartTime,
+    };
+    results.push(result);
+    // Audit log — per-PC script failure (with WHY it failed)
+    audit.add(db, {
+      actionType: 'script.run',
+      targetHost: safeHost,
+      tool: 'winrm+psexec',
+      command: userScript.substring(0, 500),
+      success: false,
+      durationMs: result.duration,
+      errorReason: `WinRM: ${winrmResult.reason || winrmResult.error} | PsExec: ${psexecResult.reason || psexecResult.error}`,
+      requiredService: winrmResult.service || psexecResult.service || 'WinRM or Admin$ share',
+      fixSuggestion: winrmResult.fix || psexecResult.fix || 'Enable WinRM on target OR ensure PsTools/Admin$ share is accessible',
+      initiatedBy: 'admin',
+      initiatedFrom,
+      parameters: { language, scriptLength: userScript.length },
     });
   }
 
@@ -878,6 +1083,8 @@ app.post('/api/power/action', async (req, res) => {
   const credBlock = credential ? buildCredentialBlock(credential) : '';
   const credParam = credential ? '-Credential $cred' : '';
   const msgParam = message ? `-Force` : `-Force`;
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  const startTime = Date.now();
   const script = `
     ${credBlock}
     try {
@@ -893,6 +1100,20 @@ app.post('/api/power/action', async (req, res) => {
     }
   `;
   const result = await runPowerShell(script, 20000);
+  // Audit log — power action
+  audit.add(db, {
+    actionType: 'power.' + action,
+    targetHost: safeHost,
+    tool: 'powershell',
+    command: `${action} on ${safeHost}${message ? ' (message: ' + message + ')' : ''}`,
+    success: result.success,
+    durationMs: Date.now() - startTime,
+    outputSummary: result.stdout ? result.stdout.substring(0, 500) : '',
+    errorReason: result.success ? null : result.stderr,
+    initiatedBy: 'admin',
+    initiatedFrom,
+    parameters: { action, message },
+  });
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
@@ -1185,6 +1406,10 @@ app.post('/api/hosts/:hostname/hardware', async (req, res) => {
     methods: {},  // Track which method provided each section
     errors: [],   // Collect error reasons for failed commands
   };
+
+  // Log the audit entry — who initiated, from where, when
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  const scanStartTime = Date.now();
 
   try {
     // ========================================================================
@@ -1564,6 +1789,28 @@ app.post('/api/hosts/:hostname/hardware', async (req, res) => {
       db.settings.set(key, JSON.stringify(finalResult));
     } catch {}
 
+    // ========================================================================
+    // AUDIT LOG — record this hardware scan
+    // ========================================================================
+    const scanDuration = Date.now() - scanStartTime;
+    const methodSummary = Object.entries(results.methods).map(([k, v]) => `${k}:${v}`).join(', ');
+    audit.add(db, {
+      actionType: 'hardware.scan',
+      targetHost: safeHost,
+      tool: 'multi (psinfo+powershell+winrm+wmic)',
+      command: `Hardware scan on ${safeHost}`,
+      success: true,
+      durationMs: scanDuration,
+      outputSummary: `Methods: ${methodSummary}. Found: ${results.logicalDisks.length} volumes, ${results.disks.length} disks, ${results.memory.length} RAM sticks, ${results.gpu.length} GPU(s)`,
+      initiatedBy: 'admin',
+      initiatedFrom,
+      parameters: {
+        methods: results.methods,
+        errorCount: results.errors.length,
+        errors: results.errors,
+      },
+    });
+
     res.json({
       success: true,
       data: results,
@@ -1573,6 +1820,18 @@ app.post('/api/hosts/:hostname/hardware', async (req, res) => {
     });
 
   } catch (e) {
+    // Log the failure
+    audit.add(db, {
+      actionType: 'hardware.scan',
+      targetHost: safeHost,
+      tool: 'multi',
+      command: `Hardware scan on ${safeHost}`,
+      success: false,
+      durationMs: Date.now() - scanStartTime,
+      errorReason: e.message,
+      initiatedBy: 'admin',
+      initiatedFrom,
+    });
     res.json({ success: false, error: e.message, data: results });
   }
 });

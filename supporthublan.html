@@ -1679,7 +1679,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v4.2.0.1';
+  const APP_VERSION = 'v4.2.0.2';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -3210,7 +3210,7 @@
       { key: 'lastBootTime', label: 'Last Boot', render: (h) => <span className="text-text-dim">{fmtRel(h.lastBootTime)}</span> },
       { key: 'patchState', label: 'Patch State', render: (h) => <StatusBadge variant={h.patchState} size="xs" /> },
       { key: 'pendingReboot', label: 'Reboot', render: (h) => h.pendingReboot ? <Icon name="RefreshCw" size={12} className="text-warning" /> : <span className="text-text-dim">—</span> },
-      { key: 'loggedOnUsers', label: 'Users', render: (h) => h.loggedOnUsers.length > 0 ? <span className="text-text tnum" title={h.loggedOnUsers.join(', ')}>{h.loggedOnUsers.length}</span> : <span className="text-text-dim">—</span> },
+      { key: 'loggedOnUsers', label: 'Users', render: (h) => (h.loggedOnUsers && h.loggedOnUsers.length > 0) ? <span className="text-text tnum" title={h.loggedOnUsers.join(', ')}>{h.loggedOnUsers.length}</span> : <span className="text-text-dim">—</span> },
       { key: 'site', label: 'Site' },
       { key: 'department', label: 'Dept' },
       { key: 'owner', label: 'Owner' },
@@ -5591,7 +5591,7 @@
           hostname: h.hostname,
           found,
           status: found ? 'Running' : 'Not running',
-          details: found ? `PID ${Math.floor(Math.random() * 9000) + 1000} · ${(Math.random() * 15).toFixed(1)}% CPU${h.loggedOnUsers.length > 0 ? ' · user: ' + h.loggedOnUsers[0] : ''}` : 'Process not found',
+          details: found ? `PID ${Math.floor(Math.random() * 9000) + 1000} · ${(Math.random() * 15).toFixed(1)}% CPU${(h.loggedOnUsers && h.loggedOnUsers.length > 0) ? ' · user: ' + h.loggedOnUsers[0] : ''}` : 'Process not found',
         };
       });
       setFleetSearchResults(results);
@@ -8703,8 +8703,8 @@
         } else if (code.includes('PendingReboot')) {
           lines.push(`PendingReboot: ${h.pendingReboot}`);
         } else if (code.includes('query user')) {
-          lines.push(h.loggedOnUsers.length > 0 ? 'USERNAME  SESSIONNAME  ID  STATE  IDLE  TIME' : 'No users logged on.');
-          h.loggedOnUsers.forEach((u, idx) => lines.push(`${u}  console  ${idx + 1}  Active  none  ${h.uptime}`));
+          lines.push((h.loggedOnUsers && h.loggedOnUsers.length > 0) ? 'USERNAME  SESSIONNAME  ID  STATE  IDLE  TIME' : 'No users logged on.');
+          if (h.loggedOnUsers) h.loggedOnUsers.forEach((u, idx) => lines.push(`${u}  console  ${idx + 1}  Active  none  ${h.uptime}`));
         } else if (code.includes('flushdns')) {
           lines.push('Windows IP Configuration');
           lines.push('Successfully flushed the DNS Resolver Cache.');
@@ -8840,6 +8840,7 @@
             department: h.department || '',
             tags: h.tags ? (typeof h.tags === 'string' ? h.tags.split(',').filter(Boolean) : h.tags) : [],
             notes: h.notes || '',
+            loggedOnUsers: [],  // Always initialize to empty array (prevents .length crash)
             _fromBackend: true,
             _inventoryId: h.inventory_id,
           }));

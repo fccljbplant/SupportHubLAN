@@ -1679,7 +1679,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v4.2.0.2';
+  const APP_VERSION = 'v4.2.0.3';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -1943,14 +1943,12 @@
     let tabs = [];
     if (host) tabs = [
       { id: 'overview', label: 'Overview', icon: 'Info' },
+      { id: 'hardware', label: 'Hardware', icon: 'Cpu' },
       { id: 'updates', label: 'Updates', icon: 'ShieldCheck' },
+      { id: 'apps', label: 'Installed Apps', icon: 'Boxes' },
+      { id: 'services', label: 'Services', icon: 'Activity' },
       { id: 'deployments', label: 'Deployments', icon: 'Package' },
       { id: 'jobs', label: 'Jobs', icon: 'ListOrdered' },
-      { id: 'services', label: 'Services', icon: 'Activity' },
-      { id: 'processes', label: 'Processes', icon: 'Cpu' },
-      { id: 'logs', label: 'Event Logs', icon: 'FileText' },
-      { id: 'network', label: 'Network', icon: 'Network' },
-      { id: 'apps', label: 'Installed Apps', icon: 'Boxes' },
       { id: 'remote', label: 'Remote', icon: 'Monitor' },
       { id: 'audit', label: 'Audit Trail', icon: 'History' },
     ];
@@ -2023,14 +2021,13 @@
     let tabs = [];
     if (host) tabs = [
       { id: 'overview', label: 'Overview', icon: 'Info' },
+      { id: 'hardware', label: 'Hardware', icon: 'Cpu' },
       { id: 'updates', label: 'Updates', icon: 'ShieldCheck' },
+      { id: 'apps', label: 'Installed Apps', icon: 'Boxes' },
+      { id: 'services', label: 'Services', icon: 'Activity' },
       { id: 'deployments', label: 'Deployments', icon: 'Package' },
       { id: 'jobs', label: 'Jobs', icon: 'ListOrdered' },
-      { id: 'services', label: 'Services', icon: 'Activity' },
-      { id: 'processes', label: 'Processes', icon: 'Cpu' },
-      { id: 'logs', label: 'Event Logs', icon: 'FileText' },
-      { id: 'network', label: 'Network', icon: 'Network' },
-      { id: 'apps', label: 'Installed Apps', icon: 'Boxes' },
+      { id: 'remote', label: 'Remote', icon: 'Monitor' },
       { id: 'audit', label: 'Audit Trail', icon: 'History' },
     ];
     if (job) tabs = [
@@ -2237,11 +2234,901 @@
     );
   };
 
+  const UpdatesTab = ({ host, updateHosts, appendAudit }) => {
+    const toast = useToast();
+    const [scanResult, setScanResult] = useState(null);   // { updates: [], error, scannedAt, count, raw }
+    const [historyResult, setHistoryResult] = useState(null);
+    const [updatesLoading, setUpdatesLoading] = useState(false);
+    const [updatesView, setUpdatesView] = useState('pending'); // 'pending' | 'history'
+
+    const doScan = async () => {
+      if (!window.SupportHubLANAPI) { toast.warning('Backend not connected'); return; }
+      setUpdatesLoading(true);
+      setUpdatesView('pending');
+      setScanResult(null);
+      try {
+        const r = await window.SupportHubLANAPI.scanUpdates([host.hostname], null);
+        if (r && r.success && !r.demo) {
+          let hostResult = null;
+          if (r.results && r.results.length > 0) hostResult = r.results[0];
+          else if (r.data) {
+            try {
+              const parsed = JSON.parse(r.data);
+              hostResult = Array.isArray(parsed) ? parsed[0] : parsed;
+            } catch {}
+          }
+          if (hostResult) {
+            if (hostResult.status === 'scanned' && Array.isArray(hostResult.updates)) {
+              setScanResult({ updates: hostResult.updates, scannedAt: new Date().toISOString(), count: hostResult.updates.length });
+              toast.success(`Found ${hostResult.updates.length} update(s) on ${host.hostname}`);
+              appendAudit({ action: 'updates.scan', actionCategory: 'Updates', targetType: 'Host', targetIds: [host.id], parameters: { hostname: host.hostname, count: hostResult.updates.length }, result: 'success' });
+            } else if (hostResult.status === 'failed' || hostResult.error) {
+              setScanResult({ updates: [], error: hostResult.error || 'Scan failed', raw: hostResult.raw });
+              toast.error('Scan failed', { detail: hostResult.error, duration: 8000 });
+            }
+          } else {
+            setScanResult({ updates: [], error: 'No data returned from backend' });
+          }
+        } else if (r && r.demo) {
+          toast.warning('Backend not connected');
+          setScanResult({ updates: [], error: 'Backend not connected' });
+        } else {
+          toast.error('Scan failed', { detail: r?.error, duration: 8000 });
+          setScanResult({ updates: [], error: r?.error || 'Scan failed' });
+        }
+      } catch (e) {
+        toast.error('Scan failed', { detail: e.message, duration: 8000 });
+        setScanResult({ updates: [], error: e.message });
+      }
+      setUpdatesLoading(false);
+    };
+
+    const doInstall = async () => {
+      if (!window.SupportHubLANAPI) { toast.warning('Backend not connected'); return; }
+      if (!confirm('Install ALL available updates on ' + host.hostname + '?\nThis may take a long time and could reboot the host if required.')) return;
+      setUpdatesLoading(true);
+      try {
+        const r = await window.SupportHubLANAPI.installUpdates([host.hostname], null, { rebootBehavior: 'if-required' });
+        if (r && r.success && !r.demo) {
+          let hostResult = null;
+          if (r.results && r.results.length > 0) hostResult = r.results[0];
+          else if (r.data) {
+            try {
+              const parsed = JSON.parse(r.data);
+              hostResult = Array.isArray(parsed) ? parsed[0] : parsed;
+            } catch {}
+          }
+          updateHosts(prev => prev.map(h => h.id === host.id ? { ...h, patchState: 'compliant', pendingReboot: false } : h));
+          appendAudit({ action: 'updates.install', actionCategory: 'Updates', targetType: 'Host', targetIds: [host.id], parameters: { hostname: host.hostname, installed: hostResult?.count || 0 }, result: 'success' });
+          toast.success(`Installed ${hostResult?.count || 0} update(s) on ${host.hostname}`);
+          setScanResult(null); // clear stale scan
+        } else if (r && r.demo) {
+          toast.warning('Backend not connected');
+        } else {
+          toast.error('Install failed', { detail: r?.error, duration: 8000 });
+        }
+      } catch (e) {
+        toast.error('Install failed', { detail: e.message, duration: 8000 });
+      }
+      setUpdatesLoading(false);
+    };
+
+    const doDownload = async () => {
+      if (!window.SupportHubLANAPI) { toast.warning('Backend not connected'); return; }
+      setUpdatesLoading(true);
+      try {
+        const r = await window.SupportHubLANAPI.downloadUpdates([host.hostname], null);
+        if (r && r.success && !r.demo) {
+          toast.success(`Downloaded updates on ${host.hostname}`);
+          appendAudit({ action: 'updates.download', actionCategory: 'Updates', targetType: 'Host', targetIds: [host.id], parameters: { hostname: host.hostname }, result: 'success' });
+        } else if (r && r.demo) {
+          toast.warning('Backend not connected');
+        } else {
+          toast.error('Download failed', { detail: r?.error, duration: 8000 });
+        }
+      } catch (e) {
+        toast.error('Download failed', { detail: e.message, duration: 8000 });
+      }
+      setUpdatesLoading(false);
+    };
+
+    const doHistory = async () => {
+      if (!window.SupportHubLANAPI) { toast.warning('Backend not connected'); return; }
+      setUpdatesLoading(true);
+      setUpdatesView('history');
+      setHistoryResult(null);
+      try {
+        const r = await window.SupportHubLANAPI.getUpdateHistory([host.hostname], null);
+        if (r && r.success && !r.demo) {
+          let hostResult = null;
+          if (r.results && r.results.length > 0) hostResult = r.results[0];
+          else if (r.data) {
+            try {
+              const parsed = JSON.parse(r.data);
+              hostResult = Array.isArray(parsed) ? parsed[0] : parsed;
+            } catch {}
+          }
+          const history = hostResult?.history || [];
+          setHistoryResult({ history, error: hostResult?.error });
+          toast.success(`Loaded ${history.length} history record(s) for ${host.hostname}`);
+        } else if (r && r.demo) {
+          toast.warning('Backend not connected');
+          setHistoryResult({ history: [], error: 'Backend not connected' });
+        } else {
+          toast.error('History fetch failed', { detail: r?.error, duration: 8000 });
+          setHistoryResult({ history: [], error: r?.error });
+        }
+      } catch (e) {
+        toast.error('History fetch failed', { detail: e.message, duration: 8000 });
+        setHistoryResult({ history: [], error: e.message });
+      }
+      setUpdatesLoading(false);
+    };
+
+    return (
+      <div className="space-y-3">
+        <div className="grid grid-cols-2 gap-2">
+          <div className="p-2 bg-surface-raised rounded border border-border">
+            <div className="text-meta text-text-dim uppercase">Status</div>
+            <div className="text-sm font-semibold capitalize text-text mt-0.5">{host.patchState ? host.patchState.replace('-', ' ') : 'unknown'}</div>
+          </div>
+          <div className="p-2 bg-surface-raised rounded border border-border">
+            <div className="text-meta text-text-dim uppercase">Pending Reboot</div>
+            <div className="text-sm font-semibold text-text mt-0.5">{host.pendingReboot ? 'Yes' : 'No'}</div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-1">
+          <ActionButton variant="primary" size="sm" icon="Search" disabled={updatesLoading} onClick={doScan}>Scan</ActionButton>
+          <ActionButton variant="secondary" size="sm" icon="Download" disabled={updatesLoading} onClick={doDownload}>Download</ActionButton>
+          <ActionButton variant="success" size="sm" icon="ShieldCheck" disabled={updatesLoading} onClick={doInstall}>Install All</ActionButton>
+          <ActionButton variant="secondary" size="sm" icon="History" disabled={updatesLoading} onClick={doHistory}>History</ActionButton>
+        </div>
+
+        {updatesLoading && (
+          <div className="text-text-dim text-xs py-4 text-center">
+            <Icon name="RefreshCw" size={14} className="inline mr-1.5 animate-spin" />
+            Working… (this can take 1-5 minutes for scans)
+          </div>
+        )}
+
+        {!updatesLoading && scanResult && updatesView === 'pending' && (
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-meta text-text-dim uppercase">
+                Pending Updates {scanResult.count !== undefined ? `(${scanResult.count})` : ''}
+              </span>
+              {scanResult.scannedAt && <span className="text-[9px] text-text-dim">{new Date(scanResult.scannedAt).toLocaleTimeString()}</span>}
+            </div>
+            {scanResult.error ? (
+              <div className="p-2 bg-danger/10 border border-danger/30 rounded text-xs text-danger">
+                <div className="font-medium">Error:</div>
+                <div className="mt-0.5">{scanResult.error}</div>
+                {scanResult.raw && <details className="mt-1"><summary className="cursor-pointer text-[10px]">Raw output</summary><pre className="text-[9px] mt-1 whitespace-pre-wrap break-all">{scanResult.raw}</pre></details>}
+              </div>
+            ) : scanResult.updates.length === 0 ? (
+              <div className="p-2 bg-success/10 border border-success/30 rounded text-xs text-success text-center">
+                No pending updates — host is up to date.
+              </div>
+            ) : (
+              scanResult.updates.map((u, i) => (
+                <div key={i} className="p-1.5 bg-surface-raised rounded border border-border text-xs">
+                  <div className="flex items-start justify-between gap-1">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="font-mono text-text text-[10px] bg-surface px-1 rounded">{u.KB || u.kb || '—'}</span>
+                        {u.MsrcSeverity && (
+                          <span className={`px-1 text-[9px] rounded ${/critical/i.test(u.MsrcSeverity) ? 'bg-danger/15 text-danger' : /important|moderate/i.test(u.MsrcSeverity) ? 'bg-warning/15 text-warning' : 'bg-info/15 text-info'}`}>
+                            {u.MsrcSeverity}
+                          </span>
+                        )}
+                        {u.Size && <span className="text-[9px] text-text-dim tnum">{formatBytes(u.Size)}</span>}
+                      </div>
+                      <div className="text-text mt-0.5">{u.Title || u.title || '(no title)'}</div>
+                      {u.Category && <div className="text-[10px] text-text-dim">{u.Category}</div>}
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {!updatesLoading && historyResult && updatesView === 'history' && (
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-meta text-text-dim uppercase">Update History</span>
+            </div>
+            {historyResult.error ? (
+              <div className="p-2 bg-danger/10 border border-danger/30 rounded text-xs text-danger">
+                <div className="font-medium">Error:</div>
+                <div className="mt-0.5">{historyResult.error}</div>
+              </div>
+            ) : historyResult.history.length === 0 ? (
+              <div className="p-2 bg-surface-raised rounded border border-border text-xs text-text-dim text-center">
+                No update history available.
+              </div>
+            ) : (
+              historyResult.history.slice(0, 30).map((h, i) => (
+                <div key={i} className="p-1.5 bg-surface-raised rounded border border-border text-xs">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="font-mono text-text text-[10px] bg-surface px-1 rounded">{h.KB || h.kb || '—'}</span>
+                    {h.Result !== undefined && (
+                      <span className={`px-1 text-[9px] rounded ${h.Result === 'Succeeded' || h.Result === 1 || h.Result === '1' ? 'bg-success/15 text-success' : 'bg-danger/15 text-danger'}`}>
+                        {typeof h.Result === 'string' ? h.Result : (h.Result === 1 ? 'Succeeded' : 'Failed')}
+                      </span>
+                    )}
+                    {h.Date && <span className="text-[9px] text-text-dim">{new Date(h.Date).toLocaleString()}</span>}
+                  </div>
+                  <div className="text-text mt-0.5">{h.Title || h.title || '(no title)'}</div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {!updatesLoading && !scanResult && !historyResult && (
+          <div className="text-[10px] text-text-dim text-center py-2">
+            Click <strong>Scan</strong> to see available updates, or <strong>History</strong> to see installed updates.
+            <div className="mt-1 text-[9px]">Requires PSWindowsUpdate module on the target host.</div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const PendingUpdatesDetail = ({ host, appendAudit }) => {
+    const toast = useToast();
+    const [result, setResult] = useState(null); // { updates, error, raw, scannedAt }
+    const [loading, setLoading] = useState(false);
+
+    const scan = async () => {
+      if (!host) return;
+      if (!window.SupportHubLANAPI) { toast.warning('Backend not connected'); return; }
+      setLoading(true);
+      setResult(null);
+      try {
+        const r = await window.SupportHubLANAPI.scanUpdates([host.hostname], null);
+        if (r && r.success && !r.demo) {
+          let hostResult = null;
+          if (r.results && r.results.length > 0) hostResult = r.results[0];
+          else if (r.data) {
+            try {
+              const parsed = JSON.parse(r.data);
+              hostResult = Array.isArray(parsed) ? parsed[0] : parsed;
+            } catch {}
+          }
+          if (hostResult && hostResult.status === 'scanned' && Array.isArray(hostResult.updates)) {
+            setResult({ updates: hostResult.updates, scannedAt: new Date().toISOString() });
+            toast.success(`Found ${hostResult.updates.length} update(s) on ${host.hostname}`);
+            if (appendAudit) appendAudit({ action: 'updates.scan', actionCategory: 'Updates', targetType: 'Host', targetIds: [host.id], parameters: { hostname: host.hostname, count: hostResult.updates.length, source: 'updates-screen' }, result: 'success' });
+          } else if (hostResult && (hostResult.status === 'failed' || hostResult.error)) {
+            setResult({ updates: [], error: hostResult.error || 'Scan failed', raw: hostResult.raw });
+            toast.error('Scan failed', { detail: hostResult.error, duration: 8000 });
+          } else {
+            setResult({ updates: [], error: 'No data returned from backend' });
+          }
+        } else if (r && r.demo) {
+          toast.warning('Backend not connected');
+          setResult({ updates: [], error: 'Backend not connected' });
+        } else {
+          toast.error('Scan failed', { detail: r?.error, duration: 8000 });
+          setResult({ updates: [], error: r?.error || 'Scan failed' });
+        }
+      } catch (e) {
+        toast.error('Scan failed', { detail: e.message, duration: 8000 });
+        setResult({ updates: [], error: e.message });
+      }
+      setLoading(false);
+    };
+
+    if (!host) {
+      return <EmptyState icon="ShieldCheck" title="All compliant" description="No pending updates to display." />;
+    }
+
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <div className="text-xs text-text-dim">
+            Showing pending updates for <span className="font-mono text-text">{host.hostname}</span>
+            {result?.scannedAt && <span className="ml-2 text-[10px]">scanned at {new Date(result.scannedAt).toLocaleTimeString()}</span>}
+          </div>
+          <ActionButton variant="primary" size="sm" icon="Search" disabled={loading} onClick={scan}>
+            {loading ? 'Scanning…' : 'Scan Now'}
+          </ActionButton>
+        </div>
+
+        {loading && (
+          <div className="text-text-dim text-xs py-6 text-center">
+            <Icon name="RefreshCw" size={14} className="inline mr-1.5 animate-spin" />
+            Scanning {host.hostname}… (1-5 min)
+          </div>
+        )}
+
+        {!loading && result?.error && (
+          <div className="p-2 bg-danger/10 border border-danger/30 rounded text-xs text-danger">
+            <div className="font-medium">Error:</div>
+            <div className="mt-0.5">{result.error}</div>
+            {result.raw && <details className="mt-1"><summary className="cursor-pointer text-[10px]">Raw output</summary><pre className="text-[9px] mt-1 whitespace-pre-wrap break-all">{result.raw}</pre></details>}
+          </div>
+        )}
+
+        {!loading && result && !result.error && result.updates.length === 0 && (
+          <div className="p-2 bg-success/10 border border-success/30 rounded text-xs text-success text-center">
+            Host is up to date — no pending updates.
+          </div>
+        )}
+
+        {!loading && result && !result.error && result.updates.length > 0 && (
+          <div className="space-y-1">
+            {result.updates.map((u, i) => (
+              <div key={i} className="p-1.5 bg-surface-raised rounded border border-border text-xs">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="font-mono text-text text-[10px] bg-surface px-1 rounded">{u.KB || u.kb || '—'}</span>
+                  {u.MsrcSeverity && (
+                    <span className={`px-1 text-[9px] rounded ${/critical/i.test(u.MsrcSeverity) ? 'bg-danger/15 text-danger' : /important|moderate/i.test(u.MsrcSeverity) ? 'bg-warning/15 text-warning' : 'bg-info/15 text-info'}`}>
+                      {u.MsrcSeverity}
+                    </span>
+                  )}
+                  {u.Size && <span className="text-[9px] text-text-dim tnum">{formatBytes(u.Size)}</span>}
+                  {u.Category && <span className="text-[9px] text-text-dim">· {u.Category}</span>}
+                </div>
+                <div className="text-text mt-0.5">{u.Title || u.title || '(no title)'}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {!loading && !result && (
+          <div className="text-text-dim text-xs py-6 text-center">
+            Click <strong>Scan Now</strong> to fetch the list of available updates from {host.hostname}.
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const HardwareTab = ({ host, updateHosts }) => {
+    const toast = useToast();
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState(null);
+    const [rawOutputs, setRawOutputs] = useState(null);
+    const hw = host._hardwareInfo;
+
+    const scan = async () => {
+      if (!window.SupportHubLANAPI) { toast.warning('Backend not connected'); return; }
+      setLoading(true);
+      setError(null);
+      setRawOutputs(null);
+      toast.info('Scanning hardware on ' + host.hostname + '…');
+      try {
+        const r = await window.SupportHubLANAPI.getHardwareInfo(host.hostname);
+        if (r && r.success && !r.demo && r.data) {
+          updateHosts(prev => prev.map(h => h.id === host.id ? {
+            ...h,
+            _hardwareInfo: r.data,
+            osName: r.data?.os?.name || h.osName,
+            osBuild: r.data?.os?.build || h.osBuild,
+            cpuModel: r.data?.processor?.name || h.cpuModel,
+            ramGb: r.data?.system?.totalRamMB ? Math.round(r.data.system.totalRamMB / 1024) : h.ramGb,
+            ipAddress: r.data?.network?.[0]?.ipAddress || h.ipAddress,
+            macAddress: r.data?.network?.[0]?.macAddress || h.macAddress,
+          } : h));
+          toast.success('Hardware scan complete for ' + host.hostname);
+          if (r.changes && r.changes.length > 0) {
+            r.changes.forEach(c => {
+              toast.warning('Hardware change: ' + c.field, {
+                detail: (c.oldValue || '∅') + ' → ' + (c.newValue || '∅'),
+                duration: 10000,
+              });
+            });
+          }
+          if (r.rawOutputs) setRawOutputs(r.rawOutputs);
+        } else if (r && r.demo) {
+          toast.warning('Backend not connected');
+          setError('Backend not connected');
+        } else {
+          toast.error('Hardware scan failed', { detail: r?.error, duration: 8000 });
+          setError(r?.error || 'Scan failed');
+        }
+      } catch (e) {
+        toast.error('Hardware scan failed', { detail: e.message, duration: 8000 });
+        setError(e.message);
+      }
+      setLoading(false);
+    };
+
+    // On first tab open: load SAVED hardware data first (instant), then
+    // auto-scan ONLY if no saved data exists. This way the user sees the
+    // last known hardware immediately without waiting for a scan, and we
+    // don't lose old data if a new scan returns empty.
+    const [loadedSaved, setLoadedSaved] = useState(false);
+    useEffect(() => {
+      let cancelled = false;
+      (async () => {
+        if (!window.SupportHubLANAPI) return;
+        // If we already have hardware data in state, don't re-load
+        if (host._hardwareInfo) { setLoadedSaved(true); return; }
+        // Try to load saved hardware data
+        try {
+          const r = await window.SupportHubLANAPI.getSavedHardware(host.hostname);
+          if (cancelled) return;
+          if (r && r.success && r.data) {
+            updateHosts(prev => prev.map(h => h.id === host.id ? { ...h, _hardwareInfo: r.data } : h));
+            setLoadedSaved(true);
+            // Don't auto-scan — user has saved data. They can click Rescan.
+          } else {
+            setLoadedSaved(true);
+            // No saved data — auto-scan
+            scan();
+          }
+        } catch (e) {
+          setLoadedSaved(true);
+          // Failed to load saved — auto-scan
+          scan();
+        }
+      })();
+      return () => { cancelled = true; };
+      // eslint-disable-next-line
+    }, [host.id]);
+
+    if (loading && !hw) {
+      return (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-meta text-text-dim uppercase">Hardware</span>
+            <ActionButton variant="secondary" size="sm" icon="RefreshCw" disabled>Scanning…</ActionButton>
+          </div>
+          <div className="text-text-dim text-xs py-8 text-center">
+            <Icon name="RefreshCw" size={16} className="inline mr-2 animate-spin" />
+            Running psinfo -d -h -s + psloggedon on {host.hostname}…<br />
+            <span className="text-[10px]">(2 PsTools calls — takes 5–15 seconds)</span>
+          </div>
+        </div>
+      );
+    }
+
+    if (!hw) {
+      return (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-meta text-text-dim uppercase">Hardware</span>
+            <ActionButton variant="primary" size="sm" icon="Cpu" disabled={loading} onClick={scan}>
+              {loading ? 'Scanning…' : 'Scan Hardware'}
+            </ActionButton>
+          </div>
+          {error && (
+            <div className="p-2 bg-danger/10 border border-danger/30 rounded text-xs text-danger">
+              <div className="font-medium">Scan failed:</div>
+              <div className="mt-0.5">{error}</div>
+            </div>
+          )}
+          {!error && (
+            <div className="text-text-dim text-xs py-6 text-center">
+              No hardware data yet. Click <strong>Scan Hardware</strong> to fetch details.
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // Helper: section title
+    const SectionTitle = ({ icon, children }) => (
+      <div className="flex items-center gap-1.5 mt-3 mb-1">
+        <Icon name={icon} size={12} className="text-text-dim" />
+        <span className="text-meta text-text-dim uppercase">{children}</span>
+      </div>
+    );
+
+    // Helper: label/value row (only shows if value is non-empty)
+    const Row = ({ label, value, mono }) => {
+      if (!value) return null;
+      return (
+        <div className="flex justify-between items-start py-0.5 text-xs">
+          <span className="text-text-dim">{label}</span>
+          <span className={`text-text text-right ${mono ? 'font-mono' : ''}`}>{value}</span>
+        </div>
+      );
+    };
+
+    const cpu = hw.processor;
+    const mb = hw.motherboard;
+    const bios = hw.bios;
+    const sys = hw.system;
+    const osInfo = hw.os;
+
+    return (
+      <div className="space-y-1">
+        {/* Header with rescan button */}
+        <div className="flex items-center justify-between">
+          <span className="text-meta text-text-dim uppercase">Hardware Audit</span>
+          <div className="flex items-center gap-1.5">
+            {hw.scannedAt && (
+              <span className="text-[9px] text-text-dim">
+                scanned {new Date(hw.scannedAt).toLocaleString()}
+              </span>
+            )}
+            <ActionButton variant="secondary" size="sm" icon="RefreshCw" disabled={loading} onClick={scan}>
+              {loading ? 'Scanning…' : 'Rescan'}
+            </ActionButton>
+          </div>
+        </div>
+
+        {error && (
+          <div className="p-2 bg-warning/10 border border-warning/30 rounded text-[11px] text-warning mt-1">
+            Last scan returned partial data: {error}
+          </div>
+        )}
+
+        {/* SYSTEM (Make / Model / Serial) */}
+        <SectionTitle icon="Server">System</SectionTitle>
+        <div className="p-2 bg-surface-raised rounded border border-border">
+          <Row label="Manufacturer" value={sys?.manufacturer} />
+          <Row label="Model" value={sys?.model} />
+          <Row label="Serial Number" value={sys?.serial} mono />
+          <Row label="System Type" value={sys?.systemType} />
+          <Row label="Domain" value={sys?.domain} mono />
+          {sys?.totalRamMB > 0 && (
+            <Row label="Total RAM" value={sys.totalRamMB >= 1024 ? (sys.totalRamMB / 1024).toFixed(1) + ' GB' : sys.totalRamMB + ' MB'} />
+          )}
+          {sys?.numberOfProcessors > 0 && <Row label="Processor Count" value={String(sys.numberOfProcessors)} />}
+        </div>
+
+        {/* MOTHERBOARD */}
+        <SectionTitle icon="CircuitBoard">Motherboard</SectionTitle>
+        <div className="p-2 bg-surface-raised rounded border border-border">
+          <Row label="Manufacturer" value={mb?.manufacturer} />
+          <Row label="Product" value={mb?.product} />
+          <Row label="Version" value={mb?.version} />
+          <Row label="Serial Number" value={mb?.serial} mono />
+          {!mb?.manufacturer && !mb?.product && !mb?.serial && (
+            <div className="text-text-dim text-xs">No motherboard data.</div>
+          )}
+        </div>
+
+        {/* BIOS */}
+        <SectionTitle icon="Chip">BIOS</SectionTitle>
+        <div className="p-2 bg-surface-raised rounded border border-border">
+          <Row label="Manufacturer" value={bios?.manufacturer} />
+          <Row label="Name" value={bios?.name} />
+          <Row label="Version" value={bios?.version} />
+          <Row label="Serial Number" value={bios?.serial} mono />
+          <Row label="Release Date" value={bios?.releaseDate} />
+          {!bios?.manufacturer && !bios?.version && (
+            <div className="text-text-dim text-xs">No BIOS data.</div>
+          )}
+        </div>
+
+        {/* PROCESSOR — ONE only (make / model / cores / threads) */}
+        <SectionTitle icon="Cpu">Processor</SectionTitle>
+        <div className="p-2 bg-surface-raised rounded border border-border">
+          {cpu ? (
+            <>
+              <Row label="Make" value={cpu.manufacturer} />
+              <Row label="Model" value={cpu.name} />
+              {cpu.cores > 0 && <Row label="Cores" value={String(cpu.cores)} />}
+              {cpu.threads > 0 && <Row label="Threads" value={String(cpu.threads)} />}
+              {cpu.maxSpeedMHz > 0 && (
+                <Row label="Max Speed" value={(cpu.maxSpeedMHz / 1000).toFixed(2) + ' GHz'} />
+              )}
+              {cpu.currentSpeedMHz > 0 && (
+                <Row label="Current Speed" value={(cpu.currentSpeedMHz / 1000).toFixed(2) + ' GHz'} />
+              )}
+              {cpu.socketCount > 1 && <Row label="Sockets" value={String(cpu.socketCount)} />}
+              {cpu.socket && <Row label="Socket" value={cpu.socket} mono />}
+            </>
+          ) : (
+            <div className="text-text-dim text-xs">No processor data.</div>
+          )}
+        </div>
+
+        {/* MEMORY STICKS */}
+        <SectionTitle icon="MemoryStick">Memory</SectionTitle>
+        <div className="p-2 bg-surface-raised rounded border border-border">
+          {sys?.totalRamMB > 0 && (
+            <Row label="Total RAM" value={sys.totalRamMB >= 1024 ? (sys.totalRamMB / 1024).toFixed(1) + ' GB' : sys.totalRamMB + ' MB'} />
+          )}
+          {hw.memory && hw.memory.length > 0 ? (
+            <div className="mt-2 pt-2 border-t border-border space-y-1">
+              <div className="text-[10px] text-text-dim uppercase mb-1">Sticks ({hw.memory.length})</div>
+              {hw.memory.map((m, i) => (
+                <div key={i} className="text-[10px] text-text">
+                  <span className="font-mono">{m.deviceLocator || 'Slot ' + (i+1)}</span>
+                  {' — '}{m.capacityGB} GB{m.speed ? ' · ' + m.speed + ' MHz' : ''}
+                  {m.manufacturer ? ' · ' + m.manufacturer : ''}
+                  {m.partNumber ? ' · ' + m.partNumber : ''}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-text-dim text-xs mt-1">No individual stick data (WMI may not expose this on some systems).</div>
+          )}
+        </div>
+
+        {/* STORAGE — LOGICAL VOLUMES */}
+        <SectionTitle icon="HardDrive">Storage — Volumes</SectionTitle>
+        <div className="p-2 bg-surface-raised rounded border border-border space-y-1">
+          {hw.logicalDisks && hw.logicalDisks.length > 0 ? hw.logicalDisks.map((d, i) => {
+            const usedGB = d.sizeGB - d.freeGB;
+            const pct = d.sizeGB > 0 ? Math.round((usedGB / d.sizeGB) * 100) : 0;
+            const barColor = pct > 90 ? 'bg-danger' : pct > 75 ? 'bg-warning' : 'bg-success';
+            return (
+              <div key={i} className="text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="font-mono text-text">{d.drive}</span>
+                  <span className="text-[10px] text-text-dim tnum">
+                    {usedGB.toFixed(0)} / {d.sizeGB} GB · {pct}% used
+                  </span>
+                </div>
+                <div className="h-1.5 bg-surface rounded mt-0.5 overflow-hidden">
+                  <div className={`h-full ${barColor}`} style={{ width: pct + '%' }} />
+                </div>
+                <div className="text-[9px] text-text-dim mt-0.5">
+                  {d.freeGB} GB free · {d.fileSystem || '—'} {d.volumeName ? '· ' + d.volumeName : ''}
+                </div>
+              </div>
+            );
+          }) : (
+            <div className="text-text-dim text-xs">No volume data. Run rescan.</div>
+          )}
+        </div>
+
+        {/* STORAGE — PHYSICAL DISKS */}
+        {hw.disks && hw.disks.length > 0 && (
+          <>
+            <SectionTitle icon="Disc">Physical Disks</SectionTitle>
+            <div className="p-2 bg-surface-raised rounded border border-border space-y-1">
+              {hw.disks.map((d, i) => (
+                <div key={i} className="text-xs">
+                  <div className="flex justify-between">
+                    <span className="text-text">{d.model || 'Disk ' + i}</span>
+                    <span className="text-text-dim tnum">{d.sizeGB} GB</span>
+                  </div>
+                  <div className="text-[9px] text-text-dim">
+                    {d.interface ? d.interface + ' · ' : ''}{d.partitions} partition(s)
+                    {d.serialNumber ? ' · S/N: ' + d.serialNumber : ''}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {/* NETWORK ADAPTERS */}
+        <SectionTitle icon="Network">Network Adapters</SectionTitle>
+        <div className="p-2 bg-surface-raised rounded border border-border space-y-2">
+          {hw.network && hw.network.length > 0 ? hw.network.map((n, i) => (
+            <div key={i} className="text-xs">
+              <div className="text-text font-medium">{n.description || 'Adapter ' + (i+1)}</div>
+              <div className="grid grid-cols-2 gap-x-2 text-[10px] text-text-dim mt-0.5">
+                <div>IP: <span className="font-mono text-text">{n.ipAddress || '—'}</span></div>
+                <div>MAC: <span className="font-mono text-text">{n.macAddress || '—'}</span></div>
+                <div>DHCP: <span className="text-text">{n.dhcpEnabled ? 'Yes' : 'No'}</span></div>
+                <div>Gateway: <span className="font-mono text-text">{n.defaultGateway || '—'}</span></div>
+                {n.dnsServers && <div className="col-span-2">DNS: <span className="font-mono text-text">{n.dnsServers}</span></div>}
+              </div>
+            </div>
+          )) : (
+            <div className="text-text-dim text-xs">No network adapters found.</div>
+          )}
+        </div>
+
+        {/* GPU / GRAPHICS */}
+        {hw.gpu && hw.gpu.length > 0 && (
+          <>
+            <SectionTitle icon="Monitor">Graphics</SectionTitle>
+            <div className="p-2 bg-surface-raised rounded border border-border space-y-1">
+              {hw.gpu.map((g, i) => (
+                <div key={i} className="text-xs">
+                  <div className="text-text">{g.name || 'GPU ' + (i+1)}</div>
+                  {g.manufacturer && <div className="text-[10px] text-text-dim">{g.manufacturer}</div>}
+                  {g.driverVersion && <div className="text-[10px] text-text-dim">Driver: {g.driverVersion}</div>}
+                  {g.ramMB > 0 && <div className="text-[10px] text-text-dim">VRAM: {g.ramMB} MB</div>}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {/* OPERATING SYSTEM */}
+        <SectionTitle icon="Monitor">Operating System</SectionTitle>
+        <div className="p-2 bg-surface-raised rounded border border-border">
+          <Row label="OS" value={osInfo?.name} />
+          <Row label="Version" value={osInfo?.version} />
+          <Row label="Build" value={osInfo?.build} mono />
+          <Row label="Architecture" value={osInfo?.architecture} />
+          <Row label="Install Date" value={osInfo?.installDate} />
+          <Row label="Last Boot" value={osInfo?.lastBoot} />
+          <Row label="OS Serial" value={osInfo?.serial} mono />
+          <Row label="Registered Org" value={osInfo?.registeredOrg} />
+          <Row label="Registered User" value={osInfo?.registeredUser} />
+        </div>
+
+        {/* HOTFIXES */}
+        {hw.hotfixes && hw.hotfixes.length > 0 && (
+          <>
+            <SectionTitle icon="ShieldCheck">Installed Hotfixes ({hw.hotfixes.length})</SectionTitle>
+            <div className="p-2 bg-surface-raised rounded border border-border">
+              <div className="flex flex-wrap gap-1">
+                {hw.hotfixes.map((kb, i) => (
+                  <span key={i} className="font-mono text-[10px] bg-surface px-1.5 py-0.5 rounded border border-border text-text">{kb}</span>
+                ))}
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* LOGGED-IN USER */}
+        <SectionTitle icon="User">User</SectionTitle>
+        <div className="p-2 bg-surface-raised rounded border border-border">
+          <Row label="Logged In" value={hw.loggedInUser} mono />
+          {!hw.loggedInUser && <div className="text-text-dim text-xs">No user currently logged in.</div>}
+        </div>
+
+        {/* RAW OUTPUTS (collapsible, for debugging) */}
+        {rawOutputs && (
+          <div className="mt-3">
+            <details>
+              <summary className="cursor-pointer text-[10px] text-text-dim">Raw wmic outputs (debug)</summary>
+              <div className="mt-1 space-y-2">
+                {Object.entries(rawOutputs).map(([key, val]) => val ? (
+                  <div key={key}>
+                    <div className="text-[9px] text-text-dim font-mono">{key}</div>
+                    <pre className="text-[9px] p-1 bg-surface-raised rounded border border-border whitespace-pre-wrap break-all max-h-32 overflow-y-auto">{val}</pre>
+                  </div>
+                ) : null)}
+              </div>
+            </details>
+          </div>
+        )}
+
+        <div className="text-[9px] text-text-dim text-center pt-2 pb-1">
+          Data source: PsInfo -d -h -s · PsLoggedOn (pure PsTools, no wmic/PowerShell)
+        </div>
+      </div>
+    );
+  };
+
+  const AppsTab = ({ host }) => {
+    const toast = useToast();
+    const [apps, setApps] = useState(null);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState(null);
+    const [search, setSearch] = useState('');
+
+    const fetchApps = async () => {
+      if (!window.SupportHubLANAPI) { toast.warning('Backend not connected'); return; }
+      setLoading(true);
+      setError(null);
+      setApps(null);
+      try {
+        const r = await window.SupportHubLANAPI.getApps(host.hostname);
+        if (r && r.success && !r.demo) {
+          const list = r.apps || [];
+          setApps(list);
+          toast.success(`Found ${list.length} app(s) on ${host.hostname}`);
+        } else if (r && r.demo) {
+          toast.warning('Backend not connected');
+          setError('Backend not connected');
+        } else {
+          toast.error('Failed to list apps', { detail: r?.error, duration: 8000 });
+          setError(r?.error || 'Failed');
+        }
+      } catch (e) {
+        toast.error('Failed to list apps', { detail: e.message, duration: 8000 });
+        setError(e.message);
+      }
+      setLoading(false);
+    };
+
+    // Auto-fetch on mount
+    useEffect(() => {
+      if (window.SupportHubLANAPI) fetchApps();
+      // eslint-disable-next-line
+    }, [host.id]);
+
+    const filtered = useMemo(() => {
+      if (!apps) return [];
+      if (!search) return apps;
+      const q = search.toLowerCase();
+      return apps.filter(a =>
+        (a.name || '').toLowerCase().includes(q) ||
+        (a.publisher || '').toLowerCase().includes(q) ||
+        (a.version || '').toLowerCase().includes(q)
+      );
+    }, [apps, search]);
+
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-meta text-text-dim uppercase">
+            Installed Software {apps ? `(${apps.length})` : ''}
+          </span>
+          <ActionButton variant="secondary" size="sm" icon="RefreshCw" disabled={loading} onClick={fetchApps}>
+            {loading ? 'Scanning…' : 'Refresh'}
+          </ActionButton>
+        </div>
+
+        {apps && apps.length > 0 && (
+          <input
+            type="text"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Search by name, publisher, or version…"
+            className="w-full px-2 py-1 text-xs bg-surface border border-border rounded text-text placeholder:text-text-dim focus:outline-none focus:border-primary"
+          />
+        )}
+
+        {loading && (
+          <div className="text-text-dim text-xs py-6 text-center">
+            <Icon name="RefreshCw" size={14} className="inline mr-1.5 animate-spin" />
+            Querying registry on {host.hostname}…
+          </div>
+        )}
+
+        {error && !loading && (
+          <div className="p-2 bg-danger/10 border border-danger/30 rounded text-xs text-danger">
+            <div className="font-medium">Error:</div>
+            <div className="mt-0.5">{error}</div>
+          </div>
+        )}
+
+        {!loading && !error && apps && apps.length === 0 && (
+          <div className="text-text-dim text-xs py-4 text-center">No installed apps found.</div>
+        )}
+
+        {!loading && filtered.length > 0 && (
+          <div className="space-y-1 max-h-[500px] overflow-y-auto">
+            {search && (
+              <div className="text-[10px] text-text-dim text-center pb-1">
+                Showing {filtered.length} of {apps.length}
+              </div>
+            )}
+            {filtered.map((a, i) => (
+              <div key={i} className="p-1.5 bg-surface-raised rounded border border-border text-xs">
+                <div className="text-text">{a.name || 'Unknown'}</div>
+                <div className="text-[10px] text-text-dim">
+                  {a.version || ''}{a.publisher ? ' · ' + a.publisher : ''}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {!loading && apps && apps.length > 0 && (
+          <div className="text-[9px] text-text-dim text-center pt-1">
+            Data source: PsExec + reg query (no PowerShell) · 64-bit + 32-bit + User registry
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const formatBytes = (bytes) => {
+    if (bytes === null || bytes === undefined || isNaN(bytes)) return '—';
+    const b = Number(bytes);
+    if (b < 1024) return b + ' B';
+    if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+    if (b < 1024 * 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + ' MB';
+    return (b / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+  };
+
   // Host drawer tab content
   const HostDrawerTab = ({ tab, host }) => {
     const { activeJobs, hosts, updateHosts, addJob, appendAudit, executePowerAction } = useApp();
     // Always read the freshest version of this host from state (so drawer updates after mutations)
     const liveHost = hosts.find(h => h.id === host.id) || host;
+
+    // ---- HARDWARE ---- (dedicated Hardware tab — full multi-method audit)
+    if (tab === 'hardware') {
+      return <HardwareTab host={liveHost} updateHosts={updateHosts} />;
+    }
+
+    // ---- APPS ---- (Installed Apps tab)
+    if (tab === 'apps') {
+      return <AppsTab host={liveHost} />;
+    }
+
     if (tab === 'overview') {
       return (
         <div className="space-y-3">

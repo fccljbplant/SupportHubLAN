@@ -219,9 +219,20 @@ app.post('/api/winrm/enable', async (req, res) => {
   res.json({ success: result.success, data: result });
 });
 
+// Check if PSWindowsUpdate module is available (checked at startup, cached)
+let _psWindowsUpdateAvailable = null;
+async function checkPSWindowsUpdate() {
+  if (_psWindowsUpdateAvailable !== null) return _psWindowsUpdateAvailable;
+  try {
+    const result = await runPowerShell('Get-Module -ListAvailable PSWindowsUpdate | Select-Object -First 1 | Measure-Object | Select-Object -ExpandProperty Count', 10000);
+    _psWindowsUpdateAvailable = result.success && parseInt(result.stdout.trim(), 10) > 0;
+  } catch { _psWindowsUpdateAvailable = false; }
+  return _psWindowsUpdateAvailable;
+}
+
 app.get('/api/health', (req, res) => {
   const pstoolsInstalled = fs.existsSync(path.join(PSTOOLS_PATH, 'psexec.exe'));
-  const psWindowsUpdateAvailable = true; // Checked at runtime
+  const psWindowsUpdateAvailable = _psWindowsUpdateAvailable;
   res.json({
     success: true,
     data: {
@@ -2211,6 +2222,11 @@ function broadcastUpdate(data) {
 // ==========================================================================
 // START SERVER
 // ==========================================================================
+// Check PSWindowsUpdate availability at startup (async, non-blocking)
+checkPSWindowsUpdate().then(available => {
+  console.log(`[startup] PSWindowsUpdate module: ${available ? 'available' : 'NOT installed (Windows Update features will not work on this server)'}`);
+}).catch(() => {});
+
 server.listen(PORT, BIND_ADDRESS, () => {
   const displayIp = BIND_ADDRESS === '0.0.0.0' ? 'localhost' : BIND_ADDRESS;
   console.log(`

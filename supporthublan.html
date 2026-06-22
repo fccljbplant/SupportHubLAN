@@ -1694,7 +1694,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v4.2.0.8';
+  const APP_VERSION = 'v4.2.0.9';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -1938,71 +1938,6 @@
           </div>
         )}
       </aside>
-    );
-  };
-
-  // ---- Right Drawer (380px) for host/job detail ----
-  const RightDrawer = ({ open, onClose, kind, data }) => {
-    const { navigate } = useApp();
-    const [tab, setTab] = useState('overview');
-    useEffect(() => { setTab('overview'); }, [data?.id]);
-    useEffect(() => {
-      const h = (e) => { if (e.key === 'Escape' && open) onClose(); };
-      window.addEventListener('keydown', h);
-      return () => window.removeEventListener('keydown', h);
-    }, [open, onClose]);
-    if (!open || !data) return null;
-    const host = kind === 'host' ? data : null;
-    const job = kind === 'job' ? data : null;
-
-    let tabs = [];
-    if (host) tabs = [
-      { id: 'overview', label: 'Overview', icon: 'Info' },
-      { id: 'hardware', label: 'Hardware', icon: 'Cpu' },
-      { id: 'updates', label: 'Updates', icon: 'ShieldCheck' },
-      { id: 'apps', label: 'Installed Apps', icon: 'Boxes' },
-      { id: 'services', label: 'Services', icon: 'Activity' },
-      { id: 'deployments', label: 'Deployments', icon: 'Package' },
-      { id: 'jobs', label: 'Jobs', icon: 'ListOrdered' },
-      { id: 'remote', label: 'Remote', icon: 'Monitor' },
-      { id: 'audit', label: 'Audit Trail', icon: 'History' },
-    ];
-    if (job) tabs = [
-      { id: 'overview', label: 'Overview', icon: 'Info' },
-      { id: 'steps', label: 'Steps', icon: 'ListOrdered' },
-      { id: 'hosts', label: 'Hosts', icon: 'Server' },
-      { id: 'log', label: 'Live Log', icon: 'Terminal' },
-    ];
-
-    return (
-      <>
-        <div className="fixed inset-0 bg-black/40 z-30 animate-fadeIn" onClick={onClose} />
-        <aside className="fixed right-0 top-0 bottom-0 w-[380px] bg-surface border-l border-border z-40 flex flex-col animate-slideIn">
-          {/* Header */}
-          <div className="flex items-center justify-between p-3 border-b border-border">
-            <div className="min-w-0">
-              <div className="text-meta text-text-dim uppercase">{kind === 'host' ? 'Host Detail' : 'Job Detail'}</div>
-              <div className="text-sm font-semibold text-text font-mono truncate">{host ? host.hostname : job.name}</div>
-            </div>
-            <IconButton icon="X" onClick={onClose} title="Close (Esc)" />
-          </div>
-
-          {/* Tabs */}
-          <div className="flex items-center gap-1 px-2 border-b border-border overflow-x-auto">
-            {tabs.map(t => (
-              <button key={t.id} onClick={() => setTab(t.id)} className={`flex items-center gap-1.5 px-2.5 py-2 text-[11px] font-medium whitespace-nowrap border-b-2 -mb-px ${tab === t.id ? 'border-primary text-primary' : 'border-transparent text-text-dim hover:text-text'}`}>
-                <Icon name={t.icon} size={12} />{t.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Body */}
-          <div className="flex-1 overflow-y-auto p-3">
-            {host && <HostDrawerTab tab={tab} host={host} />}
-            {job && <JobDrawerTab tab={tab} job={job} />}
-          </div>
-        </aside>
-      </>
     );
   };
 
@@ -3263,68 +3198,8 @@
         </div>
       ))}</div>;
     }
-    if (tab === 'processes') {
-      const sampleProcs = [
-        { pid: 4, name: 'System', cpu: 1.2, mem: 0.5, user: 'SYSTEM' },
-        { pid: 512, name: 'svchost.exe', cpu: 0.4, mem: 24, user: 'SYSTEM' },
-        { pid: 1024, name: 'sqlservr.exe', cpu: 12.5, mem: 4520, user: 'MSSQL' },
-        { pid: 2048, name: 'chrome.exe', cpu: 4.2, mem: 580, user: 'a.garcia' },
-      ];
-      return <div className="space-y-1">{sampleProcs.map(p => (
-        <div key={p.pid} className="flex items-center gap-2 p-1.5 bg-surface-raised rounded border border-border text-xs">
-          <span className="text-text-dim tnum w-10">PID {p.pid}</span>
-          <span className="flex-1 font-mono text-text truncate">{p.name}</span>
-          <span className="text-text-dim tnum">{p.cpu}%</span>
-          <span className="text-text-dim tnum w-14 text-right">{p.mem} MB</span>
-          <IconButton icon="X" size="sm" variant="danger" title="Kill" />
-        </div>
-      ))}</div>;
-    }
-    if (tab === 'logs') {
-      const events = [
-        { id: 4624, source: 'Microsoft-Windows-Security', level: 'Information', time: '07:55:01' },
-        { id: 4634, source: 'Microsoft-Windows-Security', level: 'Information', time: '07:30:14' },
-        { id: 7036, source: 'Service Control Manager', level: 'Information', time: '07:00:00' },
-        { id: 21, source: 'WUSA', level: 'Information', time: '06:45:22' },
-      ];
-      return <div className="space-y-1">{events.map((e, i) => (
-        <div key={i} className="flex items-center gap-2 p-1.5 bg-surface-raised rounded border border-border text-xs">
-          <span className="font-mono text-text-dim text-[10px] w-12">{e.id}</span>
-          <div className="flex-1 min-w-0">
-            <div className="text-text truncate">{e.source}</div>
-            <div className="text-[10px] text-text-dim">{e.time}</div>
-          </div>
-          <Badge color={e.level === 'Error' ? 'danger' : e.level === 'Warning' ? 'warning' : 'info'}>{e.level}</Badge>
-        </div>
-      ))}</div>;
-    }
-    if (tab === 'network') {
-      return <div className="space-y-2 text-xs">
-        {[['IP Address', liveHost.ipAddress], ['MAC Address', liveHost.macAddress], ['Subnet Mask', '255.255.255.0'], ['Default Gateway', liveHost.ipAddress.replace(/\.d+$/, '.1')], ['DNS Servers', '10.10.1.11, 10.10.1.12'], ['Adapter', 'Intel I210 Gigabit']].map(([k,v]) => (
-          <div key={k} className="flex justify-between p-2 bg-surface-raised rounded border border-border">
-            <span className="text-text-dim">{k}</span>
-            <span className="font-mono text-text">{v}</span>
-          </div>
-        ))}
-      </div>;
-    }
-    if (tab === 'apps') {
-      const apps = [
-        { name: 'Google Chrome', version: '120.0.6099.130', publisher: 'Google LLC', installed: '2026-02-10' },
-        { name: '7-Zip 23.01', version: '23.01.0.0', publisher: 'Igor Pavlov', installed: '2026-01-20' },
-        { name: 'Microsoft 365 Apps', version: '16.0.17126.20132', publisher: 'Microsoft', installed: '2025-11-15' },
-        { name: 'Adobe Acrobat Reader DC', version: '2024.005.20320', publisher: 'Adobe', installed: '2026-03-15' },
-      ];
-      return <div className="space-y-1">{apps.map(a => (
-        <div key={a.name} className="p-2 bg-surface-raised rounded border border-border">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-text">{a.name}</span>
-            <span className="text-[10px] text-text-dim font-mono">{a.version}</span>
-          </div>
-          <div className="text-[10px] text-text-dim mt-0.5">{a.publisher} · installed {a.installed}</div>
-        </div>
-      ))}</div>;
-    }
+    // Dead tab paths removed (processes, logs, network, apps) — these tabs
+    // are not in the tab list. Apps is handled by AppsTab component above.
     if (tab === 'remote') {
       return (
         <div className="space-y-3">

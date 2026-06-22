@@ -557,42 +557,41 @@ app.post('/api/settings/domain-credentials', (req, res) => {
   }
 });
 
-// POST /api/settings/domain-credentials/test — test credentials by running a simple command
+// POST /api/settings/domain-credentials/test — test credentials
 app.post('/api/settings/domain-credentials/test', async (req, res) => {
   const creds = getGlobalCredentials();
   if (!creds) {
     return res.json({ success: false, error: 'No domain credentials configured' });
   }
-  // Test by running a simple whoami with the credentials (no WinRM needed)
-  const script = `
-    $secPass = ConvertTo-SecureString '${creds.password.replace(/'/g, "''")}' -AsPlainText -Force
-    $cred = New-Object System.Management.Automation.PSCredential('${creds.fullUsername.replace(/'/g, "''")}', $secPass)
-    try {
-      $tempScript = [System.IO.Path]::GetTempFileName() + '.ps1'
-      'whoami' | Out-File $tempScript -Encoding UTF8
-      $output = Start-Process powershell.exe -ArgumentList '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + $tempScript -Credential $cred -Wait -PassThru -NoNewWindow -RedirectStandardOutput ($tempScript + '.out') -ErrorAction Stop
-      $result = Get-Content ($tempScript + '.out') -Raw
-      Remove-Item $tempScript, ($tempScript + '.out') -Force -ErrorAction SilentlyContinue
-      if ($result -and $result.Trim()) {
-        Write-Output ('<<<JSON>>>{"success":true,"identity":"' + $result.Trim() + '"}<<<END>>>')
-      } else {
-        Write-Output ('<<<JSON>>>{"success":false,"error":"No output from test command (exit code: ' + $output.ExitCode + ')"}<<<END>>>')
-      }
-    } catch {
-      Write-Output ('<<<JSON>>>{"success":false,"error":"' + ($_.Exception.Message -replace '"',''') + '"}<<<END>>>')
-    }
-  `;
+  // Test: verify credentials by doing an LDAP bind to the domain
+  // Use here-strings (@'...'@) to safely handle passwords with special chars
+  const lines = [
+    '$ErrorActionPreference = "Stop"',
+    'try {',
+    '  $plainPass = @\'',
+    creds.password,
+    '\'@',
+    '  $fullUser = @\'',
+    creds.fullUsername,
+    '\'@',
+    '  # Test by binding to LDAP RootDSE with these credentials',
+    '  $entry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://RootDSE", $fullUser, $plainPass)',
+    '  $nc = $entry.Properties["defaultNamingContext"][0]',
+    '  $entry.Dispose()',
+    '  Write-Output ("OK:" + $fullUser + " verified — domain NC: " + $nc)',
+    '} catch {',
+    '  Write-Output ("FAIL:" + $_.Exception.Message)',
+    '}'
+  ];
+  const script = lines.join('\n');
   const result = await runPowerShell(script, 15000);
-  const markerMatch = /<<<JSON>>>([\s\S]*?)<<<END>>>/.exec(result.stdout || '');
-  if (markerMatch) {
-    try {
-      const parsed = JSON.parse(markerMatch[1].trim());
-      res.json(parsed);
-    } catch {
-      res.json({ success: false, error: 'Could not parse test result' });
-    }
+  const output = (result.stdout || '').trim();
+  if (output.startsWith('OK:')) {
+    res.json({ success: true, identity: creds.fullUsername, message: output.substring(3) });
+  } else if (output.startsWith('FAIL:')) {
+    res.json({ success: false, error: output.substring(5) });
   } else {
-    res.json({ success: false, error: result.stderr || 'Credential test failed' });
+    res.json({ success: false, error: output || result.stderr || 'Credential test failed' });
   }
 });
 

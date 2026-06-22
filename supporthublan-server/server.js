@@ -566,7 +566,6 @@ app.post('/api/hosts/discover-ad', async (req, res) => {
   const hasCreds = username && password;
 
   const script = `
-    Import-Module ActiveDirectory -ErrorAction Stop
     $searchBase = '${(ouPath || 'OU=Computers,DC=corp,DC=local').replace(/'/g, "''")}'
     $scope = '${(searchScope || 'subtree').replace(/'/g, "''")}'
     $filter = '${(filter || 'objectCategory=computer').replace(/'/g, "''")}'
@@ -576,6 +575,7 @@ app.post('/api/hosts/discover-ad', async (req, res) => {
     $cred = New-Object System.Management.Automation.PSCredential('${safeDomain}\\${safeUser}', $secPass)
     ` : ''}
     try {
+      Import-Module ActiveDirectory -ErrorAction Stop
       $params = @{ Filter = $filter; SearchBase = $searchBase; SearchScope = $scope; Properties = 'Name, DNSHostName, IPAddress, OperatingSystem' }
       ${hasCreds ? '$params.Credential = $cred' : ''}
       $computers = Get-ADComputer @params -ErrorAction Stop
@@ -596,7 +596,22 @@ app.post('/api/hosts/discover-ad', async (req, res) => {
       res.json({ success: true, hosts: arr });
     }
   } catch (e) {
-    res.json({ success: false, error: result.stderr || 'AD query failed — ensure ActiveDirectory module is installed and credentials are correct' });
+    // Check if the error is about the ActiveDirectory module not being found
+    const errStr = result.stderr || e.message || '';
+    const isModuleNotFound = /module.*not.*found|ActiveDirectory.*not.*loaded/i.test(errStr);
+    if (isModuleNotFound) {
+      res.json({
+        success: false,
+        error: 'ActiveDirectory PowerShell module is NOT installed on this server. To install it, run one of these commands as Administrator:\n\n' +
+               'Windows 10/11:\n' +
+               '  Add-WindowsCapability -Online -Name "Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0"\n\n' +
+               'Windows Server:\n' +
+               '  Install-WindowsFeature RSAT-AD-PowerShell\n\n' +
+               'After installation, restart this server.'
+      });
+    } else {
+      res.json({ success: false, error: errStr || 'AD query failed — ensure credentials are correct and the server is joined to a domain' });
+    }
   }
 });
 

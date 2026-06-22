@@ -649,33 +649,42 @@ app.post('/api/hosts/detect-domain', async (req, res) => {
   }
 });
 
-// AD Computer Discovery — uses domain credentials to query Get-ADComputer
+// AD Computer Discovery — uses GLOBAL domain credentials from Settings
+// No per-form credentials needed. Domain is auto-detected from global settings.
 app.post('/api/hosts/discover-ad', async (req, res) => {
-  const { ouPath, searchScope, filter, nameAttr, username, password, domain } = req.body;
-  const safeUser = (username || '').replace(/'/g, "''");
-  const safePass = (password || '').replace(/'/g, "''");
-  const safeDomain = (domain || '').replace(/'/g, "''");
-  const hasCreds = username && password;
+  const { ouPath, searchScope, filter, nameAttr } = req.body;
+
+  // Use global credentials from Settings → Default Domain Credentials
+  const creds = getGlobalCredentials();
+  if (!creds) {
+    return res.json({ success: false, error: 'No domain credentials configured. Go to Settings → General → Default Domain Credentials to set them up.' });
+  }
+
+  const safeUser = creds.username.replace(/'/g, "''");
+  const safePass = creds.password.replace(/'/g, "''");
+  const safeDomain = creds.domain.replace(/'/g, "''");
+  const fullUser = creds.fullUsername.replace(/'/g, "''");
 
   // Use .NET DirectorySearcher (LDAP) — does NOT require ADWS or RSAT AD module
   const script = `
     $WarningPreference = 'SilentlyContinue'
     $VerbosePreference = 'SilentlyContinue'
     $ErrorActionPreference = 'Stop'
-    $searchBaseDN = '${(ouPath || 'OU=Computers,DC=corp,DC=local').replace(/'/g, "''")}'
+    $searchBaseDN = '${(ouPath || '').replace(/'/g, "''")}'
     $nameAttr = '${(nameAttr || 'cn').replace(/'/g, "''")}'
-    ${hasCreds ? `
-    $secPass = ConvertTo-SecureString '${safePass}' -AsPlainText -Force
-    $cred = New-Object System.Management.Automation.PSCredential('${safeDomain}\\${safeUser}', $secPass)
-    ` : ''}
     try {
-      # Build LDAP path
-      $ldapPath = 'LDAP://${searchBaseDN}'
-      ${hasCreds ? `
-      $entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath, '${safeDomain}\\${safeUser}', '${safePass}')
-      ` : `
-      $entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath)
-      `}
+      # Build LDAP path — use provided OU or auto-detect from domain
+      if ($searchBaseDN) {
+        $ldapPath = 'LDAP://${searchBaseDN}'
+      } else {
+        # Auto-detect: get defaultNamingContext from RootDSE
+        $rootDSE = New-Object System.DirectoryServices.DirectoryEntry('LDAP://RootDSE')
+        $defaultNC = $rootDSE.Properties['defaultNamingContext'][0]
+        $rootDSE.Dispose()
+        $ldapPath = 'LDAP://OU=Computers,' + $defaultNC
+        # If Computers OU doesn't exist, fall back to the whole domain
+      }
+      $entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath, '${fullUser}', '${safePass}')
       $searcher = New-Object System.DirectoryServices.DirectorySearcher($entry)
       $searcher.Filter = '(&(objectCategory=computer))'
       $searcher.PageSize = 1000

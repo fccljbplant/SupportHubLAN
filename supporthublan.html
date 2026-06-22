@@ -1698,7 +1698,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v4.2.0.11';
+  const APP_VERSION = 'v4.2.0.12';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -4902,15 +4902,12 @@
     const [columnMapping, setColumnMapping] = useState({ hostname: '', ipAddress: '', macAddress: '', site: '', department: '', owner: '', notes: '' });
 
     // AD Import state
-    const [adOUPath, setAdOUPath] = useState('OU=Computers,DC=corp,DC=local');
+    const [adOUPath, setAdOUPath] = useState('');
     const [adSearchScope, setAdSearchScope] = useState('subtree');
     const [adFilter, setAdFilter] = useState('');
     const [adNameAttr, setAdNameAttr] = useState('cn');
     const [adIncludeIP, setAdIncludeIP] = useState(true);
-    const [adUsername, setAdUsername] = useState('');
-    const [adPassword, setAdPassword] = useState('');
-    const [adDomain, setAdDomain] = useState('');
-    const [adDetecting, setAdDetecting] = useState(false);
+    const [adAutoDetecting, setAdAutoDetecting] = useState(false);
 
     useEffect(() => { if (open) { setStep(0); setMethod('single'); setEntries([{ hostname: '', ipAddress: '', macAddress: '' }]); setPasteText(''); setTag(''); setOwner(''); setNotes(''); setScanResults([]); setCsvData(null); } }, [open]);
 
@@ -5293,65 +5290,42 @@
           <div className="space-y-3">
             <div className="p-3 bg-info/10 border border-info/30 rounded text-xs text-info">
               <Icon name="Info" size={12} className="inline mr-1.5" />
-              Import computers from Active Directory. Enter domain credentials with permission to query AD, then specify the OU path to search.
-            </div>
-
-            {/* Domain Credentials Section */}
-            <div className="p-3 bg-surface-raised rounded border border-border space-y-3">
-              <div className="text-meta text-text-dim uppercase">Domain Credentials</div>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                <FormField label="Domain" hint="e.g. CORP or corp.local">
-                  <div className="flex gap-1">
-                    <Input value={adDomain} onChange={e => setAdDomain(e.target.value)} placeholder="CORP" className="font-mono" />
-                    <ActionButton variant="secondary" size="sm" icon="Search" disabled={adDetecting} onClick={async () => {
-                      setAdDetecting(true);
-                      toast.info('Detecting domain from local computer…');
-                      try {
-                        const result = await window.SupportHubLANAPI.apiCall('/api/hosts/detect-domain', {});
-                        if (result && result.success && !result.demo && result.data) {
-                          setAdDomain(result.data.domain || '');
-                          if (result.data.ouPath && !adOUPath) setAdOUPath(result.data.ouPath);
-                          toast.success(`Detected domain: ${result.data.domain}`);
-                        } else if (result && result.demo) {
-                          toast.warning('Backend not connected — enter domain manually');
-                        } else {
-                          toast.warning('Could not detect domain');
-                        }
-                      } catch (e) { toast.warning('Domain detection failed'); }
-                      setAdDetecting(false);
-                    }} title="Auto-detect domain from this computer">{adDetecting ? '...' : 'Detect'}</ActionButton>
-                  </div>
-                </FormField>
-                <FormField label="Username" hint="Domain user with AD read access">
-                  <Input value={adUsername} onChange={e => setAdUsername(e.target.value)} placeholder="admin" className="font-mono" />
-                </FormField>
-                <FormField label="Password">
-                  <Input type="password" value={adPassword} onChange={e => setAdPassword(e.target.value)} placeholder="••••••••" className="font-mono" />
-                </FormField>
-              </div>
-              <div className="text-[10px] text-text-dim">Credentials are used to run Get-ADComputer with -Credential. The user must have permission to read computer objects in the target OU.</div>
+              Import computers from Active Directory. Uses the domain credentials configured in Settings → General → Default Domain Credentials.
             </div>
 
             {/* AD Search Settings */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <FormField label="AD OU Path (LDAP Distinguished Name)" hint="e.g. OU=Computers,DC=corp,DC=local" className="md:col-span-2">
-                <Input value={adOUPath} onChange={e => setAdOUPath(e.target.value)} placeholder="OU=Computers,DC=corp,DC=local" className="font-mono text-[11px]" />
+              <FormField label="AD OU Path (optional)" hint="Leave empty to auto-detect. e.g. OU=Computers,DC=corp,DC=local" className="md:col-span-2">
+                <div className="flex gap-1">
+                  <Input value={adOUPath} onChange={e => setAdOUPath(e.target.value)} placeholder="Auto-detect from domain (leave empty)" className="font-mono text-[11px]" />
+                  <ActionButton variant="secondary" size="sm" icon="Search" disabled={adAutoDetecting} onClick={async () => {
+                    setAdAutoDetecting(true);
+                    toast.info('Detecting domain from settings…');
+                    try {
+                      const result = await fetch((window.SUPPORTHUBLAN_API_URL || 'http://localhost:8080') + '/api/hosts/detect-domain', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+                      const data = await result.json();
+                      if (data.success && data.data) {
+                        setAdOUPath(data.data.ouPath || '');
+                        toast.success(`Detected: ${data.data.domain} — OU: ${data.data.ouPath || 'auto'}`);
+                      } else {
+                        toast.warning('Could not auto-detect. Enter OU path manually.');
+                      }
+                    } catch (e) { toast.warning('Auto-detect failed: ' + e.message); }
+                    setAdAutoDetecting(false);
+                  }}>{adAutoDetecting ? '...' : 'Auto-Detect'}</ActionButton>
+                </div>
               </FormField>
-              <FormField label="Search Scope"><Select value={adSearchScope} onChange={e => setAdSearchScope(e.target.value)}><option value="subtree">Subtree (search all child OUs)</option><option value="onelevel">One Level (direct children only)</option><option value="base">Base (only this OU)</option></Select></FormField>
-              <FormField label="Filter (optional)" hint="LDAP filter, e.g. (objectCategory=computer)"><Input value={adFilter} onChange={e => setAdFilter(e.target.value)} placeholder="(objectCategory=computer)" className="font-mono text-[11px]" /></FormField>
               <FormField label="Name Attribute"><Select value={adNameAttr} onChange={e => setAdNameAttr(e.target.value)}><option value="cn">cn (Common Name)</option><option value="name">name</option><option value="dNSHostName">dNSHostName (FQDN)</option><option value="sAMAccountName">sAMAccountName</option></Select></FormField>
               <FormField label="Include IP Address"><Select value={adIncludeIP ? 'yes' : 'no'} onChange={e => setAdIncludeIP(e.target.value === 'yes')}><option value="yes">Yes — resolve hostname to IP</option><option value="no">No — hostname only</option></Select></FormField>
             </div>
             <div className="flex gap-2">
               <ActionButton variant="primary" size="sm" icon="Search" onClick={async () => {
-                if (!adOUPath) { toast.warning('Enter an AD OU path.'); return; }
-                if (!adUsername || !adPassword) { toast.warning('Enter domain credentials to query AD.'); return; }
-                toast.info(`Searching AD: ${adOUPath}…`);
+                toast.info('Searching AD using global domain credentials…');
                 if (window.SupportHubLANAPI) {
                   try {
                     const result = await fetch((window.SUPPORTHUBLAN_API_URL || 'http://localhost:8080') + '/api/hosts/discover-ad', {
                       method: 'POST', headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ ouPath: adOUPath, searchScope: adSearchScope, filter: adFilter, nameAttr: adNameAttr, username: adUsername, password: adPassword, domain: adDomain })
+                      body: JSON.stringify({ ouPath: adOUPath, searchScope: adSearchScope, filter: adFilter, nameAttr: adNameAttr })
                     });
                     const data = await result.json();
                     if (data.success && data.hosts) {
@@ -5366,7 +5340,6 @@
                 }
                 toast.warning('Backend not connected — cannot search AD');
               }}>Search AD</ActionButton>
-              <ActionButton variant="secondary" size="sm" icon="Network" onClick={() => setAdOUPath('OU=Computers,DC=corp,DC=local')}>Use Default OU</ActionButton>
             </div>
             {pasteText && (
               <div>

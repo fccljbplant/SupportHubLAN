@@ -566,6 +566,9 @@ app.post('/api/hosts/discover-ad', async (req, res) => {
   const hasCreds = username && password;
 
   const script = `
+    $WarningPreference = 'SilentlyContinue'
+    $VerbosePreference = 'SilentlyContinue'
+    $ErrorActionPreference = 'Stop'
     $searchBase = '${(ouPath || 'OU=Computers,DC=corp,DC=local').replace(/'/g, "''")}'
     $scope = '${(searchScope || 'subtree').replace(/'/g, "''")}'
     $filter = '${(filter || 'objectCategory=computer').replace(/'/g, "''")}'
@@ -575,29 +578,34 @@ app.post('/api/hosts/discover-ad', async (req, res) => {
     $cred = New-Object System.Management.Automation.PSCredential('${safeDomain}\\${safeUser}', $secPass)
     ` : ''}
     try {
-      Import-Module ActiveDirectory -ErrorAction Stop
+      Import-Module ActiveDirectory -ErrorAction Stop -WarningAction SilentlyContinue
       $params = @{ Filter = $filter; SearchBase = $searchBase; SearchScope = $scope; Properties = 'Name, DNSHostName, IPAddress, OperatingSystem' }
       ${hasCreds ? '$params.Credential = $cred' : ''}
-      $computers = Get-ADComputer @params -ErrorAction Stop
+      $computers = Get-ADComputer @params -ErrorAction Stop -WarningAction SilentlyContinue
       $results = $computers | Select-Object @{N='name';E={$_.$nameAttr}}, @{N='fqdn';E={$_.DNSHostName}}, @{N='ip';E={$_.IPAddress}}, @{N='os';E={$_.OperatingSystem}} | ConvertTo-Json -Compress
-      $results
+      Write-Output ('<<<JSON>>>' + $results + '<<<END>>>')
     } catch {
-      @{ error = $_.Exception.Message } | ConvertTo-Json -Compress
+      Write-Output ('<<<JSON>>>' + (@{ error = $_.Exception.Message } | ConvertTo-Json -Compress) + '<<<END>>>')
     }
   `;
   const result = await runPowerShell(script, 30000);
-  // Try to parse the result
-  try {
-    const parsed = JSON.parse(result.stdout);
-    if (parsed.error) {
-      res.json({ success: false, error: parsed.error });
-    } else {
-      const arr = Array.isArray(parsed) ? parsed : [parsed];
-      res.json({ success: true, hosts: arr });
+  // Extract JSON from markers (ignores any warnings/noise before/after)
+  const markerMatch = /<<<JSON>>>([\s\S]*?)<<<END>>>/.exec(result.stdout || '');
+  if (markerMatch) {
+    try {
+      const parsed = JSON.parse(markerMatch[1].trim());
+      if (parsed.error) {
+        res.json({ success: false, error: parsed.error });
+      } else {
+        const arr = Array.isArray(parsed) ? parsed : [parsed];
+        res.json({ success: true, hosts: arr });
+      }
+    } catch (e) {
+      res.json({ success: false, error: 'JSON parse error after AD query' });
     }
-  } catch (e) {
-    // Check if the error is about the ActiveDirectory module not being found
-    const errStr = result.stderr || e.message || '';
+  } else {
+    // No markers found — check for module-not-found error
+    const errStr = result.stderr || result.stdout || '';
     const isModuleNotFound = /module.*not.*found|ActiveDirectory.*not.*loaded/i.test(errStr);
     if (isModuleNotFound) {
       res.json({
@@ -610,7 +618,7 @@ app.post('/api/hosts/discover-ad', async (req, res) => {
                'After installation, restart this server.'
       });
     } else {
-      res.json({ success: false, error: errStr || 'AD query failed — ensure credentials are correct and the server is joined to a domain' });
+      res.json({ success: false, error: errStr.substring(0, 500) || 'AD query failed — ensure credentials are correct and the server is joined to a domain' });
     }
   }
 });

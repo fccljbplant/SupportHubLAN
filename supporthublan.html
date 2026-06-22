@@ -4027,6 +4027,20 @@
           >
             <Icon name="FileText" size={14} />
           </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); setEditingHost(h); }}
+            title={`Edit ${h.hostname}`}
+            className="inline-flex items-center justify-center w-7 h-7 rounded border border-border bg-surface-raised hover:border-primary hover:bg-primary/10 hover:text-primary text-text-dim transition-colors"
+          >
+            <Icon name="Edit" size={14} />
+          </button>
+          <button
+            onClick={async (e) => { e.stopPropagation(); if (!confirm(`Delete ${h.hostname}? This cannot be undone.`)) return; if (window.SupportHubLANAPI && h._fromBackend) { try { await fetch(window.SUPPORTHUBLAN_API_URL + '/api/hosts/' + h.id.replace('db-', ''), { method: 'DELETE' }); } catch (err) {} } updateHosts(prev => prev.filter(x => x.id !== h.id)); toast.warning(`Deleted ${h.hostname}`); appendAudit({ action: 'host.delete', actionCategory: 'Inventory', targetType: 'Host', targetIds: [h.id], parameters: { hostname: h.hostname }, result: 'success' }); }}
+            title={`Delete ${h.hostname}`}
+            className="inline-flex items-center justify-center w-7 h-7 rounded border border-border bg-surface-raised hover:border-danger hover:bg-danger/10 hover:text-danger text-text-dim transition-colors"
+          >
+            <Icon name="Trash" size={14} />
+          </button>
         </div>
       ) },
     ];

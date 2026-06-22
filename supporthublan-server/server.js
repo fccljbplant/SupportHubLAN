@@ -563,15 +563,23 @@ app.post('/api/settings/domain-credentials/test', async (req, res) => {
   if (!creds) {
     return res.json({ success: false, error: 'No domain credentials configured' });
   }
-  // Test by running a simple whoami command via PowerShell with the credentials
+  // Test by running a simple whoami with the credentials (no WinRM needed)
   const script = `
     $secPass = ConvertTo-SecureString '${creds.password.replace(/'/g, "''")}' -AsPlainText -Force
     $cred = New-Object System.Management.Automation.PSCredential('${creds.fullUsername.replace(/'/g, "''")}', $secPass)
     try {
-      $result = Invoke-Command -ComputerName localhost -Credential $cred -ScriptBlock { whoami } -ErrorAction Stop
-      Write-Output ('<<<JSON>>>{"success":true,"identity":"' + $result + '"}<<<END>>>')
+      $tempScript = [System.IO.Path]::GetTempFileName() + '.ps1'
+      'whoami' | Out-File $tempScript -Encoding UTF8
+      $output = Start-Process powershell.exe -ArgumentList '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + $tempScript -Credential $cred -Wait -PassThru -NoNewWindow -RedirectStandardOutput ($tempScript + '.out') -ErrorAction Stop
+      $result = Get-Content ($tempScript + '.out') -Raw
+      Remove-Item $tempScript, ($tempScript + '.out') -Force -ErrorAction SilentlyContinue
+      if ($result -and $result.Trim()) {
+        Write-Output ('<<<JSON>>>{"success":true,"identity":"' + $result.Trim() + '"}<<<END>>>')
+      } else {
+        Write-Output ('<<<JSON>>>{"success":false,"error":"No output from test command (exit code: ' + $output.ExitCode + ')"}<<<END>>>')
+      }
     } catch {
-      Write-Output ('<<<JSON>>>{"success":false,"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>')
+      Write-Output ('<<<JSON>>>{"success":false,"error":"' + ($_.Exception.Message -replace '"',''') + '"}<<<END>>>')
     }
   `;
   const result = await runPowerShell(script, 15000);
@@ -609,6 +617,7 @@ app.post('/api/credentials/legacy', (req, res) => {
 // ACTIVE DIRECTORY IMPORT — Discover computers from AD OU
 // ==========================================================================
 // Detect domain from local computer — reads domain name + default OU path
+// Uses .NET (no ADWS/RSAT needed)
 app.post('/api/hosts/detect-domain', async (req, res) => {
   const script = `
     $ErrorActionPreference = 'SilentlyContinue'
@@ -618,12 +627,16 @@ app.post('/api/hosts/detect-domain', async (req, res) => {
     $ouPath = ''
     if ($partOfDomain) {
       try {
-        $computer = Get-ADComputer $env:COMPUTERNAME -Properties DistinguishedName
-        $dn = $computer.DistinguishedName
-        # Extract DC= parts to build a base OU path
-        $dcParts = ($dn -split ',') | Where-Object { $_ -match '^DC=' }
+        # Use .NET to get the computer's DN (no ADWS needed)
+        $entry = [System.DirectoryServices.DirectoryEntry]::new('LDAP://<LDAP://RootDSE>')
+        $defaultNC = $entry.Properties['defaultNamingContext'][0]
+        $ouPath = 'OU=Computers,' + $defaultNC
+        $entry.Dispose()
+      } catch {
+        # Fallback: build from domain name
+        $dcParts = $domain -split '\\.' | ForEach-Object { 'DC=' + $_ }
         $ouPath = 'OU=Computers,' + ($dcParts -join ',')
-      } catch {}
+      }
     }
     @{ domain = $domain; partOfDomain = $partOfDomain; ouPath = $ouPath; computerName = $env:COMPUTERNAME } | ConvertTo-Json -Compress
   `;
@@ -644,27 +657,66 @@ app.post('/api/hosts/discover-ad', async (req, res) => {
   const safeDomain = (domain || '').replace(/'/g, "''");
   const hasCreds = username && password;
 
+  // Use .NET DirectorySearcher (LDAP) — does NOT require ADWS or RSAT AD module
   const script = `
     $WarningPreference = 'SilentlyContinue'
     $VerbosePreference = 'SilentlyContinue'
     $ErrorActionPreference = 'Stop'
-    $searchBase = '${(ouPath || 'OU=Computers,DC=corp,DC=local').replace(/'/g, "''")}'
-    $scope = '${(searchScope || 'subtree').replace(/'/g, "''")}'
-    $filter = '${(filter || 'objectCategory=computer').replace(/'/g, "''")}'
+    $searchBaseDN = '${(ouPath || 'OU=Computers,DC=corp,DC=local').replace(/'/g, "''")}'
     $nameAttr = '${(nameAttr || 'cn').replace(/'/g, "''")}'
     ${hasCreds ? `
     $secPass = ConvertTo-SecureString '${safePass}' -AsPlainText -Force
     $cred = New-Object System.Management.Automation.PSCredential('${safeDomain}\\${safeUser}', $secPass)
     ` : ''}
     try {
-      Import-Module ActiveDirectory -ErrorAction Stop -WarningAction SilentlyContinue
-      $params = @{ Filter = $filter; SearchBase = $searchBase; SearchScope = $scope; Properties = 'Name, DNSHostName, IPAddress, OperatingSystem' }
-      ${hasCreds ? '$params.Credential = $cred' : ''}
-      $computers = Get-ADComputer @params -ErrorAction Stop -WarningAction SilentlyContinue
-      $results = $computers | Select-Object @{N='name';E={$_.$nameAttr}}, @{N='fqdn';E={$_.DNSHostName}}, @{N='ip';E={$_.IPAddress}}, @{N='os';E={$_.OperatingSystem}} | ConvertTo-Json -Compress
-      Write-Output ('<<<JSON>>>' + $results + '<<<END>>>')
+      # Build LDAP path
+      $ldapPath = 'LDAP://${searchBaseDN}'
+      ${hasCreds ? `
+      $entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath, '${safeDomain}\\${safeUser}', '${safePass}')
+      ` : `
+      $entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath)
+      `}
+      $searcher = New-Object System.DirectoryServices.DirectorySearcher($entry)
+      $searcher.Filter = '(&(objectCategory=computer))'
+      $searcher.PageSize = 1000
+      $searcher.PropertiesToLoad.Add('cn') | Out-Null
+      $searcher.PropertiesToLoad.Add('name') | Out-Null
+      $searcher.PropertiesToLoad.Add('dNSHostName') | Out-Null
+      $searcher.PropertiesToLoad.Add('operatingSystem') | Out-Null
+      $searcher.PropertiesToLoad.Add('lastLogonTimestamp') | Out-Null
+
+      $results = @()
+      $searchResult = $searcher.FindAll()
+      foreach ($sr in $searchResult) {
+        $name = ''
+        if ($sr.Properties[$nameAttr]) { $name = $sr.Properties[$nameAttr][0] }
+        elseif ($sr.Properties['cn']) { $name = $sr.Properties['cn'][0] }
+        elseif ($sr.Properties['name']) { $name = $sr.Properties['name'][0] }
+
+        $fqdn = ''
+        if ($sr.Properties['dnshostname']) { $fqdn = $sr.Properties['dnshostname'][0] }
+
+        $os = ''
+        if ($sr.Properties['operatingsystem']) { $os = $sr.Properties['operatingsystem'][0] }
+
+        $results += @{ name = $name; fqdn = $fqdn; ip = ''; os = $os }
+      }
+      $searchResult.Dispose()
+      $searcher.Dispose()
+      $entry.Dispose()
+
+      if ($results.Count -eq 0) {
+        Write-Output '<<<JSON>>>[]<<<END>>>'
+      } else {
+        $json = $results | ConvertTo-Json -Compress
+        if ($json -is [string]) {
+          Write-Output ('<<<JSON>>>' + $json + '<<<END>>>')
+        } else {
+          Write-Output ('<<<JSON>>>[' + $json + ']<<<END>>>')
+        }
+      }
     } catch {
-      Write-Output ('<<<JSON>>>' + (@{ error = $_.Exception.Message } | ConvertTo-Json -Compress) + '<<<END>>>')
+      Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>')
     }
   `;
   const result = await runPowerShell(script, 30000);

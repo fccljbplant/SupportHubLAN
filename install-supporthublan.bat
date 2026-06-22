@@ -167,9 +167,25 @@ if exist "%PSTOOLS_DIR%\psexec.exe" (
     )
 )
 
-REM ---- Step 5: Create .env ----
+REM ---- Step 5: Install RSAT ActiveDirectory module (for AD Import) ----
 echo.
-echo [5/7] Creating configuration file...
+echo [5/8] Checking ActiveDirectory PowerShell module...
+powershell -NoProfile -Command "if (Get-Module -ListAvailable -Name ActiveDirectory) { exit 0 } else { exit 1 }"
+if errorlevel 1 (
+    echo   ActiveDirectory module NOT found. Installing RSAT AD tools...
+    echo   This requires Administrator privileges.
+    echo   Attempting installation...
+    powershell -NoProfile -Command "try { $os = (Get-CimInstance Win32_OperatingSystem); if ($os.ProductType -eq 3) { Install-WindowsFeature RSAT-AD-PowerShell -ErrorAction Stop } else { Add-WindowsCapability -Online -Name 'Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0' -ErrorAction Stop }; Write-Host 'SUCCESS' } catch { Write-Host 'FAILED: ' $_.Exception.Message }"
+) else (
+    echo   ActiveDirectory module already installed.
+)
+echo   Note: If AD import still fails, run this manually as Administrator:
+echo     Windows 10/11: Add-WindowsCapability -Online -Name "Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0"
+echo     Windows Server: Install-WindowsFeature RSAT-AD-PowerShell
+
+REM ---- Step 6: Create .env ----
+echo.
+echo [6/8] Creating configuration file...
 if not exist "%SERVER_DIR%\.env" (
     if exist "%SERVER_DIR%\.env.example" (
         copy "%SERVER_DIR%\.env.example" "%SERVER_DIR%\.env" >nul
@@ -190,7 +206,7 @@ if not exist "%SERVER_DIR%\.env" (
 
 REM ---- Step 6: npm install ----
 echo.
-echo [6/7] Installing npm dependencies...
+echo [7/8] Installing npm dependencies...
 cd /d "%SERVER_DIR%"
 if not exist "%NODE_DIR%\npm.cmd" (
     echo [ERROR] npm not found at %NODE_DIR%\npm.cmd
@@ -216,7 +232,7 @@ if errorlevel 1 (
 
 REM ---- Step 7: Create launcher + shortcuts ----
 echo.
-echo [7/7] Creating launcher and desktop shortcut...
+echo [8/8] Creating launcher and desktop shortcut...
 
 REM Create the launcher .bat
 set "LAUNCHER=%INSTALL_DIR%\start-supporthublan.bat"
@@ -306,8 +322,13 @@ echo First run checklist:
 echo   1. Download PsTools if it failed (check %PSTOOLS_DIR%)
 echo      https://learn.microsoft.com/sysinternals/downloads/pstools
 echo   2. Ensure you have admin rights on target Windows PCs
-echo   3. Open Settings → Active Directory to configure AD import
-echo   4. Open Settings → PsTools to verify PsTools path
+echo   3. Open Settings -^> Active Directory to configure AD import
+echo   4. Open Settings -^> PsTools to verify PsTools path
+echo   5. If AD Import fails with "module not found", install RSAT:
+echo      Windows 10/11: Add-WindowsCapability -Online -Name "Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0"
+echo      Windows Server: Install-WindowsFeature RSAT-AD-PowerShell
+echo   6. For Windows Updates, install PSWindowsUpdate module on target PCs:
+echo      Install-Module PSWindowsUpdate -Force
 echo.
 echo Starting SupportHubLAN now...
 echo.

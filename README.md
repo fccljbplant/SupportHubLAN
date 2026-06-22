@@ -1,6 +1,6 @@
 # SupportHubLAN
 
-> Windows endpoint administration web app for LAN admins for LAN administrators.
+> Windows endpoint administration web app for LAN admins — built as an open-source alternative to BatchPatch Pro.
 > Uses **PsTools** for remote execution. No WMI, no PowerShell Remoting required on targets.
 
 [![Live Demo](https://img.shields.io/badge/demo-GitHub%20Pages-blue)](https://fccljbplant.github.io/SupportHubLAN/supporthublan.html)
@@ -116,7 +116,7 @@ See [Deployment](#deployment--full-setup-on-a-windows-admin-pc) below. ~15 minut
 |---|---|
 | Backend serves the frontend (single port 8080) | One firewall rule, no CORS issues, one URL to remember |
 | All vendor JS bundled locally (`/vendor/`) | LAN deployments often have no internet — CDN would break the app |
-| PsTools is the ONLY remote-execution mechanism (no WinRM, no WMI cmdlets) | No need to enable WinRM/PSRP on targets; PsExec uses SMB/admin$; all service/process/power actions use PsTools binaries |
+| PsTools is the only remote-execution mechanism | No need to enable WinRM/PSRP on targets; PsExec uses SMB/admin$ |
 | Backend is Windows-only | PsTools binaries are Windows-only — this is a hard constraint |
 | `.bps` grid files use AES-256-GCM in the browser | No backend round-trip for save/open; password never leaves the browser |
 | WebSocket at `/ws` for queue progress | Long-running jobs need live updates without polling |
@@ -158,7 +158,7 @@ A browser is sandboxed — JavaScript in an HTML page **cannot** directly spawn 
 4. **Run the backend as a low-privilege service account** that is local admin only on target hosts (not Domain Admin)
 5. **Audit log** — every API call is logged to SQLite with timestamp, action, parameters, and result
 
-This is the same architecture used by every web-based RMM tool (Action1, NinjaRMM, ManageEngine). The browser is just a UI; the security boundary is the backend's HTTP listener.
+This is the same architecture used by every web-based RMM tool (Action1, NinjaRMM, ManageEngine, BatchPatch's web UI). The browser is just a UI; the security boundary is the backend's HTTP listener.
 
 ---
 
@@ -410,7 +410,7 @@ Open the app → gear icon (top right) → **Settings**. Settings has 15 tabs:
 | **LAPS password rotation** | ✅ Real | `POST /api/laps/rotate` → `Reset-LapsPassword` (modern) or `Set-ADComputer` (legacy) |
 | **Windows Updates scan** | ✅ Real | `POST /api/updates/scan` → `PSWindowsUpdate` |
 | **Windows Updates install** | ✅ Real | `POST /api/updates/install` → `Install-WindowsUpdate` |
-| **Services list / start / stop / restart** | ✅ Real | `POST /api/services/:host/*` → `psservice.exe` (PsTools only, no WinRM) |
+| **Services list** | ✅ Real | `POST /api/services/:host/list` → `Get-CimInstance Win32_Service` |
 | **Processes list** | ✅ Real | `POST /api/processes/:host/list` → `Get-CimInstance Win32_Process` |
 | **Power actions (reboot/shutdown)** | ✅ Real | `POST /api/power/action` → `Restart-Computer` / `Stop-Computer` |
 | **Wake-on-LAN** | ✅ Real | `POST /api/power/wol` → UDP magic packet broadcast |
@@ -437,6 +437,44 @@ Before you start, make sure:
 - [ ] (Optional) A VNC viewer installed if you want one-click VNC (RealVNC/TightVNC/TigerVNC/UltraVNC)
 - [ ] (Optional) LAPS deployed in your AD if you want LAPS features
 - [ ] Port 8080 is open in Windows Firewall on the admin PC (only needed if other admins will browse to it)
+
+---
+
+## Installing Required PowerShell Modules
+
+### ActiveDirectory module (for AD Import feature)
+
+The AD Import feature requires the RSAT ActiveDirectory PowerShell module on the **server machine** (the PC running SupportHubLAN). Install it as Administrator:
+
+**Windows 10/11:**
+```powershell
+Add-WindowsCapability -Online -Name "Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0"
+```
+
+**Windows Server 2019/2022:**
+```powershell
+Install-WindowsFeature RSAT-AD-PowerShell
+```
+
+Verify installation:
+```powershell
+Get-Module -ListAvailable ActiveDirectory
+```
+
+After installation, restart the SupportHubLAN server.
+
+### PSWindowsUpdate module (for Windows Updates feature)
+
+The Windows Updates feature requires the PSWindowsUpdate module on each **target PC** (the PCs you want to scan/patch). Install it as Administrator on each target:
+
+```powershell
+Install-Module PSWindowsUpdate -Force -AllowClobber
+```
+
+For offline targets, download the module from PowerShell Gallery and copy it to:
+```
+C:\Program Files\WindowsPowerShell\Modules\PSWindowsUpdate\
+```
 
 ---
 

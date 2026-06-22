@@ -555,16 +555,56 @@ app.post('/api/credentials/legacy', (req, res) => {
 // ==========================================================================
 // ACTIVE DIRECTORY IMPORT — Discover computers from AD OU
 // ==========================================================================
-app.post('/api/hosts/discover-ad', async (req, res) => {
-  const { ouPath, searchScope, filter, nameAttr } = req.body;
+// Detect domain from local computer — reads domain name + default OU path
+app.post('/api/hosts/detect-domain', async (req, res) => {
   const script = `
-    Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+    $ErrorActionPreference = 'SilentlyContinue'
+    $cs = Get-CimInstance Win32_ComputerSystem
+    $domain = $cs.Domain
+    $partOfDomain = $cs.PartOfDomain
+    $ouPath = ''
+    if ($partOfDomain) {
+      try {
+        $computer = Get-ADComputer $env:COMPUTERNAME -Properties DistinguishedName
+        $dn = $computer.DistinguishedName
+        # Extract DC= parts to build a base OU path
+        $dcParts = ($dn -split ',') | Where-Object { $_ -match '^DC=' }
+        $ouPath = 'OU=Computers,' + ($dcParts -join ',')
+      } catch {}
+    }
+    @{ domain = $domain; partOfDomain = $partOfDomain; ouPath = $ouPath; computerName = $env:COMPUTERNAME } | ConvertTo-Json -Compress
+  `;
+  const result = await runPowerShell(script, 15000);
+  try {
+    const data = JSON.parse(result.stdout);
+    res.json({ success: true, data });
+  } catch (e) {
+    res.json({ success: false, error: 'Could not detect domain: ' + (result.stderr || e.message) });
+  }
+});
+
+// AD Computer Discovery — uses domain credentials to query Get-ADComputer
+app.post('/api/hosts/discover-ad', async (req, res) => {
+  const { ouPath, searchScope, filter, nameAttr, username, password, domain } = req.body;
+  const safeUser = (username || '').replace(/'/g, "''");
+  const safePass = (password || '').replace(/'/g, "''");
+  const safeDomain = (domain || '').replace(/'/g, "''");
+  const hasCreds = username && password;
+
+  const script = `
+    Import-Module ActiveDirectory -ErrorAction Stop
     $searchBase = '${(ouPath || 'OU=Computers,DC=corp,DC=local').replace(/'/g, "''")}'
     $scope = '${(searchScope || 'subtree').replace(/'/g, "''")}'
     $filter = '${(filter || 'objectCategory=computer').replace(/'/g, "''")}'
     $nameAttr = '${(nameAttr || 'cn').replace(/'/g, "''")}'
+    ${hasCreds ? `
+    $secPass = ConvertTo-SecureString '${safePass}' -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential('${safeDomain}\\${safeUser}', $secPass)
+    ` : ''}
     try {
-      $computers = Get-ADComputer -Filter $filter -SearchBase $searchBase -SearchScope $scope -Properties Name, DNSHostName, IPAddress, OperatingSystem
+      $params = @{ Filter = $filter; SearchBase = $searchBase; SearchScope = $scope; Properties = 'Name, DNSHostName, IPAddress, OperatingSystem' }
+      ${hasCreds ? '$params.Credential = $cred' : ''}
+      $computers = Get-ADComputer @params -ErrorAction Stop
       $results = $computers | Select-Object @{N='name';E={$_.$nameAttr}}, @{N='fqdn';E={$_.DNSHostName}}, @{N='ip';E={$_.IPAddress}}, @{N='os';E={$_.OperatingSystem}} | ConvertTo-Json -Compress
       $results
     } catch {
@@ -572,7 +612,18 @@ app.post('/api/hosts/discover-ad', async (req, res) => {
     }
   `;
   const result = await runPowerShell(script, 30000);
-  res.json({ success: result.success, hosts: result.stdout, error: result.stderr });
+  // Try to parse the result
+  try {
+    const parsed = JSON.parse(result.stdout);
+    if (parsed.error) {
+      res.json({ success: false, error: parsed.error });
+    } else {
+      const arr = Array.isArray(parsed) ? parsed : [parsed];
+      res.json({ success: true, hosts: arr });
+    }
+  } catch (e) {
+    res.json({ success: false, error: result.stderr || 'AD query failed — ensure ActiveDirectory module is installed and credentials are correct' });
+  }
 });
 
 // ==========================================================================

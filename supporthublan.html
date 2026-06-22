@@ -1694,7 +1694,7 @@
 
   // Single source of truth for the app version — update this when bumping versions.
   // Used by the sidebar footer and the status bar so they always match.
-  const APP_VERSION = 'v4.2.0.6';
+  const APP_VERSION = 'v4.2.0.7';
   const APP_BUILD_DATE = '2026.06.21';
 
   const NAV_ITEMS = [
@@ -3959,6 +3959,7 @@
     const [hiddenCols, setHiddenCols] = useState(new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials']));
     const [confirmReboot, setConfirmReboot] = useState(false);
     const [contextMenu, setContextMenu] = useState(null);
+    const [editingHost, setEditingHost] = useState(null);
     const [remoteDesktopProtocol, setRemoteDesktopProtocol] = useState(() => { try { return localStorage.getItem('supporthublan:rdp-protocol') || 'VNC'; } catch(e) { return 'VNC'; } });
 
     // Launch VNC or RDP to a remote host — awaits real backend response
@@ -4189,6 +4190,23 @@
         const a = document.createElement('a'); a.href = url; a.download = 'hosts-export.csv'; a.click();
         URL.revokeObjectURL(url);
         toast.success(`Exported ${selectedHosts.length} host(s) to CSV`);
+      } },
+      { label: 'Delete', icon: 'Trash', danger: true, onClick: async () => {
+        if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; }
+        if (!confirm(`Delete ${selectedIds.length} host(s)? This cannot be undone.`)) return;
+        // Delete from backend if connected
+        if (window.SupportHubLANAPI) {
+          for (const id of selectedIds) {
+            const h = hosts.find(x => x.id === id);
+            if (h && h._fromBackend) {
+              try { await fetch(window.SUPPORTHUBLAN_API_URL + '/api/hosts/' + h.id.replace('db-', ''), { method: 'DELETE' }); } catch (e) {}
+            }
+          }
+        }
+        updateHosts(prev => prev.filter(h => !selectedIds.includes(h.id)));
+        appendAudit({ action: 'hosts.delete-bulk', actionCategory: 'Inventory', targetType: 'Host', targetIds: [...selectedIds], parameters: { count: selectedIds.length }, result: 'success' });
+        toast.warning(`Deleted ${selectedIds.length} host(s)`);
+        setSelectedIds([]);
       } },
     ];
 
@@ -4465,7 +4483,10 @@
                       { label: h.hostname },
                       { separator: true },
                       { icon: 'Info', text: 'View Details', onClick: () => openHost(h) },
+                      { icon: 'Edit', text: 'Edit Host', onClick: () => { setEditingHost(h); } },
                       { icon: 'RefreshCw', text: 'Refresh Host', onClick: () => { updateHosts(prev => prev.map(x => x.id === h.id ? { ...x, lastSeen: new Date().toISOString() } : x)); toast.success(`${h.hostname} refreshed.`); } },
+                      { separator: true },
+                      { icon: 'Trash', text: 'Delete Host', danger: true, onClick: async () => { if (!confirm(`Delete ${h.hostname}? This cannot be undone.`)) return; if (window.SupportHubLANAPI && h._fromBackend) { try { const dbId = h.id.replace('db-', ''); await fetch(window.SUPPORTHUBLAN_API_URL + '/api/hosts/' + dbId, { method: 'DELETE' }); } catch (e) {} } updateHosts(prev => prev.filter(x => x.id !== h.id)); toast.warning(`Deleted ${h.hostname}`); appendAudit({ action: 'host.delete', actionCategory: 'Inventory', targetType: 'Host', targetIds: [h.id], parameters: { hostname: h.hostname }, result: 'success' }); } },
                       { separator: true },
                       { icon: 'Search', text: 'Check for Updates', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `Scan — ${h.hostname}`, targets: [h.id], step: 'Scanning (1/3)', progress: 5, startedAt: new Date().toISOString(), status: 'running' }); toast.info(`Scanning ${h.hostname}…`); } },
                       { icon: 'ShieldCheck', text: 'Install Updates', onClick: () => { addJob({ id: 'job-' + Date.now(), name: `Install — ${h.hostname}`, targets: [h.id], step: 'Installing (1/4)', progress: 5, startedAt: new Date().toISOString(), status: 'running' }); setTimeout(() => { updateHosts(prev => prev.map(x => x.id === h.id ? { ...x, patchState: 'compliant', pendingReboot: false } : x)); toast.success(`${h.hostname} now compliant`); }, 6000); toast.info(`Installing on ${h.hostname}…`); } },
@@ -4548,6 +4569,38 @@
           confirmLabel="Reboot Now"
           targetCount={selectedIds.length}
         />
+
+        {/* Edit Host Modal */}
+        {editingHost && (
+          <Modal open={true} onClose={() => setEditingHost(null)} title={`Edit Host — ${editingHost.hostname}`} subtitle="Modify host properties" size="md">
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <FormField label="Hostname"><Input defaultValue={editingHost.hostname} onChange={e => setEditingHost({...editingHost, hostname: e.target.value})} className="font-mono" /></FormField>
+                <FormField label="IP Address"><Input defaultValue={editingHost.ipAddress} onChange={e => setEditingHost({...editingHost, ipAddress: e.target.value})} className="font-mono" /></FormField>
+                <FormField label="FQDN"><Input defaultValue={editingHost.fqdn} onChange={e => setEditingHost({...editingHost, fqdn: e.target.value})} className="font-mono" /></FormField>
+                <FormField label="MAC Address"><Input defaultValue={editingHost.macAddress} onChange={e => setEditingHost({...editingHost, macAddress: e.target.value})} className="font-mono" /></FormField>
+                <FormField label="OS"><Input defaultValue={editingHost.osName} onChange={e => setEditingHost({...editingHost, osName: e.target.value})} /></FormField>
+                <FormField label="Site"><Select value={editingHost.site || ''} onChange={e => setEditingHost({...editingHost, site: e.target.value})}>{SITES.map(s => <option key={s}>{s}</option>)}</Select></FormField>
+                <FormField label="Department"><Select value={editingHost.department || ''} onChange={e => setEditingHost({...editingHost, department: e.target.value})}>{DEPARTMENTS.map(d => <option key={d}>{d}</option>)}</Select></FormField>
+                <FormField label="Owner"><Input defaultValue={editingHost.owner || ''} onChange={e => setEditingHost({...editingHost, owner: e.target.value})} /></FormField>
+              </div>
+              <FormField label="Notes"><Textarea rows={2} defaultValue={editingHost.notes || ''} onChange={e => setEditingHost({...editingHost, notes: e.target.value})} /></FormField>
+              <div className="flex justify-end gap-2 pt-2">
+                <ActionButton variant="secondary" onClick={() => setEditingHost(null)}>Cancel</ActionButton>
+                <ActionButton variant="primary" icon="Check" onClick={async () => {
+                  const updates = { hostname: editingHost.hostname, ipAddress: editingHost.ipAddress, fqdn: editingHost.fqdn, macAddress: editingHost.macAddress, osName: editingHost.osName, site: editingHost.site, department: editingHost.department, owner: editingHost.owner, notes: editingHost.notes };
+                  updateHosts(prev => prev.map(h => h.id === editingHost.id ? { ...h, ...updates } : h));
+                  if (window.SupportHubLANAPI && editingHost._fromBackend) {
+                    try { await fetch(window.SUPPORTHUBLAN_API_URL + '/api/hosts/' + editingHost.id.replace('db-', ''), { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(updates) }); } catch (e) {}
+                  }
+                  appendAudit({ action: 'host.edit', actionCategory: 'Inventory', targetType: 'Host', targetIds: [editingHost.id], parameters: updates, result: 'success' });
+                  toast.success(`Updated ${editingHost.hostname}`);
+                  setEditingHost(null);
+                }}>Save Changes</ActionButton>
+              </div>
+            </div>
+          </Modal>
+        )}
 
         {/* Right-click Context Menu */}
         {contextMenu && (
@@ -5006,6 +5059,10 @@
     const [adFilter, setAdFilter] = useState('');
     const [adNameAttr, setAdNameAttr] = useState('cn');
     const [adIncludeIP, setAdIncludeIP] = useState(true);
+    const [adUsername, setAdUsername] = useState('');
+    const [adPassword, setAdPassword] = useState('');
+    const [adDomain, setAdDomain] = useState('');
+    const [adDetecting, setAdDetecting] = useState(false);
 
     useEffect(() => { if (open) { setStep(0); setMethod('single'); setEntries([{ hostname: '', ipAddress: '', macAddress: '' }]); setPasteText(''); setTag(''); setOwner(''); setNotes(''); setScanResults([]); setCsvData(null); } }, [open]);
 
@@ -5388,8 +5445,46 @@
           <div className="space-y-3">
             <div className="p-3 bg-info/10 border border-info/30 rounded text-xs text-info">
               <Icon name="Info" size={12} className="inline mr-1.5" />
-              Import computers from Active Directory. Enter the AD OU path or LDAP filter to search for computer objects.
+              Import computers from Active Directory. Enter domain credentials with permission to query AD, then specify the OU path to search.
             </div>
+
+            {/* Domain Credentials Section */}
+            <div className="p-3 bg-surface-raised rounded border border-border space-y-3">
+              <div className="text-meta text-text-dim uppercase">Domain Credentials</div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <FormField label="Domain" hint="e.g. CORP or corp.local">
+                  <div className="flex gap-1">
+                    <Input value={adDomain} onChange={e => setAdDomain(e.target.value)} placeholder="CORP" className="font-mono" />
+                    <ActionButton variant="secondary" size="sm" icon="Search" disabled={adDetecting} onClick={async () => {
+                      setAdDetecting(true);
+                      toast.info('Detecting domain from local computer…');
+                      try {
+                        const result = await window.SupportHubLANAPI.apiCall('/api/hosts/detect-domain', {});
+                        if (result && result.success && !result.demo && result.data) {
+                          setAdDomain(result.data.domain || '');
+                          if (result.data.ouPath && !adOUPath) setAdOUPath(result.data.ouPath);
+                          toast.success(`Detected domain: ${result.data.domain}`);
+                        } else if (result && result.demo) {
+                          toast.warning('Backend not connected — enter domain manually');
+                        } else {
+                          toast.warning('Could not detect domain');
+                        }
+                      } catch (e) { toast.warning('Domain detection failed'); }
+                      setAdDetecting(false);
+                    }} title="Auto-detect domain from this computer">{adDetecting ? '...' : 'Detect'}</ActionButton>
+                  </div>
+                </FormField>
+                <FormField label="Username" hint="Domain user with AD read access">
+                  <Input value={adUsername} onChange={e => setAdUsername(e.target.value)} placeholder="admin" className="font-mono" />
+                </FormField>
+                <FormField label="Password">
+                  <Input type="password" value={adPassword} onChange={e => setAdPassword(e.target.value)} placeholder="••••••••" className="font-mono" />
+                </FormField>
+              </div>
+              <div className="text-[10px] text-text-dim">Credentials are used to run Get-ADComputer with -Credential. The user must have permission to read computer objects in the target OU.</div>
+            </div>
+
+            {/* AD Search Settings */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               <FormField label="AD OU Path (LDAP Distinguished Name)" hint="e.g. OU=Computers,DC=corp,DC=local" className="md:col-span-2">
                 <Input value={adOUPath} onChange={e => setAdOUPath(e.target.value)} placeholder="OU=Computers,DC=corp,DC=local" className="font-mono text-[11px]" />
@@ -5402,26 +5497,26 @@
             <div className="flex gap-2">
               <ActionButton variant="primary" size="sm" icon="Search" onClick={async () => {
                 if (!adOUPath) { toast.warning('Enter an AD OU path.'); return; }
+                if (!adUsername || !adPassword) { toast.warning('Enter domain credentials to query AD.'); return; }
                 toast.info(`Searching AD: ${adOUPath}…`);
-                // Try real API
                 if (window.SupportHubLANAPI) {
                   try {
-                    const result = await fetch((window.SUPPORTHUBLAN_API_URL || 'http://localhost:3137') + '/api/hosts/discover-ad', {
+                    const result = await fetch((window.SUPPORTHUBLAN_API_URL || 'http://localhost:8080') + '/api/hosts/discover-ad', {
                       method: 'POST', headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ ouPath: adOUPath, searchScope: adSearchScope, filter: adFilter, nameAttr: adNameAttr })
+                      body: JSON.stringify({ ouPath: adOUPath, searchScope: adSearchScope, filter: adFilter, nameAttr: adNameAttr, username: adUsername, password: adPassword, domain: adDomain })
                     });
                     const data = await result.json();
                     if (data.success && data.hosts) {
                       setPasteText(data.hosts.map(h => `${h.name},${h.ip || ''}`).join('\n'));
                       toast.success(`Found ${data.hosts.length} computers in AD.`);
                       return;
+                    } else if (data.error) {
+                      toast.error(`AD search failed: ${data.error}`, { duration: 8000 });
+                      return;
                     }
-                  } catch (e) {}
+                  } catch (e) { toast.error(`AD search failed: ${e.message}`); return; }
                 }
-                // Demo: simulate AD results
-                const demoHosts = ['DC01-HQ','DC02-HQ','FS01-HQ','SQL01-HQ','IIS01-HQ','WS001-ENG','WS002-ENG','WS003-FIN','WS004-SAL','WS005-HR','NYC-DC01','NYC-FS01','LON-DC01','LON-SQL01','TKY-WS001'];
-                setPasteText(demoHosts.join('\n'));
-                toast.success(`Found ${demoHosts.length} computers in AD (demo).`);
+                toast.warning('Backend not connected — cannot search AD');
               }}>Search AD</ActionButton>
               <ActionButton variant="secondary" size="sm" icon="Network" onClick={() => setAdOUPath('OU=Computers,DC=corp,DC=local')}>Use Default OU</ActionButton>
             </div>

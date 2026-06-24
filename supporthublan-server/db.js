@@ -233,6 +233,10 @@ const hosts = {
   list: (inventoryId) => loadStore().hosts.filter(h => h.inventory_id === inventoryId).sort((a, b) => a.hostname.localeCompare(b.hostname)),
   get: (id) => loadStore().hosts.find(h => h.id === id),
   getByHostname: (inventoryId, hostname) => loadStore().hosts.find(h => h.inventory_id === inventoryId && h.hostname === hostname),
+  getIdByHostname: (hostname) => {
+    const h = loadStore().hosts.find(h => h.hostname === hostname);
+    return h ? h.id : null;
+  },
   upsert: (inventoryId, host) => {
     const s = loadStore();
     const existing = s.hosts.find(h => h.inventory_id === inventoryId && h.hostname === host.hostname);
@@ -266,7 +270,7 @@ const hosts = {
     const s = loadStore();
     const h = s.hosts.find(x => x.id === id);
     if (!h) return { success: false, error: 'not found' };
-    const allowed = ['hostname', 'ip_address', 'mac_address', 'fqdn', 'os', 'site', 'owner', 'department', 'tags', 'notes', 'online_status', 'patch_state', 'pending_reboot', 'last_seen', 'last_audit', 'custom_fields'];
+    const allowed = ['hostname', 'ip_address', 'mac_address', 'fqdn', 'os', 'os_version', 'site', 'owner', 'department', 'tags', 'notes', 'online_status', 'patch_state', 'pending_reboot', 'last_seen', 'last_audit', 'custom_fields', 'build', 'cpu', 'ram', 'manufacturer', 'model', 'serial', 'logged_on_user'];
     for (const k of allowed) { if (fields[k] !== undefined) h[k] = fields[k]; }
     h.updated_at = new Date().toISOString();
     saveStore();

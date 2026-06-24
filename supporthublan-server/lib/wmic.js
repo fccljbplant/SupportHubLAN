@@ -43,6 +43,7 @@
 
 const { spawn } = require('child_process');
 const { logCommand, analyzeError } = require('./logger');
+const { toFqdn, stripPsExecBanner } = require('./utils');
 
 // ==========================================================================
 // runLocal — execute wmic.exe locally on the server machine
@@ -90,12 +91,19 @@ function runLocal(wmiClass, fields, timeoutMs = 15000) {
 // This uses DCOM/RPC (port 135 + dynamic ports) to query WMI remotely.
 // Does NOT require PsTools, WinRM, or SMB.
 // Requires: WMI service running on target, Windows Firewall WMI exception.
+//
+// credential = { username, password, domain } — forwarded as /user /password
 // ==========================================================================
-function runRemote(hostname, wmiClass, fields, timeoutMs = 20000) {
+function runRemote(hostname, wmiClass, fields, timeoutMs = 20000, credential) {
   return new Promise((resolve) => {
     const startTime = Date.now();
     const safeHost = String(hostname).replace(/[^a-zA-Z0-9._\-:]/g, '');
-    const args = ['/node:' + safeHost, wmiClass, 'get', fields, '/format:list'];
+    const args = ['/node:' + safeHost];
+    if (credential && credential.username && credential.password) {
+      const fullUser = credential.domain ? `${credential.domain}\\${credential.username}` : credential.username;
+      args.push('/user:' + fullUser, '/password:' + credential.password);
+    }
+    args.push(...wmiClass.split(' '), 'get', fields, '/format:list');
     const proc = spawn('wmic.exe', args, { windowsHide: true, timeout: timeoutMs });
 
     let stdout = '', stderr = '';
@@ -135,13 +143,14 @@ function runRemote(hostname, wmiClass, fields, timeoutMs = 20000) {
 //
 // The resulting command: psexec -accepteula \\HOST -s wmic <class> get <fields> /format:list
 // ==========================================================================
-function runRemoteViaPsExec(hostname, wmiClass, fields, pstoolsPath, timeoutMs = 25000) {
+function runRemoteViaPsExec(hostname, wmiClass, fields, pstoolsPath, timeoutMs = 25000, credential) {
   return new Promise((resolve) => {
     const startTime = Date.now();
-    const safeHost = String(hostname).replace(/[^a-zA-Z0-9._\-:]/g, '');
+    const safeHost = toFqdn(hostname, credential).replace(/[^a-zA-Z0-9._\-:]/g, '');
     const path = require('path');
     const exe = path.join(pstoolsPath, 'psexec.exe');
-    const args = ['-accepteula', '\\\\' + safeHost, '-s', 'wmic.exe', wmiClass, 'get', fields, '/format:list'];
+    const credArgs = credential ? ['-u', credential.domain ? credential.domain + '\\' + credential.username : credential.username, '-p', credential.password] : [];
+    const args = ['-accepteula', '\\\\' + safeHost, ...credArgs, '-s', 'wmic.exe', ...wmiClass.split(' '), 'get', fields, '/format:list'];
     const proc = spawn(exe, args, { windowsHide: true, timeout: timeoutMs });
 
     let stdout = '', stderr = '';
@@ -206,45 +215,6 @@ function parseListOutput(raw) {
   }
   if (Object.keys(current).length > 0) records.push(current);
   return records;
-}
-
-// ==========================================================================
-// stripPsExecBanner — remove PsExec's copyright/connection banner from stdout
-// ==========================================================================
-// PsExec outputs a banner like:
-//   PsExec v2.43 - Execute processes remotely
-//   Copyright (C) 2001-2023 Mark Russinovich
-//   Sysinternals - www.sysinternals.com
-//
-//   Connecting to HOST...
-//   Starting PSEXESVC service on HOST...
-//
-// We strip everything before the first line that looks like wmic output
-// (a line containing '=').
-// ==========================================================================
-function stripPsExecBanner(raw) {
-  const out = (raw || '').replace(/\r/g, '');
-  const lines = out.split('\n');
-  let foundData = false;
-  const result = [];
-
-  for (const line of lines) {
-    // Skip banner lines
-    if (/^PsExec v/i.test(line)) continue;
-    if (/^Copyright/i.test(line)) continue;
-    if (/^Sysinternals/i.test(line)) continue;
-    if (/^Connecting to/i.test(line)) continue;
-    if (/^Starting PSEXESVC/i.test(line)) continue;
-    if (/^Process exited/i.test(line)) continue;
-    if (/^\s*$/.test(line) && !foundData) continue;
-
-    // Once we find a line with '=' or any real data, keep everything
-    if (line.includes('=') || foundData) {
-      foundData = true;
-      result.push(line);
-    }
-  }
-  return result.join('\n');
 }
 
 module.exports = { runLocal, runRemote, runRemoteViaPsExec, parseListOutput };

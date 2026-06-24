@@ -127,13 +127,13 @@ This document tracks all features implemented in SupportHubLAN, organized by mod
 
 | Feature | Status | Notes |
 |---|---|---|
-| Interactive PsTools command input | ✅ DONE | Type psexec, psinfo, pslist, etc. |
-| Live stdout/stderr streaming | ✅ DONE | Via WebSocket |
-| Command history | ✅ DONE | Up/Down arrows |
-| Tab filtering (All/Current/Errors/Terminal) | ✅ DONE | |
-| Resizable panel | ✅ DONE | Drag handle, 60px–40% viewport |
-| Collapsible | ✅ DONE | Persists to localStorage |
-| Per-row "open terminal" button | ✅ DONE | Auto-runs psexec \\host cmd |
+| Interactive PsTools command input | ❌ REMOVED | Removed in v2.0.0 cleanup — use direct API endpoints instead |
+| Live stdout/stderr streaming | ❌ REMOVED | Via WebSocket — removed |
+| Command history | ❌ REMOVED | — |
+| Tab filtering (All/Current/Errors/Terminal) | ❌ REMOVED | — |
+| Resizable panel | ❌ REMOVED | — |
+| Collapsible | ❌ REMOVED | — |
+| Per-row "open terminal" button | ❌ REMOVED | — |
 
 ## Module 12: Audit Log
 
@@ -184,7 +184,6 @@ This document tracks all features implemented in SupportHubLAN, organized by mod
 | Light theme | ✅ DONE | Full color support, no black-on-black |
 | System theme | ✅ DONE | Follows OS preference (default) |
 | Theme toggle | ✅ DONE | Header dropdown + Settings |
-| Theme-aware terminal | ✅ DONE | Uses CSS variables, not hardcoded colors |
 
 ## Module 16: Backend & Storage
 

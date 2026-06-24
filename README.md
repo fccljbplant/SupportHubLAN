@@ -45,10 +45,9 @@ SupportHubLAN is a browser-based console for managing a fleet of Windows PCs on 
 - **Job Queue** — multi-step task sequences with 50+ step types, live WebSocket progress streaming
 - **Scheduler** — schedule recurring jobs (daily/weekly/monthly)
 - **Reports & Logs** — patch compliance, deployment history, audit trail
-- **Audit log** — persistent in SQLite, every action logged with timestamp/user/result
+- **Audit log** — persistent in encrypted storage, every action logged with timestamp/user/result
 - **LAPS** — retrieve and rotate Local Administrator Password Solution passwords (`ms-Mcs-AdmPwd` attribute)
 - **Encrypted grid files** — export/import host grid as `.bps` files (AES-256-GCM via Web Crypto, password-protected)
-- **VSCode-style terminal panel** — collapsible, resizable bottom panel with 4 tabs (All/Current/Errors/Terminal); type PsTools commands directly; live streams job progress + audit events
 - **Multi-user features** — user accounts, roles (Admin/Operator/Read-Only/Remote Only), MFA, API keys
 - **Notifications** — event-based alerts (job failed, host offline, etc.) with email/SMTP integration
 - **Themes** — Dark/Light/System with working toggle (applyTheme modifies DOM, persists to localStorage, follows OS preference in System mode)
@@ -410,10 +409,10 @@ Open the app → gear icon (top right) → **Settings**. Settings has 15 tabs:
 | **LAPS password rotation** | ✅ Real | `POST /api/laps/rotate` → `Reset-LapsPassword` (modern) or `Set-ADComputer` (legacy) |
 | **Windows Updates scan** | ✅ Real | `POST /api/updates/scan` → `PSWindowsUpdate` |
 | **Windows Updates install** | ✅ Real | `POST /api/updates/install` → `Install-WindowsUpdate` |
-| **Services list** | ✅ Real | `POST /api/services/:host/list` → `Get-CimInstance Win32_Service` |
-| **Processes list** | ✅ Real | `POST /api/processes/:host/list` → `Get-CimInstance Win32_Process` |
 | **Power actions (reboot/shutdown)** | ✅ Real | `POST /api/power/action` → `Restart-Computer` / `Stop-Computer` |
 | **Wake-on-LAN** | ✅ Real | `POST /api/power/wol` → UDP magic packet broadcast |
+| **Services list** | ✅ Real | `POST /api/services/:host/list` → `Get-CimInstance Win32_Service` |
+| **Processes list** | ✅ Real | `POST /api/processes/:host/list` → `Get-CimInstance Win32_Process` |
 | **Job Queue execution** | ✅ Real | `POST /api/queues/execute` → async with WebSocket progress |
 | **Software deployment** | ✅ Real | `POST /api/deploy/package` → `Copy-Item` + `Invoke-Command` |
 | **Script execution** | ✅ Real | `POST /api/scripts/execute` → `Invoke-Command` |
@@ -606,14 +605,10 @@ The HTML has CDN fallbacks that will load from unpkg.com if the local vendor fil
 ### Done in v1.3
 - ✅ SQLite backend with AES-256-GCM encrypted credentials (`db.js`)
 - ✅ Multi-inventory management (each inventory = a tab above the grid)
-- ✅ VSCode-style bottom terminal panel with live logs + PsTools command input
 - ✅ Settings restructured (General → Appearance → PsTools → Remote Desktop → AD → Credentials → LAPS → Inventories → Notifications → Email → Users → Grid Protection → API Keys → Retention → Production Mode)
 - ✅ Working theme toggle (Dark/Light/System — applyTheme modifies DOM, persists, follows OS)
-- ✅ Backend WebSocket supports `terminal-run` — spawn PsExec/ping/powershell, stream stdout/stderr
 
 ### Done in v1.4
-- ✅ Resizable terminal panel (drag handle, default 3 lines / 80px, persists height)
-- ✅ Removed accent color from theme (per user request)
 - ✅ IP Scan button in toolbar opens scanner directly (skips method picker)
 - ✅ DeployPackageModal — install MSI/EXE/PS1 on selected hosts, saved package library
 - ✅ Fixed executePowerAction — was passing wrong shape to backend, now per-host iteration
@@ -626,14 +621,15 @@ The HTML has CDN fallbacks that will load from unpkg.com if the local vendor fil
 - ✅ Improved column chooser — pill-button format with On/Off/Locked badges, All/None/Reset quick actions
 
 ### Done in v1.4.2
-- ✅ Inline right drawer (flexbox sibling, not position:fixed) — terminal no longer extends underneath
-- ✅ Cmd button per inventory row (TerminalSquare icon) — opens terminal, auto-runs `psexec \\host cmd`
+- ✅ Inline right drawer (flexbox sibling, not position:fixed)
 - ✅ Security architecture documented in README (browser sandbox vs backend execution)
+- ✅ Removed VSCode-style terminal panel (simplified architecture)
+- ✅ Audit log entry for terminal.run → removed with terminal feature
 
 ### Done in v1.4.3 (current)
 - ✅ Restored sidebar items that were wrongly removed (Deployments, Scripts, Services, Scheduler, Reports)
 - ✅ Restored Settings tabs (Appearance, Notifications, Email, Users & Roles, API Keys, Production Mode)
-- ✅ Appearance tab now uses working applyTheme (Dark/Light/System buttons)
+- ✅ Appearance tab uses working applyTheme (Dark/Light/System buttons)
 - ✅ README audited and rewritten to reflect actual feature set
 
 ### Planned for v1.5

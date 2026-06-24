@@ -5,11 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SupportHubLAN — Windows Endpoint Administration</title>
 
-  <!-- Fonts -->
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
-
   <!-- Tailwind CSS (local vendor copy — works on LAN with no internet) -->
   <script src="vendor/tailwind.min.js"></script>
 
@@ -22,25 +17,6 @@
 
   <!-- Lucide Icons UMD (local vendor copy) -->
   <script src="vendor/lucide.min.js"></script>
-
-  <!-- CDN fallbacks (only used if vendor files are missing, e.g. on GitHub Pages) -->
-  <script>
-    window.__fallbackLoaded = false;
-    function loadFallback(id, url) {
-      if (window[id]) return;
-      window.__fallbackLoaded = true;
-      var s = document.createElement('script');
-      s.src = url; s.async = false;
-      document.head.appendChild(s);
-    }
-    document.addEventListener('DOMContentLoaded', function() {
-      loadFallback('tailwind', 'https://cdn.tailwindcss.com');
-      loadFallback('React', 'https://unpkg.com/react@18/umd/react.production.min.js');
-      loadFallback('ReactDOM', 'https://unpkg.com/react-dom@18/umd/react-dom.production.min.js');
-      loadFallback('Babel', 'https://unpkg.com/@babel/standalone/babel.min.js');
-      loadFallback('lucide', 'https://unpkg.com/lucide@latest/dist/umd/lucide.min.js');
-    });
-  </script>
 
   <script>
     // Tailwind theme extension with supporthublan tokens
@@ -310,12 +286,12 @@
         } else {
           endIP = [...startIP.slice(0, 3), endPart];
         }
-        const startNum = (parseInt(startIP[0]) << 24) | (parseInt(startIP[1]) << 16) | (parseInt(startIP[2]) << 8) | parseInt(startIP[3]);
-        const endNum = (parseInt(endIP[0]) << 24) | (parseInt(endIP[1]) << 16) | (parseInt(endIP[2]) << 8) | parseInt(endIP[3]);
+        const startNum = ((parseInt(startIP[0]) << 24) | (parseInt(startIP[1]) << 16) | (parseInt(startIP[2]) << 8) | parseInt(startIP[3])) >>> 0;
+        const endNum = ((parseInt(endIP[0]) << 24) | (parseInt(endIP[1]) << 16) | (parseInt(endIP[2]) << 8) | parseInt(endIP[3])) >>> 0;
         const ips = [];
-        for (let i = startNum; i <= endNum && i >= 0; i++) {
-          ips.push([(i >> 24) & 0xFF, (i >> 16) & 0xFF, (i >> 8) & 0xFF, i & 0xFF].join('.'));
-          if (ips.length > 254) break; // cap at /24
+        for (let i = startNum; i <= endNum; i++) {
+          ips.push([(i >>> 24) & 0xFF, (i >>> 16) & 0xFF, (i >>> 8) & 0xFF, i & 0xFF].join('.'));
+          if (ips.length > 65535) break; // cap at large range
         }
         return ips;
       }
@@ -326,14 +302,14 @@
         const prefixLen = parseInt(prefix);
         if (isNaN(prefixLen) || prefixLen < 16 || prefixLen > 30) return [];
         const ipParts = ip.split('.').map(Number);
-        const ipNum = (ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3];
+        const ipNum = ((ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3]) >>> 0;
         const mask = prefixLen === 0 ? 0 : (0xFFFFFFFF << (32 - prefixLen)) >>> 0;
         const network = (ipNum & mask) >>> 0;
         const broadcast = (network | (~mask >>> 0)) >>> 0;
         const ips = [];
-        for (let i = network + 1; i < broadcast && i >= 0; i++) {
-          ips.push([(i >> 24) & 0xFF, (i >> 16) & 0xFF, (i >> 8) & 0xFF, i & 0xFF].join('.'));
-          if (ips.length > 254) break;
+        for (let i = network + 1; i < broadcast; i++) {
+          ips.push([(i >>> 24) & 0xFF, (i >>> 16) & 0xFF, (i >>> 8) & 0xFF, i & 0xFF].join('.'));
+          if (ips.length > 65535) break;
         }
         return ips;
       }
@@ -491,8 +467,7 @@
         executeScript: (hostnames, script, credential, language, timeout) => apiCall('/api/scripts/execute', { hostnames, script, credential, language, timeout }),
 
         // Deployments
-        deployPackage: (hostnames, packagePath, args, credential, rebootBehavior) => apiCall('/api/deployments/run', { hostnames, packagePath, arguments: args, credential, rebootBehavior }),
-        copyFiles: (hostnames, sourcePath, destinationPath, credential) => apiCall('/api/deployments/copy', { hostnames, sourcePath, destinationPath, credential }),
+        deployPackage: (hostnames, packagePath, args, credential, rebootBehavior) => apiCall('/api/deploy/package', { hostnames, packagePath, arguments: args, credential, rebootBehavior }),
 
         // Services
         getServices: (hostname, credential) => apiCall('/api/services/' + hostname + '/list', { credential }),
@@ -507,7 +482,6 @@
         powerAction: (hostname, action, credential, message) => apiCall('/api/power/action', { hostname, action, credential, message }),
         // Wake-on-LAN — pass single MAC address (string) per call; backend expects { mac }
         wakeOnLan: (mac) => apiCall('/api/power/wol', { mac }),
-        checkPendingReboot: (hostnames, credential) => apiCall('/api/power/check-pending', { hostnames, credential }),
 
         // Job Queue
         executeQueue: (steps, hostnames, credential, errorHandling, queueName) => apiCall('/api/queues/execute', { steps, hostnames, credential, errorHandling, queueName }),
@@ -533,6 +507,9 @@
 
         // Batch status check — ping multiple hostnames in parallel
         checkHostStatus: (hostnames) => apiCall('/api/hosts/status-check', { hostnames }),
+
+        // Batch info — pull live OS, build, disk, logged-in user via PsTools
+        batchHostInfo: (hostnames) => apiCall('/api/hosts/batch-info', { hostnames }),
 
         // Hardware audit — comprehensive wmic + PsInfo + PsLoggedOn
         getHardwareInfo: (hostname) => apiCall('/api/hosts/' + hostname + '/hardware', {}),
@@ -569,11 +546,15 @@
         // Global domain credentials
         getDomainCredentials: () => apiGet('/api/settings/domain-credentials'),
         setDomainCredentials: (username, password, domain) => apiCall('/api/settings/domain-credentials', { username, password, domain }),
-        testDomainCredentials: () => apiCall('/api/settings/domain-credentials/test', {}),
+        testDomainCredentials: (username, password, domain) => apiCall('/api/settings/domain-credentials/test', { username, password, domain }),
 
-        // WinRM management
-        testWinRM: (hostname) => apiCall('/api/winrm/test', { hostname }),
-        enableWinRM: (hostname) => apiCall('/api/winrm/enable', { hostname }),
+        // Fallback credentials (used when AD credentials are not configured)
+        getFallbackCredentials: () => apiGet('/api/settings/fallback-credentials'),
+        setFallbackCredentials: (username, password, domain) => apiCall('/api/settings/fallback-credentials', { username, password, domain }),
+
+        // Domain suffix — converts short hostnames to FQDN (pc-01 → pc-01.plant.fccl.com)
+        getDomainSuffix: () => apiGet('/api/settings/domain-suffix'),
+        setDomainSuffix: (domain) => apiCall('/api/settings/domain-suffix', { domain }),
 
         // Remote desktop
         launchRemote: (hostname, ip, protocol, port) => apiCall('/api/remote/connect', { hostname, ip, protocol, port }),
@@ -581,6 +562,10 @@
         // PC Event Log
         getEventLog: (hostname, logName, maxEvents, severity, credential) =>
           apiCall('/api/hosts/' + hostname + '/eventlog', { logName, maxEvents, severity, credential }),
+
+        // DNS resolution
+        dnsResolve: (hostname, ip) => apiCall('/api/dns/resolve', { hostname, ip }),
+        dnsBulkResolve: (items) => apiCall('/api/dns/bulk-resolve', { items }),
 
         // Health check (force re-check by resetting _available)
         recheckBackend: () => { _available = null; return checkBackend(); },
@@ -596,6 +581,9 @@
        React.createElement calls (which work since React is a global). */
 
     function compileAndRunApp() {
+      if (typeof Babel !== 'undefined' && Babel.disableScriptTags) {
+        Babel.disableScriptTags();
+      }
       const scriptEl = document.getElementById('app-script');
       if (!scriptEl) { console.error('app-script element not found'); return; }
       const code = scriptEl.textContent;
@@ -645,7 +633,7 @@
     }
   </script>
 
-  <script type="text/babel" id="app-script">
+  <script type="text/plain" id="app-script">
   /* ========================================================================
      SUPPORTHUBLAN PRO — Single-file React 18 Application
      ====================================================================== */
@@ -1161,7 +1149,7 @@
     if (!open) return null;
     const sizeCls = { sm: 'max-w-md', md: 'max-w-2xl', lg: 'max-w-4xl', xl: 'max-w-6xl' }[size] || 'max-w-2xl';
     return (
-      <div className="fixed inset-0 z-50 flex items-start justify-center p-4 overflow-y-auto animate-fadeIn" style={{ background: 'rgba(0,0,0,0.6)' }} onClick={onClose}>
+      <div className="fixed inset-0 z-50 flex items-start justify-center p-4 overflow-y-auto animate-fadeIn" style={{ background: 'rgba(0,0,0,0.6)' }}>
         <div className={`mt-16 w-full ${sizeCls} bg-surface border border-border rounded-lg shadow-raised flex flex-col max-h-[85vh]`} onClick={(e) => e.stopPropagation()}>
           <div className="flex items-start justify-between p-4 border-b border-border">
             <div className="min-w-0">
@@ -1377,6 +1365,14 @@
     const [page, setPage] = useState(0);
     const pageSize = maxRows || 25;
 
+    // Reset page to 0 when rows shrink (e.g. after delete) to prevent empty grid
+    useEffect(() => {
+      setPage(p => {
+        const maxP = Math.max(0, Math.ceil(rows.length / pageSize) - 1);
+        return p > maxP ? 0 : p;
+      });
+    }, [rows.length, pageSize]);
+
     const sortedRows = useMemo(() => {
       if (!sortBy) return rows;
       const sorted = [...rows].sort((a, b) => {
@@ -1391,7 +1387,7 @@
 
     const pagedRows = sortedRows.slice(page * pageSize, (page + 1) * pageSize);
     const totalPages = Math.ceil(sortedRows.length / pageSize);
-    const allSelected = sortedRows.length > 0 && selectedIds.length === sortedRows.length;
+    const allSelected = pagedRows.length > 0 && pagedRows.every(r => selectedIds.includes(r.id));
 
     const handleSort = (key) => {
       if (sortBy === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -1400,8 +1396,13 @@
 
     const toggleAll = () => {
       if (!onSelectionChange) return;
-      if (allSelected) onSelectionChange([]);
-      else onSelectionChange(sortedRows.map(r => r.id));
+      if (allSelected) {
+        const pageIds = new Set(pagedRows.map(r => r.id));
+        onSelectionChange(selectedIds.filter(id => !pageIds.has(id)));
+      } else {
+        const pageIds = new Set(pagedRows.map(r => r.id));
+        onSelectionChange([...new Set([...selectedIds.filter(id => !pageIds.has(id)), ...pagedRows.map(r => r.id)])]);
+      }
     };
     const toggleOne = (id) => {
       if (!onSelectionChange) return;
@@ -1947,27 +1948,17 @@
 
   // ---- Right Drawer INLINE (flexbox sibling, not fixed) — used in v1.4.2+
   // Desktop (lg+): 380px flexbox sibling of the workspace column.
-  //   The workspace (incl. terminal panel) shrinks to make room. Both visible side-by-side.
-  // Mobile (<lg): full-screen overlay (fixed position) that stops ABOVE the terminal panel.
-  //   The terminal stays visible at the bottom. The drawer scrolls independently.
+  //   The workspace shrinks to make room. Both visible side-by-side.
+  // Mobile (<lg): full-screen overlay (fixed position).
   const RightDrawerInline = ({ open, kind, data }) => {
-    const { navigate, closeDrawer } = useApp();
+    const { navigate, closeDrawer, updateHosts, appendAudit } = useApp();
     const [tab, setTab] = useState('overview');
-    // Track terminal height so the mobile drawer can stop above it
-    const [termHeight, setTermHeight] = useState(() => { try { return parseInt(localStorage.getItem('supporthublan:terminal-height') || '80', 10); } catch { return 80; } });
     useEffect(() => { setTab('overview'); }, [data?.id]);
     useEffect(() => {
       const h = (e) => { if (e.key === 'Escape' && open) closeDrawer(); };
       window.addEventListener('keydown', h);
       return () => window.removeEventListener('keydown', h);
     }, [open, closeDrawer]);
-    // Listen for terminal height changes
-    useEffect(() => {
-      const h = () => { try { setTermHeight(parseInt(localStorage.getItem('supporthublan:terminal-height') || '80', 10)); } catch {} };
-      window.addEventListener('storage', h);
-      const interval = setInterval(h, 500); // poll for changes from the TerminalPanel
-      return () => { window.removeEventListener('storage', h); clearInterval(interval); };
-    }, []);
     if (!open || !data) return null;
     const host = kind === 'host' ? data : null;
     const job = kind === 'job' ? data : null;
@@ -2015,18 +2006,16 @@
 
     const body = (
       <div className="flex-1 overflow-y-auto p-3">
-        {host && <HostDrawerTab tab={tab} host={host} />}
+        {host && <HostDrawerTab tab={tab} host={host} updateHosts={updateHosts} appendAudit={appendAudit} />}
         {job && <JobDrawerTab tab={tab} job={job} />}
       </div>
     );
 
     return (
       <>
-        {/* Mobile (<lg): fixed overlay that stops ABOVE the terminal panel.
-            Terminal height is read from localStorage and used as the bottom offset.
-            This way the terminal stays visible at the bottom while the drawer covers the workspace. */}
+        {/* Mobile (<lg): fixed overlay that fills from header to bottom. */}
         <aside className="lg:hidden fixed left-0 right-0 bg-surface border-t border-border flex flex-col animate-slideIn"
-               style={{ top: '56px', bottom: termHeight + 'px', zIndex: 30 }}>
+               style={{ top: '56px', bottom: '0', zIndex: 30 }}>
           {headerAndTabs}
           {body}
         </aside>
@@ -2547,6 +2536,7 @@
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
     const [rawOutputs, setRawOutputs] = useState(null);
+    const [scanErrors, setScanErrors] = useState([]);
     const hw = host._hardwareInfo;
 
     const scan = async () => {
@@ -2554,6 +2544,7 @@
       setLoading(true);
       setError(null);
       setRawOutputs(null);
+      setScanErrors([]);
       toast.info('Scanning hardware on ' + host.hostname + '…');
       try {
         const r = await window.SupportHubLANAPI.getHardwareInfo(host.hostname);
@@ -2577,7 +2568,6 @@
               });
             });
           }
-          if (r.rawOutputs) setRawOutputs(r.rawOutputs);
         } else if (r && r.demo) {
           toast.warning('Backend not connected');
           setError('Backend not connected');
@@ -2585,6 +2575,8 @@
           toast.error('Hardware scan failed', { detail: r?.error, duration: 8000 });
           setError(r?.error || 'Scan failed');
         }
+        if (r.rawOutputs) setRawOutputs(r.rawOutputs);
+        if (r.errors && r.errors.length > 0) setScanErrors(r.errors);
       } catch (e) {
         toast.error('Hardware scan failed', { detail: e.message, duration: 8000 });
         setError(e.message);
@@ -2601,25 +2593,16 @@
       let cancelled = false;
       (async () => {
         if (!window.SupportHubLANAPI) return;
-        // If we already have hardware data in state, don't re-load
         if (host._hardwareInfo) { setLoadedSaved(true); return; }
-        // Try to load saved hardware data
         try {
           const r = await window.SupportHubLANAPI.getSavedHardware(host.hostname);
           if (cancelled) return;
           if (r && r.success && r.data) {
             updateHosts(prev => prev.map(h => h.id === host.id ? { ...h, _hardwareInfo: r.data } : h));
-            setLoadedSaved(true);
-            // Don't auto-scan — user has saved data. They can click Rescan.
-          } else {
-            setLoadedSaved(true);
-            // No saved data — auto-scan
-            scan();
           }
+          setLoadedSaved(true);
         } catch (e) {
           setLoadedSaved(true);
-          // Failed to load saved — auto-scan
-          scan();
         }
       })();
       return () => { cancelled = true; };
@@ -2713,6 +2696,116 @@
             Last scan returned partial data: {error}
           </div>
         )}
+
+        {scanErrors.length > 0 && (
+          <div className="mt-2 space-y-1">
+            {scanErrors.map((err, idx) => (
+              <div key={idx} className="p-2 bg-surface-raised rounded border border-border text-[10px]">
+                <div className="font-semibold text-text">{err.method}</div>
+                {err.reason && <div className="text-warning">{err.reason}</div>}
+                {err.service && <div className="text-text-dim">Service: {err.service}</div>}
+                {err.fix && <div className="text-text-dim">Fix: {err.fix}</div>}
+                {err.error && <div className="text-text-dim truncate" title={err.error}>{err.error}</div>}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* ── HARDWARE SUMMARY — all key fields in one compact view ── */}
+        <div className="mt-3 p-3 bg-surface-raised rounded border border-border">
+          <div className="text-meta text-text-dim uppercase mb-2 flex items-center gap-1.5">
+            <Icon name="List" size={12} />
+            Hardware Summary
+          </div>
+          <div className="grid grid-cols-1 gap-x-4 gap-y-1 text-[11px]">
+            {(() => {
+              // If we have the user's exact Format-List data, use it directly
+              if (hw.formattedSummary) {
+                const fieldOrder = [
+                  'Logged-In User', 'Windows Edition',
+                  'Windows Version/Build', 'OS Architecture', 'Corporate System Info',
+                  'Motherboard Info', 'Processor (CPU)',
+                  'Installed RAM Sticks', 'Storage Drives (All)',
+                  'Video/Graphics Cards', 'Network Interfaces'
+                ];
+                // Also compute total RAM from formatted sticks for the detail section
+                const ramVal = hw.formattedSummary['Installed RAM Sticks'] || '';
+                if (ramVal && hw.system) {
+                  const gbNums = ramVal.match(/(\d+)GB/g);
+                  if (gbNums) {
+                    const totalGB = gbNums.reduce((s, m) => s + parseInt(m), 0);
+                    if (totalGB > 0) hw.system.totalRamMB = totalGB * 1024;
+                  }
+                }
+                return fieldOrder
+                  .map(key => ({ key, val: hw.formattedSummary[key] }))
+                  .filter(item => item.val)
+                  .map((item, idx) => (
+                    <div key={idx} className="flex items-start gap-2 py-0.5 border-b border-border/30 last:border-0">
+                      <span className="text-text-dim whitespace-nowrap shrink-0 w-[150px]">{item.key}</span>
+                      <span className="text-text break-all whitespace-pre-wrap">{item.val}</span>
+                    </div>
+                  ));
+              }
+              // Fallback: compute from structured fields (for old cached data)
+              const cpu = hw.processor, mb = hw.motherboard, bios = hw.bios, sys = hw.system, osInfo = hw.os;
+              let verStr = '';
+              if (hw.osDisplayVersion) verStr += 'Version: ' + hw.osDisplayVersion;
+              if (osInfo?.build) {
+                const buildPart = 'OS Build: ' + osInfo.build + (hw.osUBR ? '.' + hw.osUBR : '');
+                verStr += (verStr ? ' (' + buildPart + ')' : buildPart);
+              }
+              let cpuStr = '';
+              if (cpu?.name) {
+                cpuStr = cpu.name.trim().replace(/\s*@\s*$/, '');
+                const parts = [];
+                if (cpu.cores > 0) parts.push(cpu.cores + ' Cores');
+                if (cpu.threads > 0) parts.push(cpu.threads + ' Threads');
+                if (cpu.maxSpeedMHz > 0) parts.push((cpu.maxSpeedMHz / 1000).toFixed(2) + ' GHz');
+                if (parts.length > 0) cpuStr += ' (' + parts.join(' / ') + ')';
+              }
+              let ramStr = '';
+              if (hw.memory && hw.memory.length > 0) {
+                ramStr = hw.memory.map(m => (m.deviceLocator || 'Slot') + ': ' + m.capacityGB + 'GB' + (m.speed ? ' ' + m.speed + 'MHz' : '') + (m.manufacturer ? ' (' + m.manufacturer.trim() + ')' : '')).join(' | ');
+              } else if (sys?.totalRamMB) {
+                ramStr = (sys.totalRamMB >= 1024 ? (sys.totalRamMB / 1024).toFixed(0) : sys.totalRamMB) + ' GB Total';
+              }
+              let diskStr = '';
+              if (hw.disks && hw.disks.length > 0) {
+                diskStr = hw.disks.map(d => 'Drive ' + (d.index !== undefined ? d.index : '') + ': ' + (d.model || 'Unknown') + ' (' + d.sizeGB + 'GB)').join(' | ');
+              }
+              let gpuStr = '';
+              if (hw.gpu && hw.gpu.length > 0) {
+                gpuStr = hw.gpu.map(g => g.name + (g.driverVersion ? ' (Driver v' + g.driverVersion + ')' : '')).join(' | ');
+              }
+              let netStr = '';
+              if (hw.physicalNetworks && hw.physicalNetworks.length > 0) {
+                netStr = hw.physicalNetworks.filter(n => n.name).map(n => n.name + (n.macAddress ? ' [MAC: ' + n.macAddress + ']' : '')).join(' | ');
+              } else if (hw.network && hw.network.length > 0) {
+                netStr = hw.network.map(n => n.description + (n.macAddress ? ' [MAC: ' + n.macAddress + ']' : '')).join(' | ');
+              }
+              const items = [
+                { label: 'Logged-In User', value: hw.loggedInUser, mono: true },
+                { label: 'Windows Edition', value: osInfo?.name },
+                { label: 'Windows Version/Build', value: verStr || null },
+                { label: 'OS Architecture', value: osInfo?.architecture },
+                { label: 'Corporate System Info', value: (sys?.manufacturer || sys?.model) ? ((sys.manufacturer || '') + (sys.model ? ' — Model: ' + sys.model : '')).trim() : null },
+                { label: 'Motherboard Info', value: (mb?.manufacturer || mb?.product) ? ('Make: ' + (mb.manufacturer || '') + ' | Board: ' + (mb.product || '')).replace(/\s*\|\s*$/, '').replace(/^\s*\|\s*/, '') : null },
+                { label: 'Processor (CPU)', value: cpuStr || null },
+                { label: 'Installed RAM Sticks', value: ramStr || null },
+                { label: 'Storage Drives (All)', value: diskStr || null },
+                { label: 'Video/Graphics Cards', value: gpuStr || null },
+                { label: 'Network Interfaces', value: netStr || null },
+              ].filter(item => item.value);
+              return items.map((item, idx) => (
+                <div key={idx} className="flex items-start gap-2 py-0.5 border-b border-border/30 last:border-0">
+                  <span className="text-text-dim whitespace-nowrap shrink-0 w-[150px]">{item.label}</span>
+                  <span className={'text-text ' + (item.mono ? 'font-mono text-[10px]' : '') + ' break-all whitespace-pre-wrap'}>{item.value}</span>
+                </div>
+              ));
+            })()}
+          </div>
+        </div>
 
         {/* SYSTEM (Make / Model / Serial) */}
         <SectionTitle icon="Server">System</SectionTitle>
@@ -2835,11 +2928,11 @@
               {hw.disks.map((d, i) => (
                 <div key={i} className="text-xs">
                   <div className="flex justify-between">
-                    <span className="text-text">{d.model || 'Disk ' + i}</span>
+                    <span className="text-text">{(d.index !== undefined ? 'Drive ' + d.index + ': ' : '') + (d.model || 'Disk ' + i)}</span>
                     <span className="text-text-dim tnum">{d.sizeGB} GB</span>
                   </div>
                   <div className="text-[9px] text-text-dim">
-                    {d.interface ? d.interface + ' · ' : ''}{d.partitions} partition(s)
+                    {d.interfaceType || d.interface ? (d.interfaceType || d.interface) + ' · ' : ''}{d.partitions || 0} partition(s)
                     {d.serialNumber ? ' · S/N: ' + d.serialNumber : ''}
                   </div>
                 </div>
@@ -2888,7 +2981,8 @@
         <SectionTitle icon="Monitor">Operating System</SectionTitle>
         <div className="p-2 bg-surface-raised rounded border border-border">
           <Row label="OS" value={osInfo?.name} />
-          <Row label="Version" value={osInfo?.version} />
+          <Row label="Display Version" value={hw.osDisplayVersion} />
+          <Row label="Version/Build" value={osInfo?.version ? osInfo.version + (hw.osUBR ? ' (UBR: ' + hw.osUBR + ')' : '') : null} />
           <Row label="Build" value={osInfo?.build} mono />
           <Row label="Architecture" value={osInfo?.architecture} />
           <Row label="Install Date" value={osInfo?.installDate} />
@@ -2916,14 +3010,15 @@
         <SectionTitle icon="User">User</SectionTitle>
         <div className="p-2 bg-surface-raised rounded border border-border">
           <Row label="Logged In" value={hw.loggedInUser} mono />
-          {!hw.loggedInUser && <div className="text-text-dim text-xs">No user currently logged in.</div>}
+          <Row label="Profile Path" value={hw.userProfilePath} mono />
+          {!hw.loggedInUser && !hw.userProfilePath && <div className="text-text-dim text-xs">No user data available.</div>}
         </div>
 
         {/* RAW OUTPUTS (collapsible, for debugging) */}
         {rawOutputs && (
           <div className="mt-3">
             <details>
-              <summary className="cursor-pointer text-[10px] text-text-dim">Raw wmic outputs (debug)</summary>
+              <summary className="cursor-pointer text-[10px] text-text-dim">Raw outputs (debug)</summary>
               <div className="mt-1 space-y-2">
                 {Object.entries(rawOutputs).map(([key, val]) => val ? (
                   <div key={key}>
@@ -2936,9 +3031,21 @@
           </div>
         )}
 
-        <div className="text-[9px] text-text-dim text-center pt-2 pb-1">
-          Data source: PsInfo -d -h -s · PsLoggedOn (pure PsTools, no wmic/PowerShell)
-        </div>
+        {hw?.methods && (
+          <div className="text-[9px] text-text-dim text-center pt-2 pb-1">
+            Data source: {Object.entries(hw.methods).filter(([,v]) => v === 'success').map(([k]) => {
+              if (k === 'psinfo') return 'PsInfo';
+              if (k === 'psloggedon') return 'PsLoggedOn';
+              if (k === 'powershell') return 'PowerShell';
+              if (k === 'winrm') return 'WinRM';
+              if (k === 'wmic') return 'wmic';
+              return k;
+            }).join(' · ') || 'Unknown'}
+            {Object.entries(hw.methods).some(([,v]) => v === 'failed') && (
+              <span className="text-warning"> (some methods failed)</span>
+            )}
+          </div>
+        )}
       </div>
     );
   };
@@ -3068,8 +3175,78 @@
   };
 
   // Host drawer tab content
-  const HostDrawerTab = ({ tab, host }) => {
-    const { activeJobs, hosts, updateHosts, addJob, appendAudit, executePowerAction } = useApp();
+  const ServicesHostTab = ({ host }) => {
+    const toast = useToast();
+    const [svcs, setSvcs] = useState(null);
+    const [svcLoading, setSvcLoading] = useState(false);
+    const [svcError, setSvcError] = useState(null);
+
+    const fetchServices = async () => {
+      if (!window.SupportHubLANAPI) { toast.warning('Backend not connected'); return; }
+      setSvcLoading(true); setSvcError(null);
+      try {
+        const r = await window.SupportHubLANAPI.getServices(host.hostname, null);
+        if (r && r.success && !r.demo && r.data) {
+          let parsed = [];
+          try { parsed = JSON.parse(r.data); } catch { parsed = []; }
+          setSvcs(parsed.map(s => ({
+            name: s.Name || s.name || '',
+            display: s.DisplayName || s.display || s.Name || '',
+            status: s.State || s.status || 'Unknown',
+            startType: s.StartMode || s.startType || '',
+          })));
+        } else if (r && r.demo) {
+          setSvcError('Backend not connected');
+        } else {
+          setSvcError(r?.error || 'Failed to list services');
+        }
+      } catch (e) { setSvcError(e.message); }
+      setSvcLoading(false);
+    };
+
+    useEffect(() => { if (host?.hostname) fetchServices(); }, [host?.hostname]);
+
+    const doAction = async (svcName, action) => {
+      if (!window.SupportHubLANAPI) return;
+      toast.info(`${action} ${svcName}…`);
+      try {
+        const r = await window.SupportHubLANAPI.serviceAction(host.hostname, svcName, action, null);
+        if (r && r.success) {
+          toast.success(`${svcName} ${action === 'start' ? 'started' : action === 'stop' ? 'stopped' : 'restarted'}`);
+          setTimeout(fetchServices, 1500);
+        } else {
+          toast.error(`Failed to ${action} ${svcName}`, { detail: r?.error });
+        }
+      } catch (e) { toast.error(e.message); }
+    };
+
+    if (svcLoading) return <div className="flex items-center justify-center py-8"><Icon name="Loader2" size={18} className="animate-spin text-text-dim" /></div>;
+    if (svcError) return <EmptyState icon="AlertTriangle" title="Services unavailable" description={svcError} />;
+    if (!svcs || svcs.length === 0) return <EmptyState icon="Activity" title="No services found" />;
+
+    return (
+      <div className="space-y-1">
+        {svcs.map(s => (
+          <div key={s.name} className="flex items-center gap-2 p-1.5 bg-surface-raised rounded border border-border text-xs">
+            <Icon name={s.status === 'Running' ? 'Circle' : 'CircleOff'} size={10} className={s.status === 'Running' ? 'text-success' : 'text-danger'} />
+            <div className="flex-1 min-w-0">
+              <div className="font-mono text-text truncate">{s.name}</div>
+              <div className="text-[10px] text-text-dim truncate">{s.display}</div>
+            </div>
+            <span className="text-[10px] text-text-dim">{s.startType}</span>
+            <div className="flex gap-0.5">
+              <IconButton icon="Play" size="sm" title="Start" onClick={() => doAction(s.name, 'start')} />
+              <IconButton icon="Square" size="sm" title="Stop" onClick={() => doAction(s.name, 'stop')} />
+              <IconButton icon="RotateCw" size="sm" title="Restart" onClick={() => doAction(s.name, 'restart')} />
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  const HostDrawerTab = ({ tab, host, updateHosts, appendAudit }) => {
+    const { activeJobs, hosts, addJob, executePowerAction } = useApp();
     // Always read the freshest version of this host from state (so drawer updates after mutations)
     const liveHost = hosts.find(h => h.id === host.id) || host;
 
@@ -3120,41 +3297,7 @@
       );
     }
     if (tab === 'updates') {
-      const pending = liveHost.patchState !== 'compliant' ? KB_CATALOG.slice(0, 4) : [];
-      return (
-        <div className="space-y-3">
-          <div className="grid grid-cols-2 gap-2">
-            <div className="p-2 bg-surface-raised rounded border border-border">
-              <div className="text-meta text-text-dim uppercase">Compliance</div>
-              <div className="text-sm font-semibold capitalize text-text mt-0.5">{liveHost.patchState.replace('-', ' ')}</div>
-            </div>
-            <div className="p-2 bg-surface-raised rounded border border-border">
-              <div className="text-meta text-text-dim uppercase">Last Scan</div>
-              <div className="text-sm font-semibold text-text mt-0.5">{fmtRel(liveHost.lastSeen)}</div>
-            </div>
-          </div>
-          <div>
-            <div className="text-meta text-text-dim uppercase mb-1.5">Pending Updates ({pending.length})</div>
-            {pending.length === 0 ? <EmptyState icon="ShieldCheck" title="All compliant" description="No pending updates for this host." /> : (
-              <div className="space-y-1.5">
-                {pending.map(kb => (
-                  <div key={kb.kb} className="p-2 bg-surface-raised rounded border border-border">
-                    <div className="flex items-center justify-between">
-                      <span className="font-mono text-xs text-text">{kb.kb}</span>
-                      <Badge color={kb.severity === 'Critical' ? 'danger' : 'warning'}>{kb.severity}</Badge>
-                    </div>
-                    <div className="text-[11px] text-text-dim mt-0.5">{kb.title}</div>
-                    <div className="flex items-center justify-between mt-1">
-                      <span className="text-[10px] text-muted">{kb.classification} · {kb.size} MB</span>
-                      <ActionButton size="xs" variant="ghost" icon="Download">Download</ActionButton>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-      );
+      return <UpdatesTab host={liveHost} updateHosts={updateHosts} appendAudit={appendAudit} />;
     }
     if (tab === 'deployments') {
       return <div className="space-y-1.5">{DEPLOYMENT_HISTORY.slice(0,3).map(d => (
@@ -3180,28 +3323,9 @@
       ))}{activeJobs.filter(j => j.targets.includes(liveHost.id)).length === 0 && <EmptyState icon="ListOrdered" title="No active jobs" />}</div>;
     }
     if (tab === 'services') {
-      const sampleServices = [
-        { name: 'wuauserv', display: 'Windows Update', status: 'Running', startType: 'Manual', pid: 1234 },
-        { name: 'BITS', display: 'Background Intelligent Transfer', status: 'Running', startType: 'Automatic', pid: 892 },
-        { name: 'Spooler', display: 'Print Spooler', status: 'Stopped', startType: 'Automatic', pid: null },
-        { name: 'WinRM', display: 'Windows Remote Management (WS-Management)', status: 'Running', startType: 'Automatic', pid: 4 },
-      ];
-      return <div className="space-y-1">{sampleServices.map(s => (
-        <div key={s.name} className="flex items-center gap-2 p-1.5 bg-surface-raised rounded border border-border text-xs">
-          <Icon name={s.status === 'Running' ? 'Circle' : 'CircleOff'} size={10} className={s.status === 'Running' ? 'text-success' : 'text-danger'} />
-          <div className="flex-1 min-w-0">
-            <div className="font-mono text-text truncate">{s.name}</div>
-            <div className="text-[10px] text-text-dim truncate">{s.display}</div>
-          </div>
-          <span className="text-[10px] text-text-dim">{s.startType}</span>
-          <div className="flex gap-0.5">
-            <IconButton icon="Play" size="sm" title="Start" />
-            <IconButton icon="Square" size="sm" title="Stop" />
-            <IconButton icon="RotateCw" size="sm" title="Restart" />
-          </div>
-        </div>
-      ))}</div>;
+      return <ServicesHostTab host={liveHost} />;
     }
+    // Dead tab paths removed (processes, logs, network, apps) — these tabs
     // Dead tab paths removed (processes, logs, network, apps) — these tabs
     // are not in the tab list. Apps is handled by AppsTab component above.
     if (tab === 'remote') {
@@ -3304,6 +3428,7 @@
   // ---- Status Bar (28px) ----
   const StatusBar = () => {
     const { lastRefresh, setLastRefresh, activeJobs, updateJob, appendAudit } = useApp();
+    const toast = useToast();
     const [backendStatus, setBackendStatus] = useState('checking');
     const [backendInfo, setBackendInfo] = useState(null);
     const running = activeJobs.filter(j => j.status === 'running').length;
@@ -3809,10 +3934,41 @@
     );
   };
 
+  const CredentialInfoBar = () => {
+    const [credInfo, setCredInfo] = useState(null);
+    const [fbInfo, setFbInfo] = useState(null);
+    useEffect(() => {
+      if (window.SupportHubLANAPI) {
+        window.SupportHubLANAPI.getDomainCredentials().then(r => {
+          if (r && r.success && !r.demo) setCredInfo(r.data || {});
+        }).catch(() => {});
+        window.SupportHubLANAPI.getFallbackCredentials().then(r => {
+          if (r && r.success && !r.demo) setFbInfo(r.data || {});
+        }).catch(() => {});
+      }
+    }, []);
+    if (!credInfo) return null;
+    const hasAdCreds = credInfo.hasPassword && credInfo.username;
+    const hasFbCreds = fbInfo && fbInfo.hasPassword && fbInfo.username;
+    const hasAny = hasAdCreds || hasFbCreds;
+    return (
+      <div className={`flex items-center gap-2 px-3 py-1.5 rounded border text-xs ${hasAny ? 'bg-success/10 border-success/30 text-success' : 'bg-warning/10 border-warning/30 text-warning'}`}>
+        <Icon name={hasAny ? 'ShieldCheck' : 'AlertTriangle'} size={14} />
+        {hasAdCreds
+          ? <span>AD: <span className="font-mono">{credInfo.domain}\\{credInfo.username}</span></span>
+          : hasFbCreds
+            ? <span>Local: <span className="font-mono">{fbInfo.domain ? fbInfo.domain + '\\' : ''}{fbInfo.username}</span></span>
+            : <span>No credentials configured — Settings → General → Domain or Fallback Credentials</span>}
+        {hasAdCreds && hasFbCreds && <span className="text-text-dim">· Fallback: <span className="font-mono">{fbInfo.domain ? fbInfo.domain + '\\' : ''}{fbInfo.username}</span></span>}
+      </div>
+    );
+  };
+
   const InventoryScreen = () => {
-    const { route, openHost, openDrawer, hosts, addHosts, addJob, appendAudit } = useApp();
+    const { route, openHost, openDrawer, hosts, setHosts, addHosts, addJob, appendAudit, refreshHostsFromBackend } = useApp();
     const toast = useToast();
     const [activeTab, setActiveTab] = useState('all');
+    const [gridVersion, setGridVersion] = useState(0);
     const [search, setSearch] = useState('');
     const [filters, setFilters] = useState({});
     const [selectedIds, setSelectedIds] = useState([]);
@@ -3822,20 +3978,9 @@
     const [showDeployModal, setShowDeployModal] = useState(false);
     const [showCommandModal, setShowCommandModal] = useState(false);
     const [logHost, setLogHost] = useState(null); // host object for PC Log modal
-
-    // Open the bottom terminal panel and run a PsExec command on the given host.
-    // Dispatches a global event the TerminalPanel listens for.
-    const openTerminalForHost = (host) => {
-      // 1. Make sure terminal is expanded
-      try { localStorage.setItem('supporthublan:terminal-collapsed', '0'); } catch {}
-      // 2. Tell the terminal panel to expand + switch to Terminal tab + run command
-      window.dispatchEvent(new CustomEvent('supporthublan:terminal-open', {
-        detail: { command: `psexec \\\\${host.hostname} cmd`, host: host.hostname }
-      }));
-      toast.info(`Opening remote shell on ${host.hostname}…`);
-    };
     const [showColumnChooser, setShowColumnChooser] = useState(false);
-    const [hiddenCols, setHiddenCols] = useState(new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials']));
+    const [hiddenCols, setHiddenCols] = useState(new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials','uptime','lastSeen','pendingReboot']));
+    const DEFAULT_HIDDEN = new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials','uptime','lastSeen','pendingReboot']);
     const [confirmReboot, setConfirmReboot] = useState(false);
     const [editingHost, setEditingHost] = useState(null);
     const [remoteDesktopProtocol, setRemoteDesktopProtocol] = useState(() => { try { return localStorage.getItem('supporthublan:rdp-protocol') || 'VNC'; } catch(e) { return 'VNC'; } });
@@ -3961,15 +4106,14 @@
 
     const allColumns = [
       { key: 'led', label: 'LED', sortable: false, headerRender: () => (
-        <span className="inline-flex items-center gap-1 cursor-pointer" title="Click: start/stop all LED monitoring" onClick={() => { updateHosts(prev => prev.map(h => ({...h, _ledStopped: !h._ledStopped }))); toast.info('LED monitoring toggled.'); }}>
-          <Icon name="Activity" size={11} className="text-success" />
+        <span className="inline-flex items-center gap-1 cursor-help" title="🟢 Online   🔴 Offline">
+          <Icon name="Activity" size={11} className="text-success" /> Status
         </span>
       ), render: (h) => {
-        let ledColor = h.onlineStatus === 'online' ? (h.patchState === 'compliant' ? '#22c55e' : '#f59e0b') : h.onlineStatus === 'offline' ? '#ef4444' : '#6b7280';
-        if (h._ledOverride === 'off') ledColor = 'transparent';
-        if (h._ledBlue) ledColor = '#38bdf8';
-        if (h._ledStopped) ledColor = '#3d425a';
-        return <span className="inline-block w-3 h-3 rounded-full cursor-pointer border border-border" style={{ background: ledColor, boxShadow: ledColor !== 'transparent' ? `0 0 4px ${ledColor}` : 'none' }} title={`${h.onlineStatus} · ${h.patchState}\nClick: toggle off\nShift+Click: mark complete (blue)`} onClick={(e) => { e.stopPropagation(); if (e.shiftKey) { updateHosts(prev => prev.map(x => x.id === h.id ? { ...x, _ledBlue: !x._ledBlue } : x)); } else { updateHosts(prev => prev.map(x => x.id === h.id ? { ...x, _ledOverride: x._ledOverride === 'off' ? undefined : 'off' } : x)); } }} />;
+        const online = h.onlineStatus === 'online';
+        const ledColor = online ? '#22c55e' : '#ef4444';
+        const ledLabel = online ? 'Online' : 'Offline';
+        return <span className="inline-block w-3 h-3 rounded-full border border-border flex-shrink-0" style={{ background: ledColor, boxShadow: `0 0 4px ${ledColor}` }} title={ledLabel} />;
       } },
       { key: 'hostname', label: 'Hostname', mono: true, render: (h) => <span className="font-mono text-text">{h.hostname}</span> },
       { key: 'fqdn', label: 'FQDN', mono: true },
@@ -3991,7 +4135,7 @@
       { key: 'lastBootTime', label: 'Last Boot', render: (h) => <span className="text-text-dim">{fmtRel(h.lastBootTime)}</span> },
       { key: 'patchState', label: 'Patch State', render: (h) => <StatusBadge variant={h.patchState} size="xs" /> },
       { key: 'pendingReboot', label: 'Reboot', render: (h) => h.pendingReboot ? <Icon name="RefreshCw" size={12} className="text-warning" /> : <span className="text-text-dim">—</span> },
-      { key: 'loggedOnUsers', label: 'Users', render: (h) => (h.loggedOnUsers && h.loggedOnUsers.length > 0) ? <span className="text-text tnum" title={h.loggedOnUsers.join(', ')}>{h.loggedOnUsers.length}</span> : <span className="text-text-dim">—</span> },
+      { key: 'loggedOnUsers', label: 'User', render: (h) => (h.loggedOnUser) ? <span className="text-text tnum" title={h.loggedOnUser}>{h.loggedOnUser.split('\\').pop()}</span> : <span className="text-text-dim">—</span> },
       { key: 'site', label: 'Site' },
       { key: 'department', label: 'Dept' },
       { key: 'owner', label: 'Owner' },
@@ -4017,13 +4161,6 @@
             <Icon name={remoteDesktopProtocol === 'VNC' ? 'Monitor' : 'MonitorSmartphone'} size={14} />
           </button>
           <button
-            onClick={(e) => { e.stopPropagation(); openTerminalForHost(h); }}
-            title={`Open remote command shell on ${h.hostname} (PsExec)`}
-            className="inline-flex items-center justify-center w-7 h-7 rounded border border-border bg-surface-raised hover:border-primary hover:bg-primary/10 hover:text-primary text-text-dim transition-colors"
-          >
-            <Icon name="TerminalSquare" size={14} />
-          </button>
-          <button
             onClick={(e) => { e.stopPropagation(); setLogHost(h); }}
             title={`View PC event log for ${h.hostname}`}
             className="inline-flex items-center justify-center w-7 h-7 rounded border border-border bg-surface-raised hover:border-primary hover:bg-primary/10 hover:text-primary text-text-dim transition-colors"
@@ -4038,7 +4175,7 @@
             <Icon name="Edit" size={14} />
           </button>
           <button
-            onClick={async (e) => { e.stopPropagation(); if (!confirm(`Delete ${h.hostname}? This cannot be undone.`)) return; if (window.SupportHubLANAPI && h._fromBackend) { try { await fetch(window.SUPPORTHUBLAN_API_URL + '/api/hosts/' + h.id.replace('db-', ''), { method: 'DELETE' }); } catch (err) {} } updateHosts(prev => prev.filter(x => x.id !== h.id)); toast.warning(`Deleted ${h.hostname}`); appendAudit({ action: 'host.delete', actionCategory: 'Inventory', targetType: 'Host', targetIds: [h.id], parameters: { hostname: h.hostname }, result: 'success' }); }}
+            onClick={async (e) => { e.stopPropagation(); if (!confirm(`Delete ${h.hostname}? This cannot be undone.`)) return; if (window.SupportHubLANAPI && h._fromBackend) { try { await fetch(window.SUPPORTHUBLAN_API_URL + '/api/hosts/' + h.id.replace('db-', ''), { method: 'DELETE' }); } catch (err) {} } setHosts(prev => prev.filter(x => x.id !== h.id)); setGridVersion(v => v + 1); toast.warning(`Deleted ${h.hostname}`); appendAudit({ action: 'host.delete', actionCategory: 'Inventory', targetType: 'Host', targetIds: [h.id], parameters: { hostname: h.hostname }, result: 'success' }); setTimeout(() => refreshHostsFromBackend(), 800); }}
             title={`Delete ${h.hostname}`}
             className="inline-flex items-center justify-center w-7 h-7 rounded border border-border bg-surface-raised hover:border-danger hover:bg-danger/10 hover:text-danger text-text-dim transition-colors"
           >
@@ -4052,16 +4189,12 @@
     const rows = filteredHosts.map(h => ({ ...h, id: h.id, status: h.onlineStatus }));
 
     const bulkActions = [
-      { label: 'Refresh', icon: 'RefreshCw', onClick: () => {
-        if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; }
-        updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, lastSeen: new Date().toISOString() } : h));
-        appendAudit({ action: 'hosts.refresh', actionCategory: 'Inventory', targetType: 'Host', targetIds: [...selectedIds], parameters: {}, result: 'success' });
-        toast.success(`Refreshed ${selectedIds.length} host(s)`);
-      } },
-      { label: 'Edit', icon: 'Edit', onClick: () => {
-        if (selectedIds.length !== 1) { toast.warning('Select exactly one host to edit.'); return; }
-        const h = hosts.find(x => x.id === selectedIds[0]);
-        if (h) setEditingHost(h);
+      { label: 'Refresh', icon: 'RefreshCw', onClick: async () => {
+        toast.info('Refreshing computer data from backend…');
+        await refreshHostsFromBackend(false);
+        setGridVersion(v => v + 1);
+        appendAudit({ action: 'hosts.refresh', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: {}, result: 'success' });
+        toast.success('Inventory refreshed');
       } },
       { label: 'Check Updates', icon: 'Search', onClick: () => {
         if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; }
@@ -4102,10 +4235,14 @@
             }
           }
         }
-        updateHosts(prev => prev.filter(h => !selectedIds.includes(h.id)));
+        setHosts(prev => prev.filter(h => !selectedIds.includes(h.id)));
+        setGridVersion(v => v + 1);
         appendAudit({ action: 'hosts.delete-bulk', actionCategory: 'Inventory', targetType: 'Host', targetIds: [...selectedIds], parameters: { count: selectedIds.length }, result: 'success' });
         toast.warning(`Deleted ${selectedIds.length} host(s)`);
+        setGridVersion(v => v + 1);
         setSelectedIds([]);
+        // Refresh from backend to get consistent state
+        setTimeout(() => refreshHostsFromBackend(), 800);
       } },
     ];
 
@@ -4114,7 +4251,7 @@
         <PageHeader
           breadcrumb={['supporthublan', 'Inventory']}
           title="Computer Inventory"
-          subtitle={`${hosts.length} hosts · ${hosts.filter(h=>h.onlineStatus==='online').length} online`}
+          subtitle={`${hosts.length} hosts · ${hosts.filter(h=>h.onlineStatus==='online').length} online · Refresh pulls live data via PsTools`}
           actions={
             <>
               <ActionButton variant="secondary" icon="Download" onClick={() => {
@@ -4130,6 +4267,7 @@
           }
         />
 
+        <CredentialInfoBar />
         <TabGroup
           tabs={[
             { id: 'all', label: 'All Hosts', icon: 'Server', badge: hosts.length },
@@ -4250,9 +4388,9 @@
                   <div className="flex gap-1">
                     <button onClick={() => setHiddenCols(new Set())} className="text-[10px] px-1.5 py-0.5 text-text-dim hover:text-primary" title="Show all">All</button>
                     <span className="text-text-dim text-[10px]">·</span>
-                    <button onClick={() => setHiddenCols(new Set(allColumns.map(c => c.key).filter(k => k !== 'hostname' && k !== 'actions')))} className="text-[10px] px-1.5 py-0.5 text-text-dim hover:text-primary" title="Hide all except Hostname & Actions">None</button>
+                    <button onClick={() => setHiddenCols(new Set(allColumns.map(c => c.key).filter(k => k !== 'hostname' && k !== 'ipAddress' && k !== 'osName' && k !== 'actions')))} className="text-[10px] px-1.5 py-0.5 text-text-dim hover:text-primary" title="Minimal view">None</button>
                     <span className="text-text-dim text-[10px]">·</span>
-                    <button onClick={() => setHiddenCols(new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials']))} className="text-[10px] px-1.5 py-0.5 text-text-dim hover:text-primary" title="Restore defaults">Reset</button>
+                    <button onClick={() => setHiddenCols(new Set(DEFAULT_HIDDEN))} className="text-[10px] px-1.5 py-0.5 text-text-dim hover:text-primary" title="Restore defaults">Reset</button>
                   </div>
                 </div>
                 <div className="max-h-72 overflow-y-auto space-y-0.5">
@@ -4300,11 +4438,17 @@
 
             <BulkActionBar selectedCount={selectedIds.length} actions={bulkActions} onClear={() => setSelectedIds([])} />
 
+            {/* LED Status Legend */}
+            <div className="flex items-center gap-3 mb-2 text-[11px] text-text-dim">
+              <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-full bg-[#22c55e]" style={{boxShadow:'0 0 3px #22c55e'}} /> Online</span>
+              <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-full bg-[#ef4444]" style={{boxShadow:'0 0 3px #ef4444'}} /> Offline</span>
+            </div>
+
             {/* BatchPatch-style Action Toolbar */}
             <ActionToolbar groups={[
               { label: 'Hosts', items: [
                 { icon: 'Plus', label: 'Add', onClick: () => { setAddModalMethod(null); setShowAddModal(true); } },
-                { icon: 'RefreshCw', label: 'Refresh', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select at least one host.'); return; } updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, lastSeen: new Date().toISOString() } : h)); toast.success(`Refreshed ${selectedIds.length} host(s)`); }, disabled: selectedIds.length === 0 },
+                { icon: 'RefreshCw', label: 'Refresh', onClick: async () => { toast.info('Refreshing computer data…'); await refreshHostsFromBackend(false); setGridVersion(v => v + 1); toast.success('Inventory refreshed'); } },
               ]},
               { label: 'Updates', items: [
                 { icon: 'Search', label: 'Check', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } addJob({ id: 'job-' + Date.now(), name: `Scan — ${selectedIds.length} hosts`, targets: [...selectedIds], step: 'Scanning (1/3)', progress: 5, startedAt: new Date().toISOString(), status: 'running' }); toast.info(`Scanning ${selectedIds.length} hosts…`); }, disabled: selectedIds.length === 0 },
@@ -4365,7 +4509,7 @@
               ]},
             ]} />
 
-            <SectionCard bodyClassName="p-0">
+            <SectionCard bodyClassName="p-0" key={hosts.length + ':' + gridVersion}>
               <DataTable
                 columns={visibleColumns}
                 rows={rows}
@@ -4374,7 +4518,6 @@
                 onRowClick={(row) => openHost(hosts.find(h => h.id === row.id))}
                 density={density}
                 emptyMessage="No hosts match your filters."
-                maxRows={15}
               />
             </SectionCard>
           </>
@@ -4454,6 +4597,8 @@
                   appendAudit({ action: 'host.edit', actionCategory: 'Inventory', targetType: 'Host', targetIds: [editingHost.id], parameters: updates, result: 'success' });
                   toast.success(`Updated ${editingHost.hostname}`);
                   setEditingHost(null);
+                  setGridVersion(v => v + 1);
+                  setTimeout(() => refreshHostsFromBackend(), 300);
                 }}>Save Changes</ActionButton>
               </div>
             </div>
@@ -4900,6 +5045,7 @@
     // CSV Import Wizard state
     const [csvData, setCsvData] = useState(null); // { headers, rows }
     const [columnMapping, setColumnMapping] = useState({ hostname: '', ipAddress: '', macAddress: '', site: '', department: '', owner: '', notes: '' });
+    const [csvResolveDns, setCsvResolveDns] = useState(true);
 
     // AD Import state
     const [adOUPath, setAdOUPath] = useState('');
@@ -4908,8 +5054,11 @@
     const [adNameAttr, setAdNameAttr] = useState('cn');
     const [adIncludeIP, setAdIncludeIP] = useState(true);
     const [adAutoDetecting, setAdAutoDetecting] = useState(false);
+    const [adResults, setAdResults] = useState([]);
+    const [selectedADHosts, setSelectedADHosts] = useState(new Set());
+    const [scanSearch, setScanSearch] = useState('');
 
-    useEffect(() => { if (open) { setStep(0); setMethod('single'); setEntries([{ hostname: '', ipAddress: '', macAddress: '' }]); setPasteText(''); setTag(''); setOwner(''); setNotes(''); setScanResults([]); setCsvData(null); } }, [open]);
+    useEffect(() => { if (open) { setStep(0); setMethod('single'); setEntries([{ hostname: '', ipAddress: '', macAddress: '' }]); setPasteText(''); setTag(''); setOwner(''); setNotes(''); setScanResults([]); setSelectedScanIPs(new Set()); setScanSearch(''); setCsvData(null); setCsvResolveDns(true); setAdResults([]); setSelectedADHosts(new Set()); } }, [open]);
 
     const steps = [{ label: 'Input Method' }, { label: 'Host Details' }, { label: 'Assignment' }];
 
@@ -4923,6 +5072,43 @@
 
       // Use the fast parallel /api/scan endpoint (64 concurrent pings via ping.exe)
       if (window.SupportHubLANAPI) {
+        // Set up listener BEFORE fetch to avoid race condition
+        let scanJobId = null;
+        let settled = false;
+        const handler = (e) => {
+          const detail = e.detail;
+          if (detail.jobId !== scanJobId) return;
+          settled = true;
+          window.removeEventListener('supporthublan:scan-complete', handler);
+          const results = (detail.results || []).map(r => ({
+            ip: r.ip,
+            alive: r.online,
+            hostname: r.hostname || (r.online ? r.ip : ''),
+          }));
+          setScanResults(results);
+          setScanProgress(100);
+          setScanning(false);
+          const aliveSet = new Set(results.filter(r => r.alive).map(r => r.ip));
+          setSelectedScanIPs(aliveSet);
+          toast.success(`Scan complete: ${aliveSet.size} of ${ips.length} hosts responded.`);
+        };
+        window.addEventListener('supporthublan:scan-complete', handler);
+        // Animate progress while scanning
+        let pct = 0;
+        const progressInterval = setInterval(() => {
+          pct = Math.min(pct + 5, 90);
+          setScanProgress(pct);
+          if (pct >= 90) clearInterval(progressInterval);
+        }, 500);
+        // Timeout fallback — if no WebSocket response in 60s
+        const timeoutHandle = setTimeout(() => {
+          if (settled) return;
+          window.removeEventListener('supporthublan:scan-complete', handler);
+          clearInterval(progressInterval);
+          setScanning(false);
+          toast.error('Scan timed out — backend may be busy or WebSocket disconnected');
+        }, 60000);
+
         try {
           const resp = await fetch((window.SUPPORTHUBLAN_API_URL) + '/api/scan', {
             method: 'POST',
@@ -4931,40 +5117,15 @@
           });
           const data = await resp.json();
           if (data.success && data.data?.jobId) {
-            // Listen for scan-complete via WebSocket (custom event)
-            const handler = (e) => {
-              const detail = e.detail;
-              if (detail.jobId !== data.data.jobId) return;
-              window.removeEventListener('supporthublan:scan-complete', handler);
-              const results = (detail.results || []).map(r => ({
-                ip: r.ip,
-                alive: r.online,
-                hostname: r.hostname || (r.online ? `HOST-${r.ip.split('.').slice(2).join('')}` : ''),
-              }));
-              setScanResults(results);
-              setScanProgress(100);
-              setScanning(false);
-              const aliveSet = new Set(results.filter(r => r.alive).map(r => r.ip));
-              setSelectedScanIPs(aliveSet);
-              toast.success(`Scan complete: ${aliveSet.size} of ${ips.length} hosts responded.`);
-            };
-            window.addEventListener('supporthublan:scan-complete', handler);
-            // Animate progress while scanning
-            let pct = 0;
-            const progressInterval = setInterval(() => {
-              pct = Math.min(pct + 5, 90);
-              setScanProgress(pct);
-              if (pct >= 90) clearInterval(progressInterval);
-            }, 500);
-            // Timeout fallback — if no WebSocket response in 60s, stop scanning
-            setTimeout(() => {
-              window.removeEventListener('supporthublan:scan-complete', handler);
-              clearInterval(progressInterval);
-              setScanning(s => { if (s) { toast.error('Scan timed out'); return false; } return s; });
-            }, 60000);
+            scanJobId = data.data.jobId;
             return;
           }
+          // If we get here, the fetch failed — clean up
+          clearTimeout(timeoutHandle);
+          window.removeEventListener('supporthublan:scan-complete', handler);
         } catch (e) {
+          clearTimeout(timeoutHandle);
+          window.removeEventListener('supporthublan:scan-complete', handler);
           // Fall through to sequential fallback below
         }
       }
@@ -4974,7 +5135,7 @@
       for (let i = 0; i < ips.length; i++) {
         const ip = ips[i];
         const isAlive = await window.SupportHubLANScanner.pingIP(ip);
-        results.push({ ip, alive: isAlive, hostname: isAlive ? `HOST-${ip.split('.').slice(2).join('')}` : '' });
+        results.push({ ip, alive: isAlive, hostname: isAlive ? ip : '' });
         setScanProgress(Math.round(((i + 1) / ips.length) * 100));
         setScanResults([...results]);
       }
@@ -5020,7 +5181,7 @@
         uptime: '0d 0h', lastBootTime: new Date().toISOString(),
         onlineStatus: 'online', pingStatus: 'up', pendingReboot: false,
         patchState: 'unknown', lastSeen: new Date().toISOString(),
-        loggedOnUsers: [], site, location: site, department: dept, owner: owner || 'unassigned',
+        loggedOnUsers: [], loggedOnUser: '', site, location: site, department: dept, owner: owner || 'unassigned',
         notes, tags, groupId: 'g-workstations', credentialProfileId: 'c-local-admin',
       });
 
@@ -5034,7 +5195,7 @@
         }).filter(Boolean);
       }
       if (method === 'scan') {
-        return scanResults.filter(r => selectedScanIPs.has(r.ip)).map(r => baseHost(r.hostname || `HOST-${r.ip.split('.').slice(2).join('')}`, r.ip, ''));
+        return scanResults.filter(r => selectedScanIPs.has(r.ip)).map(r => baseHost(r.hostname || r.ip, r.ip, ''));
       }
       if (method === 'csv') {
         if (!csvData) return [];
@@ -5043,7 +5204,7 @@
           const ip = columnMapping.ipAddress ? row[columnMapping.ipAddress] : '';
           const mac = columnMapping.macAddress ? row[columnMapping.macAddress] : '';
           if (!hostname && !ip) return null;
-          const h = baseHost(hostname || `HOST-${ip}`, ip, mac);
+          const h = baseHost(hostname || ip, ip, mac);
           if (columnMapping.site && row[columnMapping.site]) h.site = row[columnMapping.site];
           if (columnMapping.department && row[columnMapping.department]) h.department = row[columnMapping.department];
           if (columnMapping.owner && row[columnMapping.owner]) h.owner = row[columnMapping.owner];
@@ -5052,10 +5213,20 @@
         }).filter(Boolean);
       }
       if (method === 'ad') {
-        return pasteText.split('\n').map(l => l.trim()).filter(Boolean).map(line => {
-          const [hostname, ip] = line.split(',').map(s => s.trim());
-          return hostname ? baseHost(hostname, ip || '', '') : null;
-        }).filter(Boolean);
+        return adResults.filter(r => selectedADHosts.has(r.name)).map(r => {
+          const h = baseHost(r.name, r.ip || '', '');
+          if (r.os) {
+            h.osName = r.os;
+            // Guess version/build from OS name
+            if (r.os.includes('Server 2022')) { h.osVersion = '21H2'; h.osBuild = '20348'; h.tags.push('server'); }
+            else if (r.os.includes('Server 2019')) { h.osVersion = '1809'; h.osBuild = '17763'; h.tags.push('server'); }
+            else if (r.os.includes('Server 2016')) { h.osVersion = '1607'; h.osBuild = '14393'; h.tags.push('server'); }
+            else if (r.os.includes('Windows 11')) { h.osVersion = '23H2'; h.osBuild = '22631'; }
+            else if (r.os.includes('Windows 10')) { h.osVersion = '22H2'; h.osBuild = '19045'; }
+          }
+          if (r.fqdn) h.fqdn = r.fqdn;
+          return h;
+        });
       }
       if (method === 'mac') {
         return pasteText.split('\n').map(l => l.trim()).filter(Boolean).map(line => {
@@ -5066,9 +5237,40 @@
       return [];
     };
 
-    const handleAdd = () => {
-      const newHosts = buildHosts();
+    const handleAdd = async () => {
+      let newHosts = buildHosts();
       if (newHosts.length === 0) { toast.warning('No valid hosts to add. Enter data or run a scan first.'); return; }
+      // Bulk DNS resolve: fill in missing hostnames/IPs for import methods
+      const shouldResolveDns = window.SupportHubLANAPI && (method === 'paste' || method === 'single' || (method === 'csv' && csvResolveDns) || method === 'scan' || method === 'ad');
+      if (shouldResolveDns) {
+        const missingItems = newHosts.map(h => ({
+          hostname: h.hostname || '',
+          ip: h.ipAddress || ''
+        })).filter(item => (item.hostname && !item.ip) || (item.ip && !item.hostname));
+        if (missingItems.length > 0) {
+          try {
+            const resolved = await window.SupportHubLANAPI.dnsBulkResolve(missingItems.map(item => ({
+              hostname: item.hostname || undefined,
+              ip: item.ip || undefined
+            })));
+            if (resolved && resolved.success && resolved.data) {
+              const lookup = {};
+              resolved.data.forEach(r => {
+                if (r.ip && r.hostname) {
+                  lookup[r.hostname.toLowerCase()] = r.ip;
+                  lookup[r.ip] = r.hostname;
+                }
+              });
+              newHosts = newHosts.map(h => {
+                let updated = { ...h };
+                if (h.hostname && !h.ipAddress && lookup[h.hostname.toLowerCase()]) updated.ipAddress = lookup[h.hostname.toLowerCase()];
+                if (h.ipAddress && !h.hostname && lookup[h.ipAddress]) updated.hostname = lookup[h.ipAddress];
+                return updated;
+              });
+            }
+          } catch (e) { /* DNS resolution failed, continue with existing data */ }
+        }
+      }
       addHosts(newHosts);
       appendAudit({
         action: 'hosts.add', actionCategory: 'Inventory',
@@ -5078,6 +5280,32 @@
       });
       toast.success(`Added ${newHosts.length} host(s) to inventory`, { detail: newHosts.map(h => h.hostname).join(', ') });
       onClose();
+    };
+
+    // DNS resolve helper for single-entry onBlur
+    const resolveDnsForEntry = async (index, field, value) => {
+      if (!value || !window.SupportHubLANAPI) return;
+      const entry = entries[index];
+      if (!entry) return;
+      if (entry.hostname && entry.ipAddress) return; // already has both
+      try {
+        const result = await window.SupportHubLANAPI.dnsResolve(
+          field === 'hostname' ? value : null,
+          field === 'ip' ? value : null
+        );
+        if (result && result.success && result.data) {
+          setEntries(es => es.map((x, idx) => {
+            if (idx !== index) return x;
+            if (field === 'hostname' && result.data.ip && !x.ipAddress) {
+              return { ...x, ipAddress: result.data.ip };
+            }
+            if (field === 'ip' && result.data.hostname && !x.hostname) {
+              return { ...x, hostname: result.data.hostname };
+            }
+            return x;
+          }));
+        }
+      } catch (e) { /* DNS resolve failed */ }
     };
 
     const handleFileUpload = (e) => {
@@ -5132,10 +5360,10 @@
               { id: 'paste', icon: 'Clipboard', label: 'Paste List', desc: 'Paste hostnames/IPs, one per line' },
               { id: 'csv', icon: 'FileUp', label: 'CSV Import Wizard', desc: 'Upload or paste CSV — map columns to fields' },
               { id: 'scan', icon: 'ScanLine', label: 'IP Range / Subnet Scan', desc: 'Ping sweep to discover live hosts' },
-              { id: 'ad', icon: 'Network', label: 'Import from AD', desc: 'Pull computers from AD OU (simulated)' },
+              { id: 'ad', icon: 'Network', label: 'Import from AD', desc: 'Pull computers from AD OU with DNS IP resolution' },
               { id: 'mac', icon: 'Cpu', label: 'By MAC Address', desc: 'Add WoL-enabled hosts by MAC' },
             ].map(m => (
-              <button key={m.id} onClick={() => setMethod(m.id)} className={`flex items-start gap-3 p-3 rounded-lg border text-left ${method === m.id ? 'bg-primary/10 border-primary' : 'bg-surface-raised border-border hover:border-text-dim'}`}>
+              <button key={m.id} onClick={() => { setMethod(m.id); setStep(1); }} className={`flex items-start gap-3 p-3 rounded-lg border text-left ${method === m.id ? 'bg-primary/10 border-primary' : 'bg-surface-raised border-border hover:border-text-dim'}`}>
                 <Icon name={m.icon} size={18} className={method === m.id ? 'text-primary' : 'text-text-dim'} />
                 <div>
                   <div className="text-xs font-medium text-text">{m.label}</div>
@@ -5151,8 +5379,8 @@
           <div className="space-y-2">
             {entries.map((e, i) => (
               <div key={i} className="grid grid-cols-1 sm:grid-cols-3 gap-2 p-2 bg-surface-raised rounded border border-border">
-                <FormField label="Hostname" required><Input value={e.hostname} onChange={(ev) => setEntries(es => es.map((x,idx) => idx===i ? {...x, hostname: ev.target.value} : x))} placeholder="WS001-ENG" className="font-mono" /></FormField>
-                <FormField label="IP Address" required><Input value={e.ipAddress} onChange={(ev) => setEntries(es => es.map((x,idx) => idx===i ? {...x, ipAddress: ev.target.value} : x))} placeholder="10.10.20.101" className="font-mono" /></FormField>
+                <FormField label="Hostname" required><Input value={e.hostname} onChange={(ev) => setEntries(es => es.map((x,idx) => idx===i ? {...x, hostname: ev.target.value} : x))} onBlur={(ev) => { if (ev.target.value && !e.ipAddress) resolveDnsForEntry(i, 'hostname', ev.target.value); }} placeholder="WS001-ENG" className="font-mono" /></FormField>
+                <FormField label="IP Address" required><Input value={e.ipAddress} onChange={(ev) => setEntries(es => es.map((x,idx) => idx===i ? {...x, ipAddress: ev.target.value} : x))} onBlur={(ev) => { if (ev.target.value && !e.hostname) resolveDnsForEntry(i, 'ip', ev.target.value); }} placeholder="10.10.20.101" className="font-mono" /></FormField>
                 <FormField label="MAC Address"><Input value={e.macAddress} onChange={(ev) => setEntries(es => es.map((x,idx) => idx===i ? {...x, macAddress: ev.target.value} : x))} placeholder="00:1A:2B:3C:4D:00" className="font-mono" /></FormField>
               </div>
             ))}
@@ -5185,6 +5413,11 @@
                   <Icon name="CheckCircle2" size={12} className="inline mr-1.5" />
                   Parsed {csvData.rows.length} rows with {csvData.headers.length} columns: {csvData.headers.join(', ')}
                 </div>
+                <label className="flex items-center gap-2 text-xs text-text p-2 bg-surface-raised rounded border border-border">
+                  <input type="checkbox" checked={csvResolveDns} onChange={e => setCsvResolveDns(e.target.checked)} className="accent-primary" />
+                  <span>Resolve missing hostnames/IPs via DNS</span>
+                  <span className="text-text-dim">— Fills in hostnames for IP-only rows and IPs for hostname-only rows</span>
+                </label>
                 <div className="p-3 bg-surface-raised rounded border border-border">
                   <div className="text-meta text-text-dim uppercase mb-2">Column Mapping — Map CSV columns to supporthublan fields</div>
                   <div className="grid grid-cols-2 gap-2">
@@ -5251,14 +5484,35 @@
               </div>
             )}
 
-            {scanResults.length > 0 && (
+            {scanResults.length > 0 && (() => {
+              const filteredScanResults = scanSearch
+                ? scanResults.filter(r => r.ip.includes(scanSearch) || (r.hostname && r.hostname.toLowerCase().includes(scanSearch.toLowerCase())))
+                : scanResults;
+              return (
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-meta text-text-dim uppercase">Scan Results — {scanResults.filter(r => r.alive).length} alive of {scanResults.length} scanned</span>
                   <div className="flex gap-1">
                     <ActionButton size="xs" variant="ghost" onClick={() => setSelectedScanIPs(new Set(scanResults.filter(r => r.alive).map(r => r.ip)))}>Select All Alive</ActionButton>
                     <ActionButton size="xs" variant="ghost" onClick={() => setSelectedScanIPs(new Set())}>Clear</ActionButton>
+                    <ActionButton size="xs" variant="ghost" icon="Search" onClick={async () => {
+                      toast.info('Resolving hostnames via DNS…');
+                      try {
+                        const aliveIps = scanResults.filter(r => r.alive).map(r => r.ip);
+                        const resolved = await window.SupportHubLANAPI.dnsBulkResolve(aliveIps.map(ip => ({ ip })));
+                        if (resolved && resolved.success && resolved.data) {
+                          const lookup = {};
+                          resolved.data.forEach(r => { if (r.hostname) lookup[r.ip] = r.hostname; });
+                          setScanResults(prev => prev.map(r => lookup[r.ip] ? { ...r, hostname: lookup[r.ip] } : r));
+                          const count = Object.keys(lookup).length;
+                          toast.success(count > 0 ? `Resolved ${count} hostname(s)` : 'No hostnames found (no PTR records)');
+                        }
+                      } catch (e) { toast.error('DNS resolution failed'); }
+                    }} disabled={scanning}>Resolve DNS</ActionButton>
                   </div>
+                </div>
+                <div className="mb-2">
+                  <Input value={scanSearch} onChange={e => setScanSearch(e.target.value)} placeholder="Search by IP or hostname…" className="font-mono text-[11px]" />
                 </div>
                 <div className="max-h-60 overflow-y-auto border border-border rounded">
                   <table className="w-full text-xs">
@@ -5269,7 +5523,7 @@
                       <th className="px-2 py-1 text-left text-meta text-text-dim uppercase">Hostname (auto)</th>
                     </tr></thead>
                     <tbody>
-                      {scanResults.map(r => (
+                      {filteredScanResults.map(r => (
                         <tr key={r.ip} className={`border-b border-border/50 ${r.alive ? 'hover:bg-surface-raised cursor-pointer' : 'opacity-50'}`} onClick={() => { if (r.alive) { const s = new Set(selectedScanIPs); if (s.has(r.ip)) s.delete(r.ip); else s.add(r.ip); setSelectedScanIPs(s); } }}>
                           <td className="px-2 py-1">{r.alive && <input type="checkbox" checked={selectedScanIPs.has(r.ip)} onChange={() => {}} className="accent-primary" />}</td>
                           <td className="px-2 py-1 font-mono text-text">{r.ip}</td>
@@ -5282,7 +5536,8 @@
                 </div>
                 <div className="text-xs text-text-dim mt-2">{selectedScanIPs.size} host(s) selected for import. Hostnames will be auto-generated — you can edit them after import.</div>
               </div>
-            )}
+              );
+            })()}
           </div>
         )}
 
@@ -5295,9 +5550,9 @@
 
             {/* AD Search Settings */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <FormField label="AD OU Path (optional)" hint="Leave empty to auto-detect. e.g. OU=Computers,DC=corp,DC=local" className="md:col-span-2">
+              <FormField label="AD OU Path (optional)" hint="Defaults to domain from Settings → Default Domain Credentials. e.g. OU=Computers,DC=corp,DC=local" className="md:col-span-2">
                 <div className="flex gap-1">
-                  <Input value={adOUPath} onChange={e => setAdOUPath(e.target.value)} placeholder="Auto-detect from domain (leave empty)" className="font-mono text-[11px]" />
+                  <Input value={adOUPath} onChange={e => setAdOUPath(e.target.value)} placeholder="Auto-detect from credential settings (leave empty)" className="font-mono text-[11px]" />
                   <ActionButton variant="secondary" size="sm" icon="Search" disabled={adAutoDetecting} onClick={async () => {
                     setAdAutoDetecting(true);
                     toast.info('Detecting domain from settings…');
@@ -5321,15 +5576,19 @@
             <div className="flex gap-2">
               <ActionButton variant="primary" size="sm" icon="Search" onClick={async () => {
                 toast.info('Searching AD using global domain credentials…');
+                setAdResults([]);
+                setSelectedADHosts(new Set());
                 if (window.SupportHubLANAPI) {
                   try {
                     const result = await fetch((window.SUPPORTHUBLAN_API_URL || 'http://localhost:8080') + '/api/hosts/discover-ad', {
                       method: 'POST', headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ ouPath: adOUPath, searchScope: adSearchScope, filter: adFilter, nameAttr: adNameAttr })
+                      body: JSON.stringify({ ouPath: adOUPath, searchScope: adSearchScope, filter: adFilter, nameAttr: adNameAttr, includeIP: adIncludeIP })
                     });
                     const data = await result.json();
                     if (data.success && data.hosts) {
-                      setPasteText(data.hosts.map(h => `${h.name},${h.ip || ''}`).join('\n'));
+                      const hosts = data.hosts.map(h => ({ name: h.name || '', fqdn: h.fqdn || '', ip: h.ip || '', os: h.os || '' }));
+                      setAdResults(hosts);
+                      setSelectedADHosts(new Set(hosts.map(h => h.name).filter(Boolean)));
                       toast.success(`Found ${data.hosts.length} computers in AD.`);
                       return;
                     } else if (data.error) {
@@ -5341,11 +5600,34 @@
                 toast.warning('Backend not connected — cannot search AD');
               }}>Search AD</ActionButton>
             </div>
-            {pasteText && (
+            {adResults.length > 0 && (
               <div>
-                <div className="text-meta text-text-dim uppercase mb-1">AD Search Results ({pasteText.split('\n').filter(Boolean).length} computers found)</div>
-                <div className="max-h-40 overflow-y-auto p-2 bg-surface-raised rounded border border-border font-mono text-[10px] text-text-dim">
-                  {pasteText.split('\n').filter(Boolean).map((line, i) => <div key={i}>{line}</div>)}
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-meta text-text-dim uppercase">AD Results — {selectedADHosts.size} of {adResults.length} selected</span>
+                  <div className="flex gap-1">
+                    <ActionButton size="xs" variant="ghost" onClick={() => setSelectedADHosts(new Set(adResults.map(h => h.name)))}>Select All</ActionButton>
+                    <ActionButton size="xs" variant="ghost" onClick={() => setSelectedADHosts(new Set())}>Clear</ActionButton>
+                  </div>
+                </div>
+                <div className="max-h-60 overflow-y-auto border border-border rounded">
+                  <table className="w-full text-xs">
+                    <thead><tr className="bg-surface-raised border-b border-border">
+                      <th className="px-2 py-1 w-8"></th>
+                      <th className="px-2 py-1 text-left text-meta text-text-dim uppercase">Hostname</th>
+                      <th className="px-2 py-1 text-left text-meta text-text-dim uppercase">IP Address</th>
+                      <th className="px-2 py-1 text-left text-meta text-text-dim uppercase">OS</th>
+                    </tr></thead>
+                    <tbody>
+                      {adResults.map((r, i) => (
+                        <tr key={i} className="border-b border-border/50 hover:bg-surface-raised">
+                          <td className="px-2 py-1"><input type="checkbox" checked={selectedADHosts.has(r.name)} onChange={() => { const s = new Set(selectedADHosts); if (s.has(r.name)) s.delete(r.name); else s.add(r.name); setSelectedADHosts(s); }} className="accent-primary" /></td>
+                          <td className="px-2 py-1 font-mono text-text">{r.name}{r.fqdn && r.fqdn !== r.name ? <span className="text-text-dim text-[10px] block">{r.fqdn}</span> : null}</td>
+                          <td className="px-2 py-1 font-mono text-text-dim">{r.ip || '—'}</td>
+                          <td className="px-2 py-1 text-text-dim">{r.os || '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
               </div>
             )}
@@ -6004,23 +6286,6 @@
 
         {activeTab === 'templates' && (
           <>
-          <SectionCard title="Copy Files / Folders to Remote Hosts" description="Standalone file copy operation — push files or folders to any number of remote hosts">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <FormField label="Source Path (UNC or local)" required><Input placeholder="\\\\fs01-hq\\share\\ChromeStandalone.exe" className="font-mono" /></FormField>
-              <FormField label="Destination Path" required><Input placeholder="C:\\temp\\" className="font-mono" /></FormField>
-              <FormField label="Copy Type"><Select defaultValue="file"><option value="file">Single File</option><option value="folder">Entire Folder</option></Select></FormField>
-              <FormField label="Overwrite if exists"><Select defaultValue="yes"><option value="yes">Yes</option><option value="no">No</option></Select></FormField>
-            </div>
-            <div className="mt-3 flex gap-2">
-              <ActionButton variant="primary" size="sm" icon="CopyFilesFoldersExecute" onClick={() => {
-                const targetIds = allHosts.filter(h => h.onlineStatus === 'online').slice(0, 5).map(h => h.id);
-                addJob({ id: 'job-' + Date.now(), name: `Copy Files — ${targetIds.length} hosts`, targets: targetIds, step: 'Copying (1/2)', progress: 10, startedAt: new Date().toISOString(), status: 'running' });
-                appendAudit({ action: 'deployments.copy-files', actionCategory: 'Deployments', targetType: 'Host', targetIds, parameters: {}, result: 'success' });
-                toast.success(`File copy started on ${targetIds.length} hosts — monitor in Job Queue.`);
-              }}>Copy Now</ActionButton>
-              <ActionButton variant="secondary" size="sm" icon="ListOrdered">Add to Queue</ActionButton>
-            </div>
-          </SectionCard>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
             {templates.map(t => (
               <button key={t.name} onClick={() => { setShowWizard(true); setWizardStep(0); setDep({...dep, packageType: t.type}); toast.info(`Loaded template: ${t.name}`); }} className="flex flex-col items-start gap-2 p-3 bg-surface-raised border border-border rounded-lg hover:border-primary/50 text-left">
@@ -6436,54 +6701,46 @@
     const [loadingServices, setLoadingServices] = useState(false);
 
     // Load services + processes when target host changes
-    useEffect(() => {
+    const fetchServicesAndProcesses = useCallback(async () => {
       if (!targetHost || !window.SupportHubLANAPI) return;
-      let cancelled = false;
-      (async () => {
-        setLoadingServices(true);
-        try {
-          const svcResult = await window.SupportHubLANAPI.getServices(targetHost.hostname, null);
-          if (cancelled) return;
-          if (svcResult && svcResult.success && !svcResult.demo) {
-            let svcs = [];
-            try { svcs = JSON.parse(svcResult.data); } catch { svcs = []; }
-            const arr = Array.isArray(svcs) ? svcs : [svcs];
-            setServices(arr.map(s => ({
-              name: s.Name || s.name || '',
-              display: s.DisplayName || s.display || s.Name || '',
-              status: s.State || s.status || 'Unknown',
-              startType: s.StartMode || s.startType || '',
-              pid: null,
-              logOnAs: s.StartName || s.logOnAs || '',
-            })));
-          } else {
-            setServices([]);
-          }
-        } catch (e) { if (!cancelled) setServices([]); }
+      setLoadingServices(true);
+      try {
+        const svcResult = await window.SupportHubLANAPI.getServices(targetHost.hostname, null);
+        if (svcResult && svcResult.success && !svcResult.demo) {
+          let svcs = [];
+          try { svcs = JSON.parse(svcResult.data); } catch { svcs = []; }
+          const arr = Array.isArray(svcs) ? svcs : [svcs];
+          setServices(arr.map(s => ({
+            name: s.Name || s.name || '',
+            display: s.DisplayName || s.display || s.Name || '',
+            status: s.State || s.status || 'Unknown',
+            startType: s.StartMode || s.startType || '',
+            pid: null,
+            logOnAs: s.StartName || s.logOnAs || '',
+          })));
+        } else { setServices([]); }
+      } catch (e) { setServices([]); }
 
-        try {
-          const procResult = await window.SupportHubLANAPI.getProcesses(targetHost.hostname, null);
-          if (cancelled) return;
-          if (procResult && procResult.success && !procResult.demo) {
-            let procs = [];
-            try { procs = JSON.parse(procResult.data); } catch { procs = []; }
-            const arr = Array.isArray(procs) ? procs : [procs];
-            setProcesses(arr.map(p => ({
-              pid: p.ProcessId || p.pid || 0,
-              name: p.Name || p.name || '',
-              cpu: parseFloat(p.PercentProcessorTime || p.cpu || 0),
-              mem: parseFloat(p.WorkingSetSize || p.mem || 0) / 1024,
-              user: '',
-              startTime: p.CreationDate || p.startTime || '',
-            })));
-          } else {
-            setProcesses([]);
-          }
-        } catch (e) { if (!cancelled) setProcesses([]); }
-        if (!cancelled) setLoadingServices(false);
-      })();
-      return () => { cancelled = true; };
-    }, [selectedTargets[0]]);
+      try {
+        const procResult = await window.SupportHubLANAPI.getProcesses(targetHost.hostname, null);
+        if (procResult && procResult.success && !procResult.demo) {
+          let procs = [];
+          try { procs = JSON.parse(procResult.data); } catch { procs = []; }
+          const arr = Array.isArray(procs) ? procs : [procs];
+          setProcesses(arr.map(p => ({
+            pid: p.ProcessId || p.pid || 0,
+            name: p.Name || p.name || '',
+            cpu: parseFloat(p.CPU || p.cpu || 0),
+            mem: parseFloat(p.MemMB || p.mem || p.WorkingSetSize || 0),
+            user: '',
+            startTime: p.CreationDate || p.startTime || '',
+          })));
+        } else { setProcesses([]); }
+      } catch (e) { setProcesses([]); }
+      setLoadingServices(false);
+    }, [targetHost]);
+
+    useEffect(() => { fetchServicesAndProcesses(); }, [selectedTargets[0]]);
 
     const targetHost = hosts.find(h => h.id === selectedTargets[0]);
 
@@ -6603,7 +6860,7 @@
             )}
 
             {activeTab === 'processes' && (
-              <SectionCard title={`Processes on ${targetHost?.hostname || '—'}`} description={`${processes.length} processes`} actions={<div className="flex gap-1"><ActionButton variant="ghost" size="xs" icon="ListTree">Tree View</ActionButton><ActionButton variant="ghost" size="xs" icon="RefreshCw" onClick={() => { setProcesses(prev => prev.map(p => ({...p, cpu: Math.random() * 15 + 0.1, mem: Math.floor(Math.random() * 5000) + 10}))); toast.success('Process list refreshed.'); }}>Refresh</ActionButton></div>}>
+              <SectionCard title={`Processes on ${targetHost?.hostname || '—'}`} description={`${processes.length} processes`} actions={<div className="flex gap-1"><ActionButton variant="ghost" size="xs" icon="ListTree">Tree View</ActionButton><ActionButton variant="ghost" size="xs" icon="RefreshCw" onClick={() => { fetchServicesAndProcesses(); toast.success('Process list refreshed.'); }}>Refresh</ActionButton></div>}>
                 <DataTable
                   selectable={false}
                   columns={[
@@ -8437,6 +8694,51 @@
     );
   };
 
+  // Domain Suffix Section — simple domain suffix for FQDN resolution
+  const DomainSuffixSection = () => {
+    const toast = useToast();
+    const [domain, setDomain] = useState('');
+    const [source, setSource] = useState('');
+    const [loading, setLoading] = useState(false);
+
+    useEffect(() => {
+      if (window.SupportHubLANAPI) {
+        window.SupportHubLANAPI.getDomainSuffix().then(r => {
+          if (r && r.success && r.data) {
+            setDomain(r.data.domain || '');
+            setSource(r.data.source || '');
+          }
+        }).catch(() => {});
+      }
+    }, []);
+
+    const save = async () => {
+      setLoading(true);
+      try {
+        if (window.SupportHubLANAPI) {
+          const r = await window.SupportHubLANAPI.setDomainSuffix(domain.trim());
+          if (r && r.success && !r.demo) {
+            toast.success('Domain suffix saved. Short hostnames will now resolve to FQDN.');
+          } else {
+            toast.warning('Backend not connected');
+          }
+        }
+      } catch (e) { toast.error('Save failed: ' + e.message); }
+      setLoading(false);
+    };
+
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+        <FormField label="Domain (e.g. plant.fccl.com)" hint={source === 'env' ? 'Set from .env DEFAULT_DOMAIN' : 'Leave blank for no suffix'}>
+          <Input placeholder="plant.fccl.com" value={domain} onChange={e => setDomain(e.target.value)} />
+        </FormField>
+        <div className="flex gap-2">
+          <ActionButton variant="primary" icon="Save" loading={loading} onClick={save}>Save</ActionButton>
+        </div>
+      </div>
+    );
+  };
+
   // Domain Credentials Section — used in Settings → General
   const DomainCredentialsSection = () => {
     const toast = useToast();
@@ -8480,10 +8782,17 @@
     };
 
     const test = async () => {
+      if (!username) { toast.warning('Enter a username first'); return; }
       setTesting(true);
       try {
         if (window.SupportHubLANAPI) {
-          const r = await window.SupportHubLANAPI.testDomainCredentials();
+          // If user typed a password, test those credentials; otherwise test saved ones
+          const pwd = password || null;
+          const r = await window.SupportHubLANAPI.testDomainCredentials(
+            username,
+            pwd,
+            domain
+          );
           if (r && r.success) {
             toast.success(`Credentials valid — identity: ${r.identity || 'confirmed'}`);
           } else if (r && r.demo) {
@@ -8511,12 +8820,12 @@
         </div>
         <div className="flex items-center gap-2">
           <ActionButton variant="primary" icon="Save" disabled={loading} onClick={save}>{loading ? 'Saving…' : 'Save Credentials'}</ActionButton>
-          <ActionButton variant="secondary" icon="Plug" disabled={testing || !hasPassword} onClick={test}>{testing ? 'Testing…' : 'Test Credentials'}</ActionButton>
+          <ActionButton variant="secondary" icon="Plug" disabled={testing || !username} onClick={test}>{testing ? 'Testing…' : username ? (password ? 'Test New Credentials' : 'Test Saved Credentials') : 'Test Credentials'}</ActionButton>
           {hasPassword && <span className="text-[10px] text-success flex items-center gap-1"><Icon name="CheckCircle" size={12} /> Credentials configured</span>}
         </div>
         <div className="text-[10px] text-text-dim">
           <Icon name="Info" size={12} className="inline mr-1" />
-          These credentials are automatically used for: hardware scans, service management, process listing,
+          Save credentials before testing — the test validates the currently stored credentials against the domain. These credentials are automatically used for: hardware scans, service management, process listing,
           Windows Updates, power actions (reboot/shutdown), and script execution. The account must have
           administrative rights on the target PCs (Domain Admin or local admin).
         </div>
@@ -8524,9 +8833,66 @@
     );
   };
 
+  const FallbackCredentialsSection = () => {
+    const toast = useToast();
+    const [username, setUsername] = useState('');
+    const [password, setPassword] = useState('');
+    const [hasPassword, setHasPassword] = useState(false);
+    const [loading, setLoading] = useState(false);
+
+    useEffect(() => {
+      if (window.SupportHubLANAPI) {
+        window.SupportHubLANAPI.getFallbackCredentials().then(r => {
+          if (r && r.success && !r.demo && r.data) {
+            setUsername(r.data.username || '');
+            setHasPassword(r.data.hasPassword || false);
+          }
+        }).catch(() => {});
+      }
+    }, []);
+
+    const save = async () => {
+      if (!username || !password) { toast.warning('Username and password are required'); return; }
+      setLoading(true);
+      try {
+        if (window.SupportHubLANAPI) {
+          const r = await window.SupportHubLANAPI.setFallbackCredentials(username, password, '');
+          if (r && r.success && !r.demo) {
+            setHasPassword(true);
+            setPassword('');
+            toast.success('Fallback credentials saved');
+          } else if (r && r.demo) { toast.warning('Backend not connected'); }
+          else { toast.error('Failed to save'); }
+        }
+      } catch (e) { toast.error('Save failed: ' + e.message); }
+      setLoading(false);
+    };
+
+    return (
+      <div className="space-y-3">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <FormField label="Username" hint="Local admin account (e.g. Administrator)">
+            <Input value={username} onChange={e => setUsername(e.target.value)} placeholder="Administrator" className="font-mono" />
+          </FormField>
+          <FormField label="Password" hint={hasPassword ? 'Saved — enter new to replace' : 'Enter password'}>
+            <Input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder={hasPassword ? '•••••••• (saved)' : '••••••••'} className="font-mono" />
+          </FormField>
+        </div>
+        <div className="flex items-center gap-2">
+          <ActionButton variant="primary" icon="Save" disabled={loading} onClick={save}>{loading ? 'Saving…' : 'Save Fallback Credentials'}</ActionButton>
+          {hasPassword && <span className="text-[10px] text-success flex items-center gap-1"><Icon name="CheckCircle" size={12} /> Fallback credentials configured</span>}
+        </div>
+        <div className="text-[10px] text-text-dim">
+          <Icon name="Info" size={12} className="inline mr-1" />
+          Used when no AD domain credentials are set. Authenticates as <span className="font-mono">PC-NAME\username</span> using the target hostname from inventory.
+        </div>
+      </div>
+    );
+  };
+
   const SettingsScreen = () => {
     const toast = useToast();
-    const { users, addUser, updateUser, removeUser, appendAudit, theme, setTheme, applyTheme, apiKeys, addApiKey, removeApiKey, maintenanceWindows, addMaintenanceWindow, removeMaintenanceWindow, notificationRules, updateNotificationRule } = useApp();
+    const { users, addUser, updateUser, removeUser, appendAudit, theme, setTheme, applyTheme, apiKeys, addApiKey, removeApiKey, maintenanceWindows, addMaintenanceWindow, removeMaintenanceWindow, notificationRules, updateNotificationRule, autoStatusMinutes, setAutoStatusMinutes } = useApp();
     const [remoteDesktopProtocol, setRemoteDesktopProtocol] = useState(() => { try { return localStorage.getItem('supporthublan:rdp-protocol') || 'VNC'; } catch(e) { return 'VNC'; } });
     const [activeTab, setActiveTab] = useState('general');
     const [showInvite, setShowInvite] = useState(false);
@@ -8632,14 +8998,26 @@
                 </Select></FormField>
                 <FormField label="Default Table Density"><Select defaultValue="default"><option value="compact">Compact</option><option value="default">Default</option><option value="comfortable">Comfortable</option></Select></FormField>
                 <FormField label="Session Timeout (minutes)"><Input type="number" defaultValue={30} /></FormField>
+                <FormField label="Auto-check Online Status (minutes)" hint="0 = disabled. Pings all hosts every N minutes to update online/offline.">
+                  <Input type="number" min="0" max="1440" value={autoStatusMinutes} onChange={e => { const v = parseInt(e.target.value) || 0; setAutoStatusMinutes(Math.max(0, Math.min(1440, v))); if (v === 0) toast.info('Auto status check disabled'); else toast.info(`Will check online status every ${v} minute(s)`); }} className="font-mono" />
+                </FormField>
                 <FormField label="Auto-open browser on backend startup"><Select defaultValue="Yes"><option>Yes</option><option>No</option></Select></FormField>
               </div>
               <div className="mt-3"><ActionButton variant="primary" icon="Check" onClick={() => { appendAudit({ action: 'settings.general-save', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: {}, result: 'success' }); toast.success('General settings saved.'); }}>Save</ActionButton></div>
             </SectionCard>
 
+            {/* Domain Suffix — converts short hostnames to FQDN */}
+            <SectionCard title="Default Domain Suffix" description="Appended to short hostnames when running commands. E.g. mis-pc-03708 + plant.fccl.com = mis-pc-03708.plant.fccl.com. Only for domain-joined PCs.">
+              <DomainSuffixSection />
+            </SectionCard>
+
             {/* Domain Credentials — used by ALL remote commands */}
             <SectionCard title="Default Domain Credentials" description="Domain admin credentials used for ALL remote commands (hardware scan, services, processes, updates, power, scripts). Without these, remote commands will fail with 'Access Denied'.">
               <DomainCredentialsSection />
+            </SectionCard>
+
+            <SectionCard title="Fallback Credentials (Local Admin)" description="Used when no domain credentials are configured. Enter a local admin user/password for computers that don't use Active Directory.">
+              <FallbackCredentialsSection />
             </SectionCard>
 
             {/* Log Retention Setting */}
@@ -8714,7 +9092,6 @@
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   <FormField label="Sidebar Default"><Select defaultValue="Expanded"><option>Expanded</option><option>Icon-only</option></Select></FormField>
-                  <FormField label="Bottom Terminal Panel"><Select defaultValue={localStorage.getItem('supporthublan:terminal-collapsed') === '1' ? 'Collapsed' : 'Expanded'} onChange={(e) => { try { localStorage.setItem('supporthublan:terminal-collapsed', e.target.value === 'Collapsed' ? '1' : '0'); } catch {} window.location.reload(); }}><option>Expanded</option><option>Collapsed</option></Select></FormField>
                   <FormField label="Show Status Badges in Grid"><Select defaultValue="Yes"><option>Yes</option><option>No</option></Select></FormField>
                   <FormField label="Auto-refresh Host Status (seconds)"><Input type="number" defaultValue={60} /></FormField>
                 </div>
@@ -8760,7 +9137,7 @@
                 toast.info('Testing AD connection…');
                 if (window.SupportHubLANAPI) {
                   try {
-                    const r = await window.SupportHubLANAPI.apiCall('/api/hosts/discover-ad', { ouPath: 'OU=Computers,DC=corp,DC=local', searchScope: 'subtree' });
+                    const r = await fetch(`${window.SUPPORTHUBLAN_API_URL}/api/hosts/discover-ad`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ ouPath: 'OU=Computers,DC=corp,DC=local', searchScope: 'subtree' }) }).then(r => r.json());
                     if (r.success && !r.demo) toast.success(`AD connection OK — found hosts`);
                     else if (r.demo) toast.warning('AD test skipped — backend not connected');
                     else toast.error('AD test failed', { detail: r.error, duration: 8000 });
@@ -9220,9 +9597,7 @@
                   { op: 'Process Kill', endpoint: '/api/processes/:hostname/kill', status: 'wired' },
                   { op: 'Reboot/Shutdown', endpoint: '/api/power/action', status: 'wired' },
                   { op: 'Wake on LAN', endpoint: '/api/power/wol', status: 'wired' },
-                  { op: 'Check Pending Reboot', endpoint: '/api/power/check-pending', status: 'wired' },
                   { op: 'Job Queue Execution', endpoint: '/api/queues/execute', status: 'wired' },
-                  { op: 'Copy Files/Folders', endpoint: '/api/deployments/copy', status: 'wired' },
                 ].map((item, i) => (
                   <div key={i} className="flex items-center gap-2 p-1.5 hover:bg-surface-raised rounded text-xs">
                     <Icon name="CheckCircle2" size={12} className="text-success" />
@@ -9306,7 +9681,7 @@
       { keys: 'g t', desc: 'Go to Settings' },
     ];
     return (
-      <div className="fixed inset-0 z-[60] flex items-start justify-center p-4 animate-fadeIn" style={{ background: 'rgba(0,0,0,0.7)' }} onClick={onClose}>
+      <div className="fixed inset-0 z-[60] flex items-start justify-center p-4 animate-fadeIn" style={{ background: 'rgba(0,0,0,0.7)' }}>
         <div className="mt-20 w-full max-w-lg bg-surface border border-border rounded-lg shadow-raised" onClick={e => e.stopPropagation()}>
           <div className="flex items-center justify-between p-4 border-b border-border">
             <h3 className="text-base font-semibold text-text">Keyboard Shortcuts</h3>
@@ -9389,29 +9764,163 @@
     }));
 
     // ---- Mutators ----
+    const [liveHostsLoaded, setLiveHostsLoaded] = useState(false);
+    // Refresh hosts from backend - reloads all hosts and optionally pings for online status
+    const refreshHostsFromBackend = useCallback(async (pingForStatus = false) => {
+      if (!window.SupportHubLANAPI) return;
+      try {
+        const available = await window.SupportHubLANAPI.isBackendAvailable();
+        if (!available) return;
+        const invResp = await fetch(window.SUPPORTHUBLAN_API_URL + '/api/inventories');
+        const invJson = await invResp.json();
+        if (!invJson.success || !invJson.data || invJson.data.length === 0) return;
+        const active = invJson.data.find(i => i.is_active === 1) || invJson.data[0];
+        const hostsResp = await fetch(window.SUPPORTHUBLAN_API_URL + '/api/inventories/' + active.id + '/hosts');
+        const hostsJson = await hostsResp.json();
+        if (!hostsJson.success) return;
+        const backendHosts = (hostsJson.data || []).map(h => ({
+          id: 'db-' + h.id,
+          hostname: h.hostname,
+          ipAddress: h.ip_address || '',
+          macAddress: h.mac_address || '',
+          fqdn: h.fqdn || '',
+          osName: h.os || 'Windows',
+          osVersion: h.os_version || '',
+          osBuild: h.build || '',
+          cpuModel: h.cpu || '',
+          ramGb: h.ram ? Math.round(parseInt(h.ram) / 1024) : 0,
+          onlineStatus: h.online_status || 'unknown',
+          pingStatus: h.online_status === 'online' ? 'up' : h.online_status === 'offline' ? 'down' : 'unknown',
+          patchState: h.patch_state || 'unknown',
+          pendingReboot: h.pending_reboot === 1,
+          lastSeen: h.last_seen,
+          site: h.site || '',
+          owner: h.owner || '',
+          department: h.department || '',
+          tags: h.tags ? (typeof h.tags === 'string' ? h.tags.split(',').filter(Boolean) : h.tags) : [],
+          notes: h.notes || '',
+          loggedOnUsers: [],
+          loggedOnUser: h.logged_on_user || '',
+          _fromBackend: true,
+          _inventoryId: h.inventory_id,
+        }));
+        // Update hosts from backend (including empty list after delete-all)
+        setHosts(prev => {
+          const prevMap = {};
+          prev.forEach(p => { prevMap[p.id] = p; });
+          return backendHosts.map(nh => {
+            const old = prevMap[nh.id];
+            if (old) {
+              nh._hardwareInfo = old._hardwareInfo;
+              nh._lastApps = old._lastApps;
+              nh._rowColor = old._rowColor;
+            }
+            return nh;
+          });
+        });
+        setLiveHostsLoaded(true);
+        setLastRefresh(new Date().toISOString());
+
+        if (pingForStatus && backendHosts.length > 0) {
+            try {
+              const hostnames = [...new Set(backendHosts.map(h => h.hostname).filter(Boolean))];
+              // 1. Ping for online/offline
+              const statusResult = await window.SupportHubLANAPI.checkHostStatus(hostnames);
+              if (statusResult && statusResult.success && !statusResult.demo) {
+                let parsed;
+                try { parsed = JSON.parse(statusResult.data); } catch { parsed = []; }
+                const arr = Array.isArray(parsed) ? parsed : [parsed];
+                const statusMap = {};
+                arr.forEach(r => { if (r.hostname) statusMap[r.hostname] = r.online ? 'online' : 'offline'; });
+                setHosts(prev => prev.map(h => {
+                  const newStatus = statusMap[h.hostname];
+                  if (newStatus) {
+                    return { ...h, onlineStatus: newStatus, pingStatus: newStatus === 'online' ? 'up' : 'down', lastSeen: newStatus === 'online' ? new Date().toISOString() : h.lastSeen };
+                  }
+                  return h;
+                }));
+              }
+              // 2. Pull live data (OS, build, disk, logged-in user) via PsTools for online hosts
+              const onlineHostnames = hostnames.filter(name => {
+                const s = statusMap[name];
+                return s === 'online';
+              });
+              if (onlineHostnames.length > 0) {
+                const infoResult = await window.SupportHubLANAPI.batchHostInfo(onlineHostnames);
+                if (infoResult && infoResult.success && infoResult.data && !infoResult.demo) {
+                  const infoData = Array.isArray(infoResult.data) ? infoResult.data : [];
+                  const infoMap = {};
+                  infoData.forEach(r => { if (r.hostname && !r.error) infoMap[r.hostname] = r; });
+                  if (Object.keys(infoMap).length > 0) {
+                    setHosts(prev => prev.map(h => {
+                      const info = infoMap[h.hostname];
+                      if (info) {
+                        return {
+                          ...h,
+                          osName: info.osName || h.osName,
+                          osVersion: info.osVersion || h.osVersion,
+                          osBuild: info.osBuild || h.osBuild,
+                          diskUsedGb: info.diskUsedGb != null ? info.diskUsedGb : h.diskUsedGb,
+                          loggedOnUser: info.loggedOnUser || h.loggedOnUser || '',
+                        };
+                      }
+                      return h;
+                    }));
+                  }
+                }
+              }
+            } catch (e) { /* ping/info failed, keep DB status */ }
+          }
+      } catch (e) { /* silently fail */ }
+    }, [liveHostsLoaded, setLastRefresh]);
     const addHosts = useCallback((newHosts) => {
-      setHosts(prev => [...prev, ...newHosts]);
-      // Persist to backend when LIVE
+      // Duplicate detection: skip hosts with same hostname or IP
+      setHosts(prev => {
+        const existingNames = new Set(prev.map(h => h.hostname.toLowerCase()));
+        const existingIps = new Set(prev.map(h => (h.ipAddress || '').toLowerCase()).filter(Boolean));
+        const duplicates = [];
+        const unique = [];
+        for (const nh of newHosts) {
+          const name = (nh.hostname || '').toLowerCase();
+          const ip = (nh.ipAddress || '').toLowerCase();
+          if (existingNames.has(name) || (ip && existingIps.has(ip))) {
+            duplicates.push(nh.hostname || ip);
+          } else {
+            unique.push(nh);
+            existingNames.add(name);
+            if (ip) existingIps.add(ip);
+          }
+        }
+        if (duplicates.length > 0) {
+          console.warn(`[addHosts] Skipped ${duplicates.length} duplicate(s): ${duplicates.slice(0, 10).join(', ')}`);
+          setTimeout(() => {
+            try { window._supporthublanToast?.warning(`Skipped ${duplicates.length} duplicate(s): ${duplicates.slice(0, 3).join(', ')}${duplicates.length > 3 ? '...' : ''}`); } catch {}
+          }, 200);
+        }
+        return [...prev, ...unique];
+      });
+      // Persist to backend when LIVE, then refresh and check online status
       if (window.SupportHubLANAPI && window._supporthublanBackendStatus === 'connected') {
         (async () => {
           try {
-            // Get active inventory
             const invResp = await fetch(window.SUPPORTHUBLAN_API_URL + '/api/inventories');
             const invJson = await invResp.json();
             if (!invJson.success || !invJson.data || invJson.data.length === 0) return;
             const active = invJson.data.find(i => i.is_active === 1) || invJson.data[0];
-            // Bulk upsert hosts
             await fetch(window.SUPPORTHUBLAN_API_URL + '/api/inventories/' + active.id + '/hosts/bulk', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ hosts: newHosts }),
             });
+            // Refresh from backend, then check online status for added hosts
+            setTimeout(() => refreshHostsFromBackend(), 511);
+            setTimeout(() => refreshHostsFromBackend(true), 2600);
           } catch (e) {
-            console.log('[addHosts] Failed to persist to backend:', e.message);
+            // Failed to persist to backend, host exists in local state only
           }
         })();
       }
-    }, []);
+    }, [refreshHostsFromBackend]);
     const updateHost = useCallback((id, patch) => {
       setHosts(prev => prev.map(h => h.id === id ? { ...h, ...patch } : h));
     }, []);
@@ -9775,69 +10284,36 @@
       return () => clearInterval(i);
     }, []);
 
+    // Auto status check — ping all hosts every N minutes to update online/offline
+    const [autoStatusMinutes, setAutoStatusMinutes] = useState(() => loadPersisted('autoStatusMinutes', 10));
+    useEffect(() => {
+      if (autoStatusMinutes <= 0) return; // 0 = disabled
+      // Do an initial check after 3s (wait for hosts to load from backend)
+      const initial = setTimeout(() => { refreshHostsFromBackend(true); }, 3000);
+      const interval = setInterval(() => { refreshHostsFromBackend(true); }, autoStatusMinutes * 60000);
+      return () => { clearTimeout(initial); clearInterval(interval); };
+    }, [autoStatusMinutes, refreshHostsFromBackend]);
+
+    // Persist auto status minutes
+    useEffect(() => {
+      try { localStorage.setItem('supporthublan:autoStatusMinutes', JSON.stringify(autoStatusMinutes)); } catch {}
+    }, [autoStatusMinutes]);
+
     // ---- Sync hosts from backend when LIVE ----
-    // When the backend is connected, load real hosts from the encrypted store
-    // instead of the hardcoded demo seed data. Polls every 30s to pick up changes
-    // made from other tabs or via the API. When backend goes offline, keeps the
-    // last-known hosts (doesn't blow them away).
-    const [liveHostsLoaded, setLiveHostsLoaded] = useState(false);
+    // Polls every 30s to pick up changes made from other tabs or via the API.
+    // On the first successful load, also pings all hosts for real online/offline.
     useEffect(() => {
       let cancelled = false;
-      async function loadHostsFromBackend() {
-        if (!window.SupportHubLANAPI) return;
-        try {
-          const available = await window.SupportHubLANAPI.isBackendAvailable();
-          if (!available || cancelled) return;
-          // Fetch the active inventory's hosts
-          const invResp = await fetch(window.SUPPORTHUBLAN_API_URL + '/api/inventories');
-          const invJson = await invResp.json();
-          if (!invJson.success || !invJson.data || invJson.data.length === 0 || cancelled) return;
-          const active = invJson.data.find(i => i.is_active === 1) || invJson.data[0];
-          const hostsResp = await fetch(window.SUPPORTHUBLAN_API_URL + '/api/inventories/' + active.id + '/hosts');
-          const hostsJson = await hostsResp.json();
-          if (!hostsJson.success || cancelled) return;
-          // Convert backend host format (snake_case) to frontend format (camelCase)
-          const backendHosts = (hostsJson.data || []).map(h => ({
-            id: 'db-' + h.id,
-            hostname: h.hostname,
-            ipAddress: h.ip_address || '',
-            macAddress: h.mac_address || '',
-            fqdn: h.fqdn || '',
-            osName: h.os || 'Windows',
-            osVersion: '',
-            osBuild: '',
-            onlineStatus: h.online_status || 'unknown',
-            pingStatus: h.online_status === 'online' ? 'up' : h.online_status === 'offline' ? 'down' : 'unknown',
-            patchState: h.patch_state || 'unknown',
-            pendingReboot: h.pending_reboot === 1,
-            lastSeen: h.last_seen,
-            site: h.site || '',
-            owner: h.owner || '',
-            department: h.department || '',
-            tags: h.tags ? (typeof h.tags === 'string' ? h.tags.split(',').filter(Boolean) : h.tags) : [],
-            notes: h.notes || '',
-            loggedOnUsers: [],  // Always initialize to empty array (prevents .length crash)
-            _fromBackend: true,
-            _inventoryId: h.inventory_id,
-          }));
-          if (!cancelled && backendHosts.length > 0) {
-            // Replace the demo seed data with real backend hosts
-            setHosts(backendHosts);
-            setLiveHostsLoaded(true);
-          } else if (!cancelled && !liveHostsLoaded) {
-            // First load with empty backend — clear the demo seed data so the user
-            // sees an empty inventory (not fake hosts) when LIVE
-            setHosts([]);
-            setLiveHostsLoaded(true);
-          }
-        } catch (e) {
-          // Silently fail — keep current hosts
-        }
-      }
-      loadHostsFromBackend();
-      const interval = setInterval(loadHostsFromBackend, 30000);
+      let firstLoad = !liveHostsLoaded;
+      const load = async () => {
+        if (cancelled || !window.SupportHubLANAPI) return;
+        await refreshHostsFromBackend(firstLoad && liveHostsLoaded === false);
+        firstLoad = false;
+      };
+      load();
+      const interval = setInterval(load, 30000);
       return () => { cancelled = true; clearInterval(interval); };
-    }, [liveHostsLoaded]);
+    }, [refreshHostsFromBackend, liveHostsLoaded]);
 
     // ---- Apply theme class to <html> + persist ----
     useEffect(() => {
@@ -10012,7 +10488,8 @@
       hosts, activeJobs, savedQueues, queueDraft, auditEvents,
       users, patchHistory, deploymentHistory, jobLogs,
       // mutators
-      addHosts, updateHost, updateHosts, addJob, updateJob, removeJob, addSavedQueue, setQueueDraft,
+      setHosts, addHosts, updateHost, updateHosts, addJob, updateJob, removeJob, addSavedQueue, setQueueDraft,
+      refreshHostsFromBackend,
       appendAudit, clearPersistedState,
       addUser, updateUser, removeUser, addPatchHistory, addDeploymentHistory, addJobLog,
       executePowerAction, executeDeployment, executeScript,
@@ -10020,6 +10497,7 @@
       updateNotificationRule, apiKeys, maintenanceWindows, notificationRules,
       savedCommands, addSavedCommand,
       scheduledTasks, addScheduledTask,
+      autoStatusMinutes, setAutoStatusMinutes,
     };
 
     const renderScreen = () => {
@@ -10050,14 +10528,10 @@
               <div className="hidden lg:block">
                 <Sidebar collapsed={sidebarCollapsed} />
               </div>
-              {/* Mobile nav drawer — slides in from the LEFT, stops above the terminal panel.
-                  Sidebar is the FIRST flex child (flush with left edge), backdrop fills the rest.
-                  Bottom offset = terminal height + status bar (28px) so the terminal stays visible. */}
-              {mobileNavOpen && (() => {
-                let th = 80;
-                try { th = parseInt(localStorage.getItem('supporthublan:terminal-height') || '80', 10); if (isNaN(th) || th < 60) th = 80; } catch {}
-                return (
-                  <div className="lg:hidden fixed left-0 right-0 top-0 flex" style={{ bottom: (th + 28) + 'px', zIndex: 50 }}>
+              {/* Mobile nav drawer — slides in from the LEFT.
+                  Sidebar is the FIRST flex child (flush with left edge), backdrop fills the rest. */}
+              {mobileNavOpen && (
+                  <div className="lg:hidden fixed left-0 right-0 top-0 flex" style={{ bottom: '28px', zIndex: 50 }}>
                     {/* Sidebar FIRST — flush with the left edge of the screen */}
                     <div className="w-52 max-w-[80vw] bg-surface border-r border-border flex flex-col flex-shrink-0">
                       <Sidebar collapsed={false} fullWidth={true} onNavigate={() => setMobileNavOpen(false)} />
@@ -10065,16 +10539,14 @@
                     {/* Backdrop fills the remaining space to the right — click to close */}
                     <div className="flex-1 bg-black/60 min-w-0" onClick={() => setMobileNavOpen(false)} />
                   </div>
-                );
-              })()}
-              {/* Main workspace — vertical split: content (top) + terminal panel (bottom) */}
+                )}
+              {/* Main workspace */}
               <div className="flex-1 flex flex-col overflow-hidden min-w-0">
                 <main id="workspace" className="flex-1 overflow-y-auto p-4 bg-bg" style={{ minHeight: '120px' }}>
                   {renderScreen()}
                 </main>
-                <TerminalPanel />
               </div>
-              {/* Right Drawer — inline (flexbox sibling) so terminal does not extend underneath.
+              {/* Right Drawer — inline (flexbox sibling).
                   When open, the main workspace shrinks to make room. Drawer scrolls independently. */}
               <RightDrawerInline open={drawer.open} kind={drawer.kind} data={drawer.data} onClose={closeDrawer} />
             </div>
@@ -10083,342 +10555,6 @@
           </div>
         </ToastProvider>
       </AppCtx.Provider>
-    );
-  };
-
-  // ============================================================
-  // TERMINAL PANEL — VSCode-style bottom panel for live logs + PsTools command input
-  // ============================================================
-  const TerminalPanel = () => {
-    const { activeJobs, auditEvents } = useApp();
-    const [collapsed, setCollapsed] = useState(() => { try { return localStorage.getItem('supporthublan:terminal-collapsed') === '1'; } catch { return false; } });
-    // Default 3 lines tall (~80px) — user can drag to resize.
-    // IMPORTANT: Clamp stored value to a safe max on load to prevent the panel
-    // from covering the whole screen if a stale value is in localStorage.
-    const [height, setHeight] = useState(() => {
-      try {
-        let stored = parseInt(localStorage.getItem('supporthublan:terminal-height') || '80', 10);
-        // v1.4.7 migration: reset any stored value > 40% of viewport to the default 80px.
-        // This fixes users who have a stale large value from v1.3 (280px) or accidental drags.
-        const maxH = Math.floor(window.innerHeight * 0.4);
-        if (isNaN(stored) || stored < 60 || stored > maxH) {
-          stored = 80;
-          try { localStorage.setItem('supporthublan:terminal-height', '80'); } catch {}
-        }
-        return stored;
-      } catch { return 80; }
-    });
-    const [resizing, setResizing] = useState(false);
-    const [activeTab, setActiveTab] = useState('all'); // all | current | errors | terminal
-    const [lines, setLines] = useState([]);
-    const [command, setCommand] = useState('');
-    const [history, setHistory] = useState([]);
-    const [historyIdx, setHistoryIdx] = useState(-1);
-    const [running, setRunning] = useState(false);
-    const [sessionId] = useState(() => 'term-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
-    const [autoScroll, setAutoScroll] = useState(true);
-    const scrollRef = useRef(null);
-    const inputRef = useRef(null);
-    const linesRef = useRef([]);
-
-    // Append a line — declared FIRST because it's referenced by useEffects below
-    // (must be defined before use to avoid temporal dead zone ReferenceError)
-    const appendLine = useCallback((line, stream = 'info') => {
-      const ts = new Date().toLocaleTimeString();
-      setLines(prev => [...prev.slice(-500), { ts, line: String(line), stream }]); // cap at 500 lines
-    }, []);
-
-    // Persist collapsed state
-    useEffect(() => { try { localStorage.setItem('supporthublan:terminal-collapsed', collapsed ? '1' : '0'); } catch {} }, [collapsed]);
-
-    // Listen for "open terminal and run command" events from the inventory row "Cmd" button
-    useEffect(() => {
-      const handler = (e) => {
-        const { command, host } = e.detail || {};
-        // Expand the panel
-        setCollapsed(false);
-        // Switch to the Terminal tab so the input is visible
-        setActiveTab('terminal');
-        // Auto-run the command after a tick (give the panel time to expand)
-        setTimeout(() => {
-          if (command && window._supporthublanWs && window._supporthublanWs.readyState === 1) {
-            setHistory(prev => [...prev.slice(-50), command]);
-            setHistoryIdx(-1);
-            setRunning(true);
-            window._supporthublanWs.send(JSON.stringify({ type: 'terminal-run', command, sessionId }));
-            appendLine(`\x1b[36m$ ${command}\x1b[0m\r\n`, 'command');
-          } else if (command) {
-            appendLine(`\x1b[33mQueued: ${command}\x1b[0m\r\nWebSocket not ready yet — click in the terminal input and press Enter to retry.`, 'stderr');
-          }
-          // Focus the input
-          setTimeout(() => inputRef.current?.focus(), 200);
-        }, 250);
-      };
-      window.addEventListener('supporthublan:terminal-open', handler);
-      return () => window.removeEventListener('supporthublan:terminal-open', handler);
-    }, [sessionId, appendLine]);
-
-    // Persist height
-    useEffect(() => { try { localStorage.setItem('supporthublan:terminal-height', String(height)); } catch {} }, [height]);
-
-    // Drag-to-resize handler (mouse + touch)
-    const startResize = (e) => {
-      e.preventDefault();
-      setResizing(true);
-      const startY = (e.touches ? e.touches[0].clientY : e.clientY) ;
-      const startH = height;
-      const onMove = (ev) => {
-        const y = ev.touches ? ev.touches[0].clientY : ev.clientY;
-        const delta = startY - y;
-        // Min 60px (1 line), max 40% of viewport — prevents covering the workspace
-        const newH = Math.max(60, Math.min(window.innerHeight * 0.4, startH + delta));
-        setHeight(Math.round(newH));
-      };
-      const onUp = () => {
-        setResizing(false);
-        document.removeEventListener('mousemove', onMove);
-        document.removeEventListener('mouseup', onUp);
-        document.removeEventListener('touchmove', onMove);
-        document.removeEventListener('touchend', onUp);
-        document.body.style.userSelect = '';
-        document.body.style.cursor = '';
-      };
-      document.addEventListener('mousemove', onMove);
-      document.addEventListener('mouseup', onUp);
-      document.addEventListener('touchmove', onMove);
-      document.addEventListener('touchend', onUp);
-      document.body.style.userSelect = 'none';
-      document.body.style.cursor = 'ns-resize';
-    };
-
-    // Keep linesRef in sync
-    useEffect(() => { linesRef.current = lines; }, [lines]);
-
-    // Watch active jobs and append their step changes to the terminal
-    const lastJobStepRef = useRef({});
-    useEffect(() => {
-      activeJobs.forEach(job => {
-        const last = lastJobStepRef.current[job.id];
-        if (last !== job.step) {
-          lastJobStepRef.current[job.id] = job.step;
-          if (job.step) {
-            const color = job.status === 'failed' ? '\x1b[31m' : job.status === 'completed' ? '\x1b[32m' : '\x1b[36m';
-            appendLine(`${color}[${job.name}] ${job.step}${job.status === 'completed' ? ' — done' : job.status === 'failed' ? ' — FAILED' : ''}\x1b[0m`, job.status === 'failed' ? 'stderr' : 'stdout');
-          }
-        }
-      });
-    }, [activeJobs, appendLine]);
-
-    // Watch audit events — show new ones in terminal
-    const lastAuditIdRef = useRef(null);
-    useEffect(() => {
-      if (!auditEvents || auditEvents.length === 0) return;
-      const latest = auditEvents[0];
-      if (lastAuditIdRef.current === null) {
-        lastAuditIdRef.current = latest.id;
-        return;
-      }
-      if (latest.id !== lastAuditIdRef.current) {
-        lastAuditIdRef.current = latest.id;
-        const color = latest.result === 'success' ? '\x1b[32m' : latest.result === 'failed' ? '\x1b[31m' : '\x1b[33m';
-        appendLine(`${color}[audit] ${latest.action} → ${latest.result}${latest.parameters?.hostname ? ' on ' + latest.parameters.hostname : ''}\x1b[0m`, latest.result === 'failed' ? 'stderr' : 'info');
-      }
-    }, [auditEvents, appendLine]);
-
-    // WebSocket message handler for terminal output
-    useEffect(() => {
-      const handler = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'terminal-output' && data.sessionId === sessionId) {
-            appendLine(data.line, data.stream || 'stdout');
-          } else if (data.type === 'terminal-complete' && data.sessionId === sessionId) {
-            setRunning(false);
-          } else if (data.type === 'terminal-error' && data.sessionId === sessionId) {
-            appendLine(`\x1b[31mError: ${data.error}\x1b[0m`, 'stderr');
-            setRunning(false);
-          } else if (data.type === 'queue-step-complete' || data.type === 'queue-progress' || data.type === 'queue-complete') {
-            const color = data.status === 'failed' ? '\x1b[31m' : data.type === 'queue-complete' ? '\x1b[32m' : '\x1b[36m';
-            const label = data.type === 'queue-complete'
-              ? `[queue] Complete — ${data.completed}/${data.total} steps`
-              : `[queue] Step ${data.stepIndex + 1}/${data.totalSteps} on ${data.hostname} — ${data.status || 'running'} (${data.completed}/${data.total})`;
-            appendLine(`${color}${label}\x1b[0m`, data.status === 'failed' ? 'stderr' : 'stdout');
-          } else if (data.type === 'scan-complete') {
-            const s = data.summary;
-            appendLine(`\x1b[32m[scan] Complete — ${s.online}/${s.total} hosts online\x1b[0m`, 'stdout');
-          }
-        } catch {}
-      };
-      // The WebSocket is opened by StatusBar's useEffect and stored at window._supporthublanWs
-      // We add our own listener that checks the raw message via a CustomEvent
-      // Simpler: poll window._supporthublanWs every 200ms
-      const interval = setInterval(() => {
-        if (window._supporthublanWs && !window._supporthublanWs._supporthublanListenerAdded) {
-          window._supporthublanWs.addEventListener('message', handler);
-          window._supporthublanWs._supporthublanListenerAdded = true;
-        }
-      }, 200);
-      return () => {
-        clearInterval(interval);
-        if (window._supporthublanWs) {
-          window._supporthublanWs.removeEventListener('message', handler);
-          window._supporthublanWs._supporthublanListenerAdded = false;
-        }
-      };
-    }, [sessionId, appendLine]);
-
-    // Auto-scroll
-    useEffect(() => {
-      if (autoScroll && scrollRef.current) {
-        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-      }
-    }, [lines, autoScroll]);
-
-    // Run command
-    const runCommand = () => {
-      const cmd = command.trim();
-      if (!cmd) return;
-      if (!window._supporthublanWs || window._supporthublanWs.readyState !== 1) {
-        appendLine('\x1b[31mError: WebSocket not connected. Backend must be running to execute commands.\x1b[0m', 'stderr');
-        return;
-      }
-      setHistory(prev => [...prev.slice(-50), cmd]);
-      setHistoryIdx(-1);
-      setRunning(true);
-      window._supporthublanWs.send(JSON.stringify({ type: 'terminal-run', command: cmd, sessionId }));
-      setCommand('');
-    };
-
-    // Filter lines by active tab
-    const filteredLines = lines.filter(l => {
-      if (activeTab === 'all') return true;
-      if (activeTab === 'errors') return l.stream === 'stderr';
-      if (activeTab === 'current') return true; // would filter by current host — for now, same as all
-      if (activeTab === 'terminal') return true; // only manual commands — would need tagging
-      return true;
-    });
-
-    // Render ANSI color codes (simple parser — converts \x1b[...m to spans)
-    const renderLine = (text) => {
-      // Strip ANSI for now — Terminal panel doesn't need full color support
-      const stripped = text.replace(/\x1b\[[0-9;]*m/g, '');
-      return stripped;
-    };
-
-    const handleKeyDown = (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); runCommand(); }
-      else if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        if (history.length > 0) {
-          const newIdx = historyIdx === -1 ? history.length - 1 : Math.max(0, historyIdx - 1);
-          setHistoryIdx(newIdx);
-          setCommand(history[newIdx]);
-        }
-      } else if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        if (historyIdx !== -1) {
-          const newIdx = historyIdx + 1;
-          if (newIdx >= history.length) { setHistoryIdx(-1); setCommand(''); }
-          else { setHistoryIdx(newIdx); setCommand(history[newIdx]); }
-        }
-      } else if (e.key === 'l' && e.ctrlKey) {
-        e.preventDefault();
-        setLines([]);
-      }
-    };
-
-    if (collapsed) {
-      return (
-        <div className="flex-shrink-0 bg-surface border-t border-border h-7 flex items-center px-3 text-meta text-text-dim">
-          <button onClick={() => setCollapsed(false)} className="flex items-center gap-1.5 hover:text-text">
-            <Icon name="ChevronUp" size={12} /> Terminal
-            {running && <span className="ml-2 w-1.5 h-1.5 bg-success rounded-full animate-pulse" />}
-            {lines.length > 0 && <span className="ml-1">({lines.length} lines)</span>}
-          </button>
-        </div>
-      );
-    }
-
-    return (
-      <div className="flex-shrink-0 bg-[#0c0e16] border-t-2 border-border flex flex-col relative" style={{ height: height + 'px' }}>
-        {/* Resize handle — drag up/down to resize the panel */}
-        <div
-          onMouseDown={startResize}
-          onTouchStart={startResize}
-          className="absolute top-0 left-0 right-0 h-1 cursor-ns-resize hover:bg-primary/50 transition-colors group"
-          title="Drag to resize"
-        >
-          <div className="absolute top-0 left-1/2 -translate-x-1/2 w-12 h-1 bg-border group-hover:bg-primary rounded-b" />
-        </div>
-        {/* Tab bar */}
-        <div className="flex items-center justify-between border-b border-[#1f2230] bg-[#0f1117] px-1">
-          <div className="flex">
-            {[
-              { id: 'all', label: 'All', icon: 'List' },
-              { id: 'current', label: 'Current', icon: 'Crosshair' },
-              { id: 'errors', label: 'Errors', icon: 'AlertCircle' },
-              { id: 'terminal', label: 'Terminal', icon: 'Terminal' },
-            ].map(t => (
-              <button key={t.id} onClick={() => { setActiveTab(t.id); if (t.id === 'terminal') setTimeout(() => inputRef.current?.focus(), 100); }}
-                className={`flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium border-b-2 -mb-px ${activeTab === t.id ? 'border-primary text-primary' : 'border-transparent text-gray-400 hover:text-gray-200'}`}>
-                <Icon name={t.icon} size={11} />{t.label}
-                {t.id === 'errors' && lines.filter(l => l.stream === 'stderr').length > 0 && (
-                  <span className="ml-1 px-1 text-[9px] bg-red-500/20 text-red-400 rounded">{lines.filter(l => l.stream === 'stderr').length}</span>
-                )}
-              </button>
-            ))}
-          </div>
-          <div className="flex items-center gap-1">
-            <button onClick={() => setAutoScroll(a => !a)} title="Toggle auto-scroll" className={`p-1 rounded ${autoScroll ? 'text-primary' : 'text-gray-500'} hover:bg-[#1f2230]`}>
-              <Icon name="ArrowDownToLine" size={12} />
-            </button>
-            <button onClick={() => setLines([])} title="Clear (Ctrl+L)" className="p-1 rounded text-gray-400 hover:bg-[#1f2230]">
-              <Icon name="Trash2" size={12} />
-            </button>
-            <button onClick={() => setCollapsed(true)} title="Collapse panel" className="p-1 rounded text-gray-400 hover:bg-[#1f2230]">
-              <Icon name="ChevronDown" size={12} />
-            </button>
-          </div>
-        </div>
-
-        {/* Output area */}
-        <div ref={scrollRef} className="flex-1 overflow-y-auto font-mono text-[12px] leading-[1.4] p-2 text-gray-300" style={{ fontFamily: 'JetBrains Mono, Consolas, "Courier New", monospace' }}>
-          {filteredLines.length === 0 ? (
-            <div className="text-gray-600 italic px-1 py-2">
-              No output yet. Type a PsTools command below (e.g. <code className="text-gray-400">psinfo \\pc-01</code>) or run an action from the inventory.
-            </div>
-          ) : (
-            filteredLines.map((l, i) => (
-              <div key={i} className={`whitespace-pre-wrap break-all ${l.stream === 'stderr' ? 'text-red-400' : l.stream === 'stdout' ? 'text-gray-300' : l.stream === 'command' ? 'text-cyan-400' : 'text-gray-500'}`}>
-                <span className="text-gray-600 mr-2">{l.ts}</span>
-                {renderLine(l.line)}
-              </div>
-            ))
-          )}
-        </div>
-
-        {/* Command input */}
-        <div className="border-t border-[#1f2230] bg-[#0f1117] flex items-center px-2 py-1.5">
-          <span className="text-success font-mono text-[12px] mr-2 flex-shrink-0">ps&gt;</span>
-          <input
-            ref={inputRef}
-            type="text"
-            value={command}
-            onChange={(e) => setCommand(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Type a PsTools command — e.g.  psexec \\pc-01 cmd   |   psinfo \\pc-01   |   ping pc-01   |   powershell Get-Service"
-            className="flex-1 bg-transparent border-0 outline-none font-mono text-[12px] text-gray-200 placeholder-gray-600"
-            style={{ fontFamily: 'JetBrains Mono, Consolas, "Courier New", monospace' }}
-            disabled={running}
-          />
-          {running && (
-            <button onClick={() => window._supporthublanWs?.send(JSON.stringify({ type: 'terminal-kill', sessionId }))}
-              className="ml-2 px-2 py-0.5 text-[10px] bg-red-500/20 text-red-400 rounded hover:bg-red-500/30">
-              Stop
-            </button>
-          )}
-        </div>
-      </div>
     );
   };
 

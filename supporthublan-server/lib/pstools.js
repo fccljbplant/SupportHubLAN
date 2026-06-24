@@ -2,42 +2,31 @@
    SupportHubLAN PsTools Module
    ==========================================================================
    Provides execution of Sysinternals PsTools commands (PsInfo, PsLoggedOn,
-   PsExec) and fast parallel ping sweep.
+   PsExec, PsList, PsKill, PsService, PsShutdown) with optional explicit
+   domain credentials.
 
-   PSTOOLS DOCUMENTATION (studied before implementation):
+   Every command that targets a remote PC now uses the global domain
+   credentials configured in Settings → General → Default Domain Credentials.
+   If no credentials are provided, the current process token is used (legacy
+   behaviour — only works when the server is running as a privileged domain
+   account on the same LAN).
+
+   PSTOOLS DOCUMENTATION
    ------------------------------------
    Reference: https://docs.microsoft.com/en-us/sysinternals/downloads/pstools
 
-   PsInfo:
-     psinfo [-h] [-s] [-d] [-c] [\\HOST]
-       -h  Show installed hotfixes
-       -s  Show installed software
-       -d  Show disk volume information
-       -c  Output in CSV format
-       -t  CSV delimiter (use with -c)
-
-   PsLoggedOn:
-     psloggedon [-l] [-x] [\\HOST]
-       -l  Show only local logons (not network)
-       -x  Don't show logon time
-
    PsExec:
-     psexec [\\HOST] [-s] [-h] [-u user] [-p pass] command [args]
-       -accepteula  MUST be placed BEFORE \\HOST (it's a PsExec option)
-       -s           Run as SYSTEM account
-       -h           Run with elevated privileges
-       -u -p        Alternate credentials
+     psexec -accepteula \\HOST [-u user] [-p password] [-s] [-h] command [args]
+     -accepteula  MUST be placed BEFORE \\HOST
 
-   CRITICAL: -accepteula placement:
-     CORRECT: psexec -accepteula \\HOST -s command args
-     WRONG:   psexec \\HOST -s command args -accepteula
-     (In the wrong version, -accepteula is passed to the remote command
-      as an argument, causing it to fail silently.)
+   PsInfo, PsList, PsKill, PsService, PsLoggedOn, PsShutdown:
+     tool \\HOST [-u user] [-p password] [-accepteula] [tool-specific args]
    ========================================================================== */
 
 const { spawn } = require('child_process');
 const path = require('path');
 const { logCommand, analyzeError } = require('./logger');
+const { toFqdn, credentialArgs, maskPassword, stripPsExecBanner } = require('./utils');
 
 const PSTOOLS_PATH = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
 
@@ -46,19 +35,14 @@ function pstoolsExe(name) {
 }
 
 // ==========================================================================
-// runPsInfo — run psinfo.exe against a remote host
+// runPsInfo — run psinfo.exe against a remote host with optional credentials
 // ==========================================================================
-// Usage: runPsInfo('HOST', ['-d', '-h', '-s', '-c'])
-// Returns: { success, stdout, stderr, error, reason }
-// ==========================================================================
-function runPsInfo(hostname, flags = ['-d', '-h', '-s', '-c'], timeoutMs = 30000) {
+function runPsInfo(hostname, flags = ['-d', '-h', '-s', '-c'], timeoutMs = 30000, credential) {
   return new Promise((resolve) => {
     const startTime = Date.now();
-    const safeHost = String(hostname).replace(/[^a-zA-Z0-9._\-:]/g, '');
+    const safeHost = toFqdn(hostname, credential).replace(/[^a-zA-Z0-9._\-:]/g, '');
     const exe = pstoolsExe('psinfo.exe');
-    const args = [...flags, '\\\\' + safeHost];
-    // PsInfo needs -accepteula appended (it's a psinfo option, not a psexec option)
-    if (!args.includes('-accepteula')) args.push('-accepteula');
+    const args = [...flags, '-accepteula', '\\\\' + safeHost, ...credentialArgs(credential, safeHost)];
 
     const proc = spawn(exe, args, { windowsHide: true, timeout: timeoutMs });
 
@@ -68,16 +52,19 @@ function runPsInfo(hostname, flags = ['-d', '-h', '-s', '-c'], timeoutMs = 30000
 
     proc.on('error', (err) => {
       const reason = analyzeError('pstools', err.message, -1);
-      logCommand({ tool: 'psinfo', target: safeHost, command: `psinfo ${flags.join(' ')} \\${safeHost}`, success: false, error: err.message, ...reason, duration: Date.now() - startTime });
+      const cmd = maskPassword(`psinfo ${flags.join(' ')} \\${safeHost} -u *** -p ***`);
+      logCommand({ tool: 'psinfo', target: safeHost, command: cmd, success: false, error: err.message, ...reason, duration: Date.now() - startTime });
       resolve({ success: false, stdout: '', stderr: err.message, ...reason });
     });
 
     proc.on('close', (code) => {
       const duration = Date.now() - startTime;
-      const success = code === 0 && stdout.length > 0;
+      const cleanStdout = stripPsExecBanner(stdout);
+      const success = code === 0 && cleanStdout.length > 0;
       const reason = success ? null : analyzeError('pstools', stderr, code);
-      logCommand({ tool: 'psinfo', target: safeHost, command: `psinfo ${flags.join(' ')} \\${safeHost}`, success, error: success ? null : stderr, ...(reason || {}), duration });
-      resolve({ success, stdout, stderr, ...(reason || {}) });
+      const cmd = maskPassword(`psinfo ${flags.join(' ')} \\${safeHost} -u *** -p ***`);
+      logCommand({ tool: 'psinfo', target: safeHost, command: cmd, success, error: success ? null : stderr, ...(reason || {}), duration });
+      resolve({ success, stdout: cleanStdout, stderr, ...(reason || {}) });
     });
 
     setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs + 2000);
@@ -87,12 +74,12 @@ function runPsInfo(hostname, flags = ['-d', '-h', '-s', '-c'], timeoutMs = 30000
 // ==========================================================================
 // runPsLoggedOn — run psloggedon.exe against a remote host
 // ==========================================================================
-function runPsLoggedOn(hostname, timeoutMs = 15000) {
+function runPsLoggedOn(hostname, timeoutMs = 15000, credential) {
   return new Promise((resolve) => {
     const startTime = Date.now();
-    const safeHost = String(hostname).replace(/[^a-zA-Z0-9._\-:]/g, '');
+    const safeHost = toFqdn(hostname, credential).replace(/[^a-zA-Z0-9._\-:]/g, '');
     const exe = pstoolsExe('psloggedon.exe');
-    const args = ['\\\\' + safeHost, '-accepteula'];
+    const args = ['-l', '-x', '\\\\' + safeHost];
 
     const proc = spawn(exe, args, { windowsHide: true, timeout: timeoutMs });
 
@@ -102,7 +89,8 @@ function runPsLoggedOn(hostname, timeoutMs = 15000) {
 
     proc.on('error', (err) => {
       const reason = analyzeError('pstools', err.message, -1);
-      logCommand({ tool: 'psloggedon', target: safeHost, command: `psloggedon \\${safeHost}`, success: false, error: err.message, ...reason, duration: Date.now() - startTime });
+      const cmd = maskPassword(`psloggedon \\${safeHost} -u *** -p ***`);
+      logCommand({ tool: 'psloggedon', target: safeHost, command: cmd, success: false, error: err.message, ...reason, duration: Date.now() - startTime });
       resolve({ success: false, stdout: '', stderr: err.message, ...reason });
     });
 
@@ -110,7 +98,8 @@ function runPsLoggedOn(hostname, timeoutMs = 15000) {
       const duration = Date.now() - startTime;
       const success = code === 0;
       const reason = success ? null : analyzeError('pstools', stderr, code);
-      logCommand({ tool: 'psloggedon', target: safeHost, command: `psloggedon \\${safeHost}`, success, error: success ? null : stderr, ...(reason || {}), duration });
+      const cmd = maskPassword(`psloggedon \\${safeHost} -u *** -p ***`);
+      logCommand({ tool: 'psloggedon', target: safeHost, command: cmd, success, error: success ? null : stderr, ...(reason || {}), duration });
       resolve({ success, stdout, stderr, ...(reason || {}) });
     });
 
@@ -119,18 +108,16 @@ function runPsLoggedOn(hostname, timeoutMs = 15000) {
 }
 
 // ==========================================================================
-// runPsExec — run a command on a remote host via PsExec
+// runPsExec — run a command on a remote host via PsExec with explicit creds
 // ==========================================================================
-// Usage: runPsExec('HOST', 'ipconfig', ['/all'])
-// The resulting command: psexec -accepteula \\HOST -s ipconfig /all
-// ==========================================================================
-function runPsExec(hostname, command, args = [], timeoutMs = 30000) {
+function runPsExec(hostname, command, args = [], timeoutMs = 30000, credential) {
   return new Promise((resolve) => {
     const startTime = Date.now();
-    const safeHost = String(hostname).replace(/[^a-zA-Z0-9._\-:]/g, '');
+    const safeHost = toFqdn(hostname, credential).replace(/[^a-zA-Z0-9._\-:]/g, '');
     const exe = pstoolsExe('psexec.exe');
-    // CRITICAL: -accepteula goes BEFORE \\HOST (it's a psexec option)
-    const fullArgs = ['-accepteula', '\\\\' + safeHost, '-s', command, ...args];
+    // CRITICAL: -accepteula goes BEFORE \\HOST; -u/-p go after \\HOST but
+    // before the command so they are treated as PsExec options.
+    const fullArgs = ['-accepteula', '\\\\' + safeHost, ...credentialArgs(credential, safeHost), '-s', '-h', command, ...args];
 
     const proc = spawn(exe, fullArgs, { windowsHide: true, timeout: timeoutMs });
 
@@ -140,16 +127,18 @@ function runPsExec(hostname, command, args = [], timeoutMs = 30000) {
 
     proc.on('error', (err) => {
       const reason = analyzeError('psexec', err.message, -1);
-      logCommand({ tool: 'psexec', target: safeHost, command: `psexec \\${safeHost} -s ${command} ${args.join(' ')}`, success: false, error: err.message, ...reason, duration: Date.now() - startTime });
+      const cmd = maskPassword(`psexec \\${safeHost} -u *** -p *** -s -h ${command} ${args.join(' ')}`);
+      logCommand({ tool: 'psexec', target: safeHost, command: cmd, success: false, error: err.message, ...reason, duration: Date.now() - startTime });
       resolve({ success: false, stdout: '', stderr: err.message, ...reason });
     });
 
     proc.on('close', (code) => {
       const duration = Date.now() - startTime;
       const cleanStdout = stripPsExecBanner(stdout);
-      const success = code === 0 && cleanStdout.trim().length > 0;
+      const success = code === 0;
       const reason = success ? null : analyzeError('psexec', stderr, code);
-      logCommand({ tool: 'psexec', target: safeHost, command: `psexec \\${safeHost} -s ${command} ${args.join(' ')}`, success, error: success ? null : stderr, ...(reason || {}), duration });
+      const cmd = maskPassword(`psexec \\${safeHost} -u *** -p *** -s -h ${command} ${args.join(' ')}`);
+      logCommand({ tool: 'psexec', target: safeHost, command: cmd, success, error: success ? null : stderr, ...(reason || {}), duration });
       resolve({ success, stdout: cleanStdout, stderr, ...(reason || {}) });
     });
 
@@ -158,13 +147,45 @@ function runPsExec(hostname, command, args = [], timeoutMs = 30000) {
 }
 
 // ==========================================================================
-// pingParallel — fast parallel ping sweep using ping.exe
+// runGeneric — run any PsTool (pslist, pskill, psservice, psshutdown, ...)
 // ==========================================================================
-// Spawns up to `concurrency` ping.exe processes simultaneously.
-// Much faster than PowerShell Test-Connection — ping.exe starts in ~50ms
-// vs PowerShell's ~3-5s startup.
+function runGeneric(toolName, hostname, extraArgs = [], timeoutMs = 30000, credential) {
+  return new Promise((resolve) => {
+    const startTime = Date.now();
+    const safeHost = toFqdn(hostname, credential).replace(/[^a-zA-Z0-9._\-:]/g, '');
+    const exe = pstoolsExe(toolName + '.exe');
+    const args = ['-accepteula', '\\\\' + safeHost, ...credentialArgs(credential, safeHost), ...extraArgs];
+
+    const proc = spawn(exe, args, { windowsHide: true, timeout: timeoutMs });
+
+    let stdout = '', stderr = '';
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    proc.on('error', (err) => {
+      const reason = analyzeError('pstools', err.message, -1);
+      const cmd = maskPassword(`${toolName} \\${safeHost} -u *** -p *** ${extraArgs.join(' ')}`);
+      logCommand({ tool: toolName, target: safeHost, command: cmd, success: false, error: err.message, ...reason, duration: Date.now() - startTime });
+      resolve({ success: false, stdout: '', stderr: err.message, ...reason });
+    });
+
+    proc.on('close', (code) => {
+      const duration = Date.now() - startTime;
+      const success = code === 0;
+      const reason = success ? null : analyzeError('pstools', stderr, code);
+      const cmd = maskPassword(`${toolName} \\${safeHost} -u *** -p *** ${extraArgs.join(' ')}`);
+      logCommand({ tool: toolName, target: safeHost, command: cmd, success, error: success ? null : stderr, ...(reason || {}), duration });
+      resolve({ success, stdout: stdout.trim(), stderr, ...(reason || {}) });
+    });
+
+    setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs + 2000);
+  });
+}
+
 // ==========================================================================
-function pingParallel(ips, concurrency = 64, timeoutMs = 3000) {
+// pingParallel — fast parallel ping sweep using ping.exe (NO PowerShell)
+// ==========================================================================
+function pingParallel(ips, concurrency = 64, timeoutMs = 5000) {
   return new Promise((resolve) => {
     const results = new Array(ips.length);
     let completed = 0;
@@ -175,7 +196,7 @@ function pingParallel(ips, concurrency = 64, timeoutMs = 3000) {
       const idx = nextIndex++;
       const ip = ips[idx];
 
-      const proc = spawn('ping.exe', ['-n', '1', '-w', String(timeoutMs), ip], { windowsHide: true });
+      const proc = spawn('ping.exe', ['-n', '2', '-w', String(timeoutMs), ip], { windowsHide: true });
       let stdout = '';
       proc.stdout.on('data', (d) => { stdout += d.toString(); });
       proc.stderr.on('data', () => {});
@@ -202,29 +223,85 @@ function pingParallel(ips, concurrency = 64, timeoutMs = 3000) {
 }
 
 // ==========================================================================
-// stripPsExecBanner — remove PsExec banner from stdout
+// runSystemInfo — query a remote host via systeminfo.exe (RPC, NO Admin$/SMB)
 // ==========================================================================
-function stripPsExecBanner(raw) {
+// systeminfo.exe /S HOST uses RPC (port 135 + dynamic ports) — the same
+// protocol PsLoggedOn uses. It does NOT require Admin$, PsExec, or WinRM.
+// This is the fallback for hosts where UAC blocks the Admin$ share.
+//
+// Reference: https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/systeminfo
+// ==========================================================================
+function runSystemInfo(hostname, timeoutMs = 45000, credential) {
+  return new Promise((resolve) => {
+    const startTime = Date.now();
+    const safeHost = toFqdn(hostname, credential).replace(/[^a-zA-Z0-9._\-:]/g, '');
+    const args = ['/S', safeHost];
+
+    if (credential && credential.username && credential.password) {
+      const fullUser = credential.domain ? `${credential.domain}\\${credential.username}` : credential.username;
+      args.push('/U', fullUser, '/P', credential.password);
+    }
+
+    const proc = spawn('systeminfo.exe', args, { windowsHide: true, timeout: timeoutMs });
+
+    let stdout = '', stderr = '';
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    proc.on('error', (err) => {
+      const cmd = maskPassword(`systeminfo /S ${safeHost} /U *** /P ***`);
+      logCommand({ tool: 'systeminfo', target: safeHost, command: cmd, success: false, error: err.message, duration: Date.now() - startTime });
+      resolve({ success: false, stdout: '', stderr: err.message, reason: err.message });
+    });
+
+    proc.on('close', (code) => {
+      const duration = Date.now() - startTime;
+      const success = code === 0 && stdout.length > 100;
+      const cmd = maskPassword(`systeminfo /S ${safeHost} /U *** /P ***`);
+      if (success) {
+        const parsed = parseSystemInfo(stdout);
+        logCommand({ tool: 'systeminfo', target: safeHost, command: cmd, success: true, duration });
+        resolve({ success: true, stdout, stderr: '', parsed });
+      } else {
+        const reason = analyzeError('pstools', stderr, code);
+        logCommand({ tool: 'systeminfo', target: safeHost, command: cmd, success: false, error: stderr, ...(reason || {}), duration });
+        resolve({ success: false, stdout, stderr, parsed: null, ...(reason || {}) });
+      }
+    });
+
+    setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs + 2000);
+  });
+}
+
+// ==========================================================================
+// parseSystemInfo — parse systeminfo.exe default output into key-value pairs
+// ==========================================================================
+function parseSystemInfo(raw) {
   const out = (raw || '').replace(/\r/g, '');
   const lines = out.split('\n');
-  let foundData = false;
-  const result = [];
+  const result = {};
+  let currentKey = null;
 
   for (const line of lines) {
-    if (/^PsExec v/i.test(line)) continue;
-    if (/^Copyright/i.test(line)) continue;
-    if (/^Sysinternals/i.test(line)) continue;
-    if (/^Connecting to/i.test(line)) continue;
-    if (/^Starting PSEXESVC/i.test(line)) continue;
-    if (/^Process exited/i.test(line)) continue;
-    if (/^\s*$/.test(line) && !foundData) continue;
-    foundData = true;
-    result.push(line);
+    const trimmed = line.trim();
+    if (!trimmed) { currentKey = null; continue; }
+    const colonIdx = trimmed.indexOf(':');
+    if (colonIdx > 0 && colonIdx < 50) {
+      const key = trimmed.substring(0, colonIdx).trim();
+      const value = trimmed.substring(colonIdx + 1).trim();
+      result[key] = value;
+      currentKey = key;
+    } else if (currentKey && colonIdx === -1) {
+      result[currentKey] += '\n' + trimmed;
+    }
   }
-  return result.join('\n');
+
+  return result;
 }
 
 module.exports = {
-  runPsInfo, runPsLoggedOn, runPsExec, pingParallel,
-  pstoolsExe, PSTOOLS_PATH, stripPsExecBanner,
+  runPsInfo, runPsLoggedOn, runPsExec, runGeneric, pingParallel,
+  runSystemInfo, parseSystemInfo,
+  pstoolsExe, PSTOOLS_PATH,
+  credentialArgs, // re-exported from utils for backward compat (used by server.js)
 };

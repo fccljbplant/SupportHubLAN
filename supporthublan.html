@@ -523,6 +523,7 @@
 
         // Installed apps — via PsExec + reg query
         getApps: (hostname) => apiCall('/api/hosts/' + hostname + '/apps', {}),
+        uninstallApp: (hostname, appName) => apiCall('/api/hosts/' + hostname + '/apps/uninstall', { appName }),
 
         // Command logs — view WHY commands failed
         getCommandLogs: (limit = 100) => apiGet('/api/logs?limit=' + limit),
@@ -559,8 +560,6 @@
         setFallbackCredentials: (username, password, domain) => apiCall('/api/settings/fallback-credentials', { username, password, domain }),
 
         // Domain suffix — converts short hostnames to FQDN (pc-01 → pc-01.plant.fccl.com)
-        getDomainSuffix: () => apiGet('/api/settings/domain-suffix'),
-        setDomainSuffix: (domain) => apiCall('/api/settings/domain-suffix', { domain }),
 
         // Remote desktop
         launchRemote: (hostname, ip, protocol, port) => apiCall('/api/remote/connect', { hostname, ip, protocol, port }),
@@ -1670,33 +1669,7 @@
     );
   };
 
-  /* ------------------------------------------------------------------------
-     ACTION TOOLBAR — BatchPatch-style icon toolbar above the grid
-  ------------------------------------------------------------------------ */
-  const ActionToolbar = ({ groups }) => (
-    <div className="flex items-center flex-wrap gap-0 p-1.5 bg-surface border border-border rounded-lg mb-2 overflow-x-auto">
-      {groups.map((group, gi) => (
-        <React.Fragment key={gi}>
-          {gi > 0 && <div className="toolbar-divider" />}
-          {group.label && <span className="toolbar-label">{group.label}</span>}
-          <div className="toolbar-group">
-            {group.items.map((item, i) => (
-              <button
-                key={i}
-                className={`toolbar-btn ${item.variant === 'danger' ? 'toolbar-btn-danger' : item.variant === 'success' ? 'toolbar-btn-success' : item.variant === 'warning' ? 'toolbar-btn-warning' : ''}`}
-                onClick={item.onClick}
-                title={item.title || item.label}
-                disabled={item.disabled}
-              >
-                {item.icon && <Icon name={item.icon} size={14} />}
-                {item.label}
-              </button>
-            ))}
-          </div>
-        </React.Fragment>
-      ))}
-    </div>
-  );
+
 
   /* __DESIGN_SYSTEM_END__ */
   /* ========================================================================
@@ -1957,7 +1930,7 @@
   //   The workspace shrinks to make room. Both visible side-by-side.
   // Mobile (<lg): full-screen overlay (fixed position).
   const RightDrawerInline = ({ open, kind, data }) => {
-    const { navigate, closeDrawer, updateHosts, appendAudit } = useApp();
+    const { navigate, closeDrawer, updateHosts, appendAudit, activeJobs } = useApp();
     const [tab, setTab] = useState('overview');
     useEffect(() => { setTab('overview'); }, [data?.id]);
     useEffect(() => {
@@ -1966,8 +1939,8 @@
       return () => window.removeEventListener('keydown', h);
     }, [open, closeDrawer]);
     if (!open || !data) return null;
-    const host = kind === 'host' ? data : null;
-    const job = kind === 'job' ? data : null;
+    const host = kind === 'host' ? (data._fromBackend ? data : data) : null;
+    const job = kind === 'job' ? (activeJobs.find(j => j.id === data.id) || data) : null;
 
     let tabs = [];
     if (host) tabs = [
@@ -2539,6 +2512,7 @@
 
   const HardwareTab = ({ host, updateHosts }) => {
     const toast = useToast();
+    const { addJob, updateJob, activeJobs } = useApp();
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
     const [rawOutputs, setRawOutputs] = useState(null);
@@ -2551,10 +2525,13 @@
       setError(null);
       setRawOutputs(null);
       setScanErrors([]);
+      const jobId = 'scan-hw-' + Date.now();
+      addJob({ id: jobId, name: `HW Scan — ${host.hostname}`, targets: [host.id], step: 'Scanning hardware…', progress: 10, startedAt: new Date().toISOString(), status: 'running', _isRealJob: true });
       toast.info('Scanning hardware on ' + host.hostname + '…');
       try {
         const r = await window.SupportHubLANAPI.getHardwareInfo(host.hostname);
         if (r && r.success && !r.demo && r.data) {
+          updateJob(jobId, { status: 'completed', progress: 100, step: 'Hardware scan complete', completedAt: new Date().toISOString() });
           updateHosts(prev => prev.map(h => h.id === host.id ? {
             ...h,
             _hardwareInfo: r.data,
@@ -2575,15 +2552,18 @@
             });
           }
         } else if (r && r.demo) {
+          updateJob(jobId, { status: 'failed', progress: 100, step: 'Backend not connected', completedAt: new Date().toISOString() });
           toast.warning('Backend not connected');
           setError('Backend not connected');
         } else {
+          updateJob(jobId, { status: 'failed', progress: 100, step: 'Scan failed', completedAt: new Date().toISOString() });
           toast.error('Hardware scan failed', { detail: r?.error, duration: 8000 });
           setError(r?.error || 'Scan failed');
         }
         if (r.rawOutputs) setRawOutputs(r.rawOutputs);
         if (r.errors && r.errors.length > 0) setScanErrors(r.errors);
       } catch (e) {
+        updateJob(jobId, { status: 'failed', progress: 100, step: 'Scan error', completedAt: new Date().toISOString() });
         toast.error('Hardware scan failed', { detail: e.message, duration: 8000 });
         setError(e.message);
       }
@@ -3056,43 +3036,66 @@
     );
   };
 
-  const AppsTab = ({ host }) => {
+  const AppsTab = ({ host, updateHosts }) => {
     const toast = useToast();
+    const { addJob, updateJob } = useApp();
     const [apps, setApps] = useState(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
     const [search, setSearch] = useState('');
+    const [uninstalling, setUninstalling] = useState(null);
+    const [confirmUninstall, setConfirmUninstall] = useState(null);
+
+    useEffect(() => {
+      if (host._lastApps) {
+        setApps(host._lastApps);
+      }
+    }, [host.id]);
 
     const fetchApps = async () => {
       if (!window.SupportHubLANAPI) { toast.warning('Backend not connected'); return; }
       setLoading(true);
       setError(null);
       setApps(null);
+      const jobId = 'scan-apps-' + Date.now();
+      addJob({ id: jobId, name: `Apps Scan — ${host.hostname}`, targets: [host.id], step: 'Scanning apps…', progress: 10, startedAt: new Date().toISOString(), status: 'running', _isRealJob: true });
       try {
         const r = await window.SupportHubLANAPI.getApps(host.hostname);
         if (r && r.success && !r.demo) {
           const list = r.apps || [];
           setApps(list);
+          updateHosts(prev => prev.map(h => h.id === host.id ? { ...h, _lastApps: list } : h));
+          updateJob(jobId, { status: 'completed', progress: 100, step: `Found ${list.length} apps`, completedAt: new Date().toISOString() });
           toast.success(`Found ${list.length} app(s) on ${host.hostname}`);
         } else if (r && r.demo) {
-          toast.warning('Backend not connected');
+          updateJob(jobId, { status: 'failed', progress: 100, step: 'Backend not connected', completedAt: new Date().toISOString() });
           setError('Backend not connected');
         } else {
-          toast.error('Failed to list apps', { detail: r?.error, duration: 8000 });
+          updateJob(jobId, { status: 'failed', progress: 100, step: 'Scan failed', completedAt: new Date().toISOString() });
           setError(r?.error || 'Failed');
         }
       } catch (e) {
-        toast.error('Failed to list apps', { detail: e.message, duration: 8000 });
+        updateJob(jobId, { status: 'failed', progress: 100, step: 'Scan error', completedAt: new Date().toISOString() });
         setError(e.message);
       }
       setLoading(false);
     };
 
-    // Auto-fetch on mount
-    useEffect(() => {
-      if (window.SupportHubLANAPI) fetchApps();
-      // eslint-disable-next-line
-    }, [host.id]);
+    const doUninstall = async (appName) => {
+      if (!window.SupportHubLANAPI) return;
+      setUninstalling(appName);
+      try {
+        const r = await window.SupportHubLANAPI.uninstallApp(host.hostname, appName);
+        if (r && r.success) {
+          toast.success(`Uninstall initiated for "${appName}"`);
+          setApps(prev => prev.filter(a => a.name !== appName));
+          updateHosts(prev => prev.map(h => h.id === host.id ? { ...h, _lastApps: (h._lastApps || []).filter(a => a.name !== appName) } : h));
+        } else {
+          toast.error(`Uninstall failed for "${appName}"`, { detail: r?.error, duration: 8000 });
+        }
+      } catch (e) { toast.error(e.message); }
+      setUninstalling(null);
+    };
 
     const filtered = useMemo(() => {
       if (!apps) return [];
@@ -3109,12 +3112,16 @@
       <div className="space-y-2">
         <div className="flex items-center justify-between">
           <span className="text-meta text-text-dim uppercase">
-            Installed Software {apps ? `(${apps.length})` : ''}
+            Installed Software {apps ? `(${apps.length})` : (host._lastApps ? `(${host._lastApps.length} cached)` : '')}
           </span>
-          <ActionButton variant="secondary" size="sm" icon="RefreshCw" disabled={loading} onClick={fetchApps}>
-            {loading ? 'Scanning…' : 'Refresh'}
+          <ActionButton variant="primary" size="sm" icon="Search" disabled={loading} onClick={fetchApps}>
+            {loading ? 'Scanning…' : apps ? 'Rescan' : 'Scan'}
           </ActionButton>
         </div>
+
+        {!apps && !loading && host._lastApps && (
+          <div className="text-[10px] text-text-dim text-center">Showing cached results — click Scan to refresh</div>
+        )}
 
         {apps && apps.length > 0 && (
           <input
@@ -3144,6 +3151,10 @@
           <div className="text-text-dim text-xs py-4 text-center">No installed apps found.</div>
         )}
 
+        {!loading && !apps && !host._lastApps && !error && (
+          <div className="text-text-dim text-xs py-4 text-center">Click Scan to query installed software.</div>
+        )}
+
         {!loading && filtered.length > 0 && (
           <div className="space-y-1 max-h-[500px] overflow-y-auto">
             {search && (
@@ -3152,11 +3163,14 @@
               </div>
             )}
             {filtered.map((a, i) => (
-              <div key={i} className="p-1.5 bg-surface-raised rounded border border-border text-xs">
-                <div className="text-text">{a.name || 'Unknown'}</div>
-                <div className="text-[10px] text-text-dim">
-                  {a.version || ''}{a.publisher ? ' · ' + a.publisher : ''}
+              <div key={i} className="p-1.5 bg-surface-raised rounded border border-border text-xs flex items-start justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="text-text">{a.name || 'Unknown'}</div>
+                  <div className="text-[10px] text-text-dim">
+                    {a.version || ''}{a.publisher ? ' · ' + a.publisher : ''}
+                  </div>
                 </div>
+                <IconButton icon="Trash" size="sm" variant="danger" title="Uninstall" loading={uninstalling === a.name} onClick={() => setConfirmUninstall(a.name)} />
               </div>
             ))}
           </div>
@@ -3164,9 +3178,18 @@
 
         {!loading && apps && apps.length > 0 && (
           <div className="text-[9px] text-text-dim text-center pt-1">
-            Data source: PsExec + reg query (no PowerShell) · 64-bit + 32-bit + User registry
+            Data source: PsExec + reg query · 64-bit + 32-bit + User registry
           </div>
         )}
+
+        <ConfirmDialog
+          open={!!confirmUninstall}
+          onClose={() => setConfirmUninstall(null)}
+          onConfirm={() => { const name = confirmUninstall; setConfirmUninstall(null); doUninstall(name); }}
+          title="Uninstall Application"
+          message={`Are you sure you want to uninstall "${confirmUninstall}" from ${host.hostname}? This action cannot be undone.`}
+          destructive={true}
+        />
       </div>
     );
   };
@@ -3181,72 +3204,122 @@
   };
 
   // Host drawer tab content
-  const ServicesHostTab = ({ host }) => {
+  const ServicesHostTab = ({ host, updateHosts }) => {
     const toast = useToast();
+    const { addJob, updateJob } = useApp();
     const [svcs, setSvcs] = useState(null);
     const [svcLoading, setSvcLoading] = useState(false);
     const [svcError, setSvcError] = useState(null);
+    const [actingSvc, setActingSvc] = useState(null);
+
+    useEffect(() => {
+      if (host._lastServices) {
+        setSvcs(host._lastServices);
+      }
+    }, [host.id]);
 
     const fetchServices = async () => {
       if (!window.SupportHubLANAPI) { toast.warning('Backend not connected'); return; }
       setSvcLoading(true); setSvcError(null);
+      const jobId = 'scan-svc-' + Date.now();
+      addJob({ id: jobId, name: `Services Scan — ${host.hostname}`, targets: [host.id], step: 'Scanning services…', progress: 10, startedAt: new Date().toISOString(), status: 'running', _isRealJob: true });
       try {
         const r = await window.SupportHubLANAPI.getServices(host.hostname, null);
         if (r && r.success && !r.demo && r.data) {
           let parsed = [];
           try { parsed = JSON.parse(r.data); } catch { parsed = []; }
-          setSvcs(parsed.map(s => ({
+          const list = parsed.map(s => ({
             name: s.Name || s.name || '',
             display: s.DisplayName || s.display || s.Name || '',
             status: s.State || s.status || 'Unknown',
             startType: s.StartMode || s.startType || '',
-          })));
+          }));
+          setSvcs(list);
+          updateHosts(prev => prev.map(h => h.id === host.id ? { ...h, _lastServices: list } : h));
+          updateJob(jobId, { status: 'completed', progress: 100, step: `Found ${list.length} services`, completedAt: new Date().toISOString() });
         } else if (r && r.demo) {
+          updateJob(jobId, { status: 'failed', progress: 100, step: 'Backend not connected', completedAt: new Date().toISOString() });
           setSvcError('Backend not connected');
         } else {
+          updateJob(jobId, { status: 'failed', progress: 100, step: 'Scan failed', completedAt: new Date().toISOString() });
           setSvcError(r?.error || 'Failed to list services');
         }
-      } catch (e) { setSvcError(e.message); }
+      } catch (e) {
+        updateJob(jobId, { status: 'failed', progress: 100, step: 'Scan error', completedAt: new Date().toISOString() });
+        setSvcError(e.message);
+      }
       setSvcLoading(false);
     };
 
-    useEffect(() => { if (host?.hostname) fetchServices(); }, [host?.hostname]);
-
     const doAction = async (svcName, action) => {
       if (!window.SupportHubLANAPI) return;
-      toast.info(`${action} ${svcName}…`);
+      setActingSvc(svcName + ':' + action);
       try {
         const r = await window.SupportHubLANAPI.serviceAction(host.hostname, svcName, action, null);
         if (r && r.success) {
           toast.success(`${svcName} ${action === 'start' ? 'started' : action === 'stop' ? 'stopped' : 'restarted'}`);
-          setTimeout(fetchServices, 1500);
+          setTimeout(fetchServices, 2000);
         } else {
           toast.error(`Failed to ${action} ${svcName}`, { detail: r?.error });
         }
       } catch (e) { toast.error(e.message); }
+      setActingSvc(null);
     };
 
-    if (svcLoading) return <div className="flex items-center justify-center py-8"><Icon name="Loader2" size={18} className="animate-spin text-text-dim" /></div>;
-    if (svcError) return <EmptyState icon="AlertTriangle" title="Services unavailable" description={svcError} />;
-    if (!svcs || svcs.length === 0) return <EmptyState icon="Activity" title="No services found" />;
+    const isRunning = (s) => s.status === 'Running';
 
     return (
-      <div className="space-y-1">
-        {svcs.map(s => (
-          <div key={s.name} className="flex items-center gap-2 p-1.5 bg-surface-raised rounded border border-border text-xs">
-            <Icon name={s.status === 'Running' ? 'Circle' : 'CircleOff'} size={10} className={s.status === 'Running' ? 'text-success' : 'text-danger'} />
-            <div className="flex-1 min-w-0">
-              <div className="font-mono text-text truncate">{s.name}</div>
-              <div className="text-[10px] text-text-dim truncate">{s.display}</div>
-            </div>
-            <span className="text-[10px] text-text-dim">{s.startType}</span>
-            <div className="flex gap-0.5">
-              <IconButton icon="Play" size="sm" title="Start" onClick={() => doAction(s.name, 'start')} />
-              <IconButton icon="Square" size="sm" title="Stop" onClick={() => doAction(s.name, 'stop')} />
-              <IconButton icon="RotateCw" size="sm" title="Restart" onClick={() => doAction(s.name, 'restart')} />
-            </div>
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-meta text-text-dim uppercase">
+            Services {svcs ? `(${svcs.length})` : (host._lastServices ? `(${host._lastServices.length} cached)` : '')}
+          </span>
+          <ActionButton variant="primary" size="sm" icon="Search" disabled={svcLoading} onClick={fetchServices}>
+            {svcLoading ? 'Scanning…' : svcs ? 'Rescan' : 'Scan'}
+          </ActionButton>
+        </div>
+
+        {!svcs && !svcLoading && host._lastServices && (
+          <div className="text-[10px] text-text-dim text-center">Showing cached results — click Scan to refresh</div>
+        )}
+
+        {svcLoading && (
+          <div className="flex items-center justify-center py-8">
+            <Icon name="RefreshCw" size={18} className="animate-spin text-text-dim" />
           </div>
-        ))}
+        )}
+        {svcError && !svcLoading && (
+          <EmptyState icon="AlertTriangle" title="Services unavailable" description={svcError} />
+        )}
+        {!svcLoading && !svcError && !svcs && !host._lastServices && (
+          <div className="text-text-dim text-xs py-4 text-center">Click Scan to query services.</div>
+        )}
+        {!svcLoading && !svcError && svcs && svcs.length === 0 && (
+          <EmptyState icon="Activity" title="No services found" />
+        )}
+
+        {!svcLoading && svcs && svcs.length > 0 && (
+          <div className="space-y-1 max-h-[500px] overflow-y-auto">
+            {svcs.map(s => {
+              const busy = actingSvc === (s.name + ':start') || actingSvc === (s.name + ':stop') || actingSvc === (s.name + ':restart');
+              return (
+                <div key={s.name} className="flex items-center gap-2 p-1.5 bg-surface-raised rounded border border-border text-xs">
+                  <Icon name={isRunning(s) ? 'Circle' : 'CircleOff'} size={10} className={isRunning(s) ? 'text-success' : 'text-danger'} />
+                  <div className="flex-1 min-w-0">
+                    <div className="font-mono text-text truncate">{s.name}</div>
+                    <div className="text-[10px] text-text-dim truncate">{s.display}</div>
+                  </div>
+                  <span className="text-[10px] text-text-dim">{s.startType}</span>
+                  <div className="flex gap-0.5">
+                    <IconButton icon="Play" size="sm" title="Start" disabled={busy || isRunning(s)} onClick={() => doAction(s.name, 'start')} />
+                    <IconButton icon="Square" size="sm" title="Stop" disabled={busy || !isRunning(s)} onClick={() => doAction(s.name, 'stop')} />
+                    <IconButton icon="RotateCw" size="sm" title="Restart" disabled={busy} onClick={() => doAction(s.name, 'restart')} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     );
   };
@@ -3263,7 +3336,7 @@
 
     // ---- APPS ---- (Installed Apps tab)
     if (tab === 'apps') {
-      return <AppsTab host={liveHost} />;
+      return <AppsTab host={liveHost} updateHosts={updateHosts} />;
     }
 
     if (tab === 'overview') {
@@ -3329,7 +3402,7 @@
       ))}{activeJobs.filter(j => j.targets.includes(liveHost.id)).length === 0 && <EmptyState icon="ListOrdered" title="No active jobs" />}</div>;
     }
     if (tab === 'services') {
-      return <ServicesHostTab host={liveHost} />;
+      return <ServicesHostTab host={liveHost} updateHosts={updateHosts} />;
     }
     // Dead tab paths removed (processes, logs, network, apps) — these tabs
     // Dead tab paths removed (processes, logs, network, apps) — these tabs
@@ -3367,47 +3440,154 @@
 
   // Job drawer tab content
   const JobDrawerTab = ({ tab, job }) => {
-    const { hosts, savedQueues, updateJob, removeJob } = useApp();
+    const { hosts, updateJob, removeJob, toast: ct } = useApp();
+    const toast = ct || { success: () => {}, warning: () => {}, info: () => {}, error: () => {} };
     if (tab === 'overview') {
       return (
         <div className="space-y-3">
           <div className="flex items-center gap-2">
             <StatusBadge variant={job.status} />
+            <span className="text-xs text-text">{job.name}</span>
           </div>
           <div className="grid grid-cols-2 gap-2 text-xs">
-            {[['Started', fmtAbs(job.startedAt)], ['Targets', `${job.targets.length} host(s)`], ['Current Step', job.step], ['Progress', `${job.progress}%`]].map(([k,v]) => (
+            {[['Started', fmtAbs(job.startedAt)], ['Targets', `${job.hostnames?.length || job.targets?.length || 0} host(s)`], ['Current Step', job.step], ['Overall Progress', `${job.overallProgress || job.progress || 0}%`]].map(([k,v]) => (
+              <div key={k}><div className="text-meta text-text-dim uppercase">{k}</div><div className="text-text">{v}</div></div>
+            ))}
+            {job.completedHosts !== undefined && [
+              ['Completed', job.completedHosts || 0],
+              ['Failed', job.failedHosts || 0],
+              ['Skipped', job.skippedHosts || 0],
+            ].map(([k,v]) => (
               <div key={k}><div className="text-meta text-text-dim uppercase">{k}</div><div className="text-text">{v}</div></div>
             ))}
           </div>
-          <ProgressBar value={job.progress} showLabel color="info" />
-          <div className="flex gap-2">
-            <ActionButton variant="secondary" size="sm" icon="Pause" onClick={() => updateJob(job.id, { status: 'queued' })}>Pause</ActionButton>
-            <ActionButton variant="danger" size="sm" icon="X" onClick={() => { removeJob(job.id); }}>Cancel</ActionButton>
-            <ActionButton variant="secondary" size="sm" icon="Terminal">View Log</ActionButton>
+          <ProgressBar value={job.overallProgress || job.progress || 0} showLabel color="info" />
+          {job.currentHostProgress > 0 && (
+            <div><div className="text-[10px] text-text-dim mb-0.5">Current host</div><ProgressBar value={job.currentHostProgress} max={100} color="primary" height="h-1.5" /></div>
+          )}
+          <div className="flex gap-2 flex-wrap">
+            {job.status === 'running' && <ActionButton variant="secondary" size="sm" icon="Pause" onClick={async () => { if (job._backendJobId && window.SupportHubLANAPI) { try { await window.SupportHubLANAPI.pauseJob(job._backendJobId); } catch(_){} } updateJob(job.id, { status: 'paused' }); toast.info('Job paused'); }}>Pause</ActionButton>}
+            {job.status === 'paused' && <ActionButton variant="warning" size="sm" icon="Play" onClick={async () => { if (job._backendJobId && window.SupportHubLANAPI) { try { await window.SupportHubLANAPI.resumeJob(job._backendJobId); } catch(_){} } updateJob(job.id, { status: 'running' }); toast.success('Job resumed'); }}>Resume</ActionButton>}
+            <ActionButton variant="danger" size="sm" icon="X" onClick={async () => { if (job._backendJobId && window.SupportHubLANAPI) { try { await window.SupportHubLANAPI.cancelJob(job._backendJobId); } catch(_){} } removeJob(job.id); toast.warning('Job cancelled'); }}>Cancel</ActionButton>
           </div>
         </div>
       );
     }
     if (tab === 'steps') {
-      const steps = savedQueues[0]?.steps || [{ id: 's1', label: 'Step 1' }, { id: 's2', label: 'Step 2' }, { id: 's3', label: 'Step 3' }];
-      const curIdx = parseInt(job.step.match(/(\d+)/)?.[1] || 1) - 1;
-      return <JobStepTracker steps={steps} currentStepIndex={curIdx} />;
+      const steps = job.steps?.length ? job.steps : (job._savedSteps?.length ? job._savedSteps : [{ id: 's1', label: 'Step 1' }, { id: 's2', label: 'Step 2' }, { id: 's3', label: 'Step 3' }]);
+      const curIdx = parseInt((job.step || 'Step 1').match(/(\d+)/)?.[1] || 1) - 1;
+      return (
+        <div className="space-y-2">
+          <JobStepTracker steps={steps} currentStepIndex={Math.max(0, Math.min(curIdx, steps.length - 1))} />
+          {/* Show per-host step status if available */}
+          {job.perHostProgress && Object.keys(job.perHostProgress).length > 0 && (
+            <div className="mt-3 space-y-1 max-h-[300px] overflow-y-auto">
+              <div className="text-meta text-text-dim uppercase mb-1">Per-Host Status</div>
+              {Object.entries(job.perHostProgress).map(([hostname, ph]) => (
+                <div key={hostname} className="flex items-center gap-2 p-1.5 bg-surface-raised rounded border border-border text-xs">
+                  <StatusBadge variant={ph.status === 'success' ? 'online' : ph.status === 'failed' ? 'critical' : ph.status === 'unreachable' ? 'offline' : 'queued'} size="xs" />
+                  <span className="font-mono text-text flex-1 truncate">{hostname}</span>
+                  <span className="text-[10px] text-text-dim">{ph.step || ''}{ph.error ? ` — ${ph.error.slice(0, 40)}` : ''}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
     }
     if (tab === 'hosts') {
-      return <div className="space-y-1">{job.targets.map(id => {
+      const targetIds = job.targets || [];
+      const hostnames = job.hostnames || [];
+      const perHost = job.perHostProgress || {};
+      const [expandedHost, setExpandedHost] = useState(null);
+
+      // Map host status to color
+      const hostColor = (status) => {
+        switch (status) {
+          case 'success': return { bg: 'bg-success/10', border: 'border-success/40', text: 'text-success', badge: 'online' };
+          case 'failed': return { bg: 'bg-danger/10', border: 'border-danger/40', text: 'text-danger', badge: 'critical' };
+          case 'unreachable': return { bg: 'bg-warning/10', border: 'border-warning/40', text: 'text-warning', badge: 'offline' };
+          case 'running': return { bg: 'bg-info/10', border: 'border-info/40', text: 'text-info', badge: 'running' };
+          case 'pending': case 'queued': return { bg: 'bg-surface', border: 'border-border', text: 'text-text-dim', badge: 'queued' };
+          default: return { bg: 'bg-surface', border: 'border-border', text: 'text-text-dim', badge: 'queued' };
+        }
+      };
+
+      // If we have hostnames but no targets, use hostnames
+      const displayHosts = hostnames.length > 0 ? hostnames : targetIds.map(id => {
         const h = hosts.find(h => h.id === id);
-        if (!h) return null;
-        return (
-          <div key={id} className="flex items-center gap-2 p-2 bg-surface-raised rounded border border-border text-xs">
-            <Icon name="Server" size={12} className="text-text-dim" />
-            <span className="flex-1 font-mono text-text">{h.hostname}</span>
-            <StatusBadge variant={h.onlineStatus} size="xs" />
-          </div>
-        );
-      })}</div>;
+        return h ? h.hostname : id;
+      });
+
+      return (
+        <div className="space-y-1.5 max-h-[450px] overflow-y-auto">
+          {displayHosts.length === 0 && (
+            <div className="text-text-dim text-xs py-4 text-center">No host data available.</div>
+          )}
+          {displayHosts.map((hostKey, idx) => {
+            const hostname = typeof hostKey === 'string' ? hostKey : '';
+            const hp = perHost[hostname] || { status: 'pending', step: '', error: '', output: '' };
+            const colors = hostColor(hp.status);
+            const isExpanded = expandedHost === hostname;
+            // Find host object for online status
+            const hostObj = hosts.find(h => h.hostname === hostname || h.id === hostKey);
+            const onlineStatus = hostObj?.onlineStatus || 'unknown';
+            const hasDetail = hp.output || hp.error || hp.step;
+
+            return (
+              <div key={hostname || idx}>
+                <div
+                  className={`flex items-center gap-2 p-2.5 rounded border cursor-pointer transition-colors ${colors.bg} ${colors.border} hover:opacity-80`}
+                  onClick={() => hasDetail ? setExpandedHost(isExpanded ? null : hostname) : null}
+                >
+                  <StatusBadge variant={colors.badge} size="xs" />
+                  <Icon name="Server" size={12} className="text-text-dim" />
+                  <span className="flex-1 font-mono text-xs text-text truncate">{hostname}</span>
+                  <Badge color={hp.status === 'success' ? 'success' : hp.status === 'failed' ? 'danger' : hp.status === 'unreachable' ? 'warning' : hp.status === 'running' ? 'info' : 'muted'} size="sm">{hp.status || 'pending'}</Badge>
+                  {onlineStatus !== 'unknown' && <StatusBadge variant={onlineStatus} size="xs" />}
+                  {hasDetail && <Icon name={isExpanded ? "ChevronUp" : "ChevronDown"} size={12} className="text-text-dim" />}
+                </div>
+                {/* Expanded detail */}
+                {isExpanded && hasDetail && (
+                  <div className="mt-1 p-2.5 bg-surface-raised border border-border rounded text-xs space-y-1.5">
+                    {hp.step && (
+                      <div className="flex gap-2">
+                        <span className="text-text-dim w-16 shrink-0">Step:</span>
+                        <span className="text-text font-mono">{hp.step}</span>
+                      </div>
+                    )}
+                    {hp.output && (
+                      <div className="flex gap-2">
+                        <span className="text-text-dim w-16 shrink-0">Output:</span>
+                        <code className="text-text flex-1 whitespace-pre-wrap break-all text-[10px] bg-surface p-1.5 rounded max-h-32 overflow-y-auto">{hp.output}</code>
+                      </div>
+                    )}
+                    {hp.error && (
+                      <div className="flex gap-2">
+                        <span className="text-danger w-16 shrink-0">Error:</span>
+                        <code className="text-danger flex-1 whitespace-pre-wrap break-all text-[10px] bg-danger/5 p-1.5 rounded max-h-24 overflow-y-auto">{hp.error}</code>
+                      </div>
+                    )}
+                    {hp.exit_code !== undefined && hp.exit_code !== null && (
+                      <div className="flex gap-2">
+                        <span className="text-text-dim w-16 shrink-0">Exit:</span>
+                        <span className={hp.exit_code === 0 ? 'text-success' : 'text-danger'}>{hp.exit_code}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      );
     }
     if (tab === 'log') {
-      return <CodeBlock code={`[${job.startedAt}] Job started by j.martin\n[${job.startedAt}] Connecting to ${job.targets.length} hosts...\n[${job.startedAt}] Step 1: ${job.step}\n[${job.startedAt}] All targets responded.\n[${job.startedAt}] Step 2: in progress...\n[${job.startedAt}] Estimated time remaining: ~12m\n`} language="log" maxHeight="400px" />;
+      const logs = job.logs || [];
+      const logText = logs.length > 0
+        ? logs.map(l => `[${l.time || ''}] ${l.hostname || ''} ${l.command || l.step || ''} — ${l.success ? 'OK' : 'FAILED'}${l.error ? ': ' + l.error : ''}${l.output ? '\n  ' + l.output : ''}`).join('\n')
+        : `[${job.startedAt || ''}] Job started\n[${job.startedAt || ''}] Connecting to ${job.hostnames?.length || job.targets?.length || 0} hosts...\n[${job.startedAt || ''}] Waiting for execution data…`;
+      return <CodeBlock code={logText} language="log" maxHeight="400px" />;
     }
     return null;
   };
@@ -3471,27 +3651,95 @@
         ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
-            // Handle queue progress updates — match by jobId
-            if (data.type === 'queue-step-complete' || data.type === 'queue-progress') {
-              const pct = data.total > 0 ? Math.round((data.completed / data.total) * 100) : 0;
-              const stepLabel = `Step ${data.stepIndex + 1}/${data.totalSteps} on ${data.hostname} — ${data.status || 'running'}`;
-              // Find the local job matching this backend jobId and update it
-              // (The executeQueue function stored the backend jobId in the audit event parameters)
-              // For simplicity, broadcast to all running jobs from the same backend:
-              const matchingJobs = activeJobs.filter(j => j.status === 'running');
-              if (matchingJobs.length === 1) {
-                updateJob(matchingJobs[0].id, { progress: pct, step: stepLabel });
+            if (data.type === 'queue-start') {
+              const localId = window._jobIdMap?.[data.jobId];
+              if (localId) {
+                updateJob(localId, {
+                  step: 'Starting…',
+                  progress: 0,
+                  totalHosts: data.totalHosts || 0,
+                  total: data.total || 0,
+                  completedHosts: 0,
+                  failedHosts: 0,
+                  skippedHosts: 0,
+                });
+              }
+            } else if (data.type === 'queue-progress') {
+              const localId = window._jobIdMap?.[data.jobId];
+              if (localId) {
+                updateJob(localId, {
+                  step: `Step ${data.stepIndex + 1}/${data.totalSteps}: ${data.status || 'running'} on ${data.hostname}`,
+                  progress: data.total > 0 ? Math.round((data.completed / data.total) * 100) : 0,
+                  overallProgress: data.overallProgress || 0,
+                  currentHostProgress: data.currentHostProgress || 0,
+                  completedHosts: data.completedHosts || 0,
+                  failedHosts: data.failedHosts || 0,
+                  skippedHosts: data.skippedHosts || 0,
+                  totalHosts: data.totalHosts || 0,
+                });
+              }
+            } else if (data.type === 'queue-step-complete') {
+              const localId = window._jobIdMap?.[data.jobId];
+              if (localId) {
+                const pct = data.total > 0 ? Math.round((data.completed / data.total) * 100) : 0;
+                const stepLabel = `Step ${data.stepIndex + 1}/${data.totalSteps} — ${data.hostname} ${data.status}`;
+                updateJob(localId, {
+                  progress: pct,
+                  step: stepLabel,
+                  overallProgress: data.overallProgress || pct,
+                  completedHosts: data.completedHosts || 0,
+                  failedHosts: data.failedHosts || 0,
+                  skippedHosts: data.skippedHosts || 0,
+                  totalHosts: data.totalHosts || 0,
+                  // Append to logs
+                });
+                // Also append to job's log entries
+                const job = activeJobs.find(j => j.id === localId);
+                if (job) {
+                  updateJob(localId, {
+                    logs: [...(job.logs || []), {
+                      time: new Date().toISOString(),
+                      hostname: data.hostname,
+                      step: data.step,
+                      command: data.commandExecuted || data.step,
+                      success: data.success,
+                      error: data.error || '',
+                      output: data.output || '',
+                      hostStatus: data.status || 'unknown',
+                    }],
+                    perHostProgress: {
+                      ...(job.perHostProgress || {}),
+                      [data.hostname]: {
+                        step: data.step,
+                        status: data.status || 'unknown',
+                        error: data.error || '',
+                        output: data.output || '',
+                      },
+                    },
+                  });
+                }
               }
             } else if (data.type === 'queue-complete') {
-              const matchingJobs = activeJobs.filter(j => j.status === 'running');
-              if (matchingJobs.length === 1) {
-                updateJob(matchingJobs[0].id, { status: 'completed', progress: 100, step: 'Done', completedAt: new Date().toISOString() });
+              const localId = window._jobIdMap?.[data.jobId];
+              if (localId) {
+                updateJob(localId, {
+                  status: 'completed',
+                  progress: 100,
+                  overallProgress: 100,
+                  step: 'Done',
+                  completedAt: new Date().toISOString(),
+                  completedHosts: data.completedHosts || 0,
+                  failedHosts: data.failedHosts || 0,
+                  skippedHosts: data.skippedHosts || 0,
+                  totalHosts: data.totalHosts || 0,
+                });
               }
+            } else if (data.type === 'queue-aborted') {
+              const localId = window._jobIdMap?.[data.jobId];
+              if (localId) { updateJob(localId, { status: 'cancelled', step: 'Cancelled', completedAt: new Date().toISOString() }); }
             } else if (data.type === 'scan-complete') {
-              // Surface scan results as a toast
               const s = data.summary;
               if (s) {
-                // Use a custom event so the scanner component can pick this up
                 window.dispatchEvent(new CustomEvent('supporthublan:scan-complete', { detail: data }));
               }
             }
@@ -3619,7 +3867,9 @@
     const pendingReboot = hosts.filter(h => h.pendingReboot).length;
     const updatesAvailable = hosts.filter(h => h.patchState === 'updates-available' || h.patchState === 'critical').length;
     const critical = hosts.filter(h => h.patchState === 'critical').length;
-    const failedJobs24h = activeJobs.filter(j => j.status === 'failed').length || 1; // simulating
+    const runningJobs = activeJobs.filter(j => j.status === 'running' || j.status === 'paused' || j.status === 'queued').length;
+    const completedJobs = activeJobs.filter(j => j.status === 'completed').length;
+    const failedJobs24h = activeJobs.filter(j => j.status === 'failed').length;
 
     const compliant = hosts.filter(h => h.patchState === 'compliant').length;
     const unknown = hosts.filter(h => h.patchState === 'unknown').length;
@@ -3717,7 +3967,7 @@
               toast.success('Demo activity seeded — scan, deploy, script, and reboot triggered. Watch the Active Jobs panel and Audit Trail.');
             }}>Seed Demo Activity</ActionButton>
             <ActionButton variant="primary" icon="RefreshCw" onClick={async () => {
-              toast.info('Refreshing fleet — checking online/offline status…');
+              toast.info('Refreshing fleet + jobs…');
               // 1. Ping all hosts in parallel to check online/offline status
               if (window.SupportHubLANAPI) {
                 const hostnames = hosts.filter(h => h.hostname).map(h => h.hostname);
@@ -3737,17 +3987,47 @@
                         }
                         return { ...h, lastSeen: new Date().toISOString() };
                       }));
-                      const onlineCount = arr.filter(r => r.online).length;
-                      toast.success(`Fleet refreshed — ${onlineCount} of ${hostnames.length} hosts online`);
-                      return;
                     }
                   } catch (e) {}
                 }
+                // 2. Pull jobs from backend to update running/completed counts
+                try {
+                  const jobsR = await window.SupportHubLANAPI.getJobs();
+                  if (jobsR && jobsR.success && jobsR.data) {
+                    jobsR.data.forEach(jb => {
+                      const existing = activeJobs.find(j => j._backendJobId === jb.jobId);
+                      if (!existing) {
+                        addJob({
+                          id: 'bk-' + jb.jobId,
+                          _backendJobId: jb.jobId,
+                          _isRealJob: true,
+                          name: jb.queueName || 'Job ' + jb.jobId,
+                          status: jb.status,
+                          progress: jb.completed || 0,
+                          step: jb.status === 'completed' ? 'Done' : jb.status,
+                          startedAt: jb.startedAt,
+                          completedAt: jb.completedAt,
+                          hostnames: jb.hostnames || [],
+                          steps: jb.steps || [],
+                          targets: (jb.hostnames || []).map((hn, i) => 't' + i),
+                          perHostProgress: jb.perHostProgress || {},
+                          logs: jb.logs || [],
+                          completedHosts: jb.completed_hosts || 0,
+                          failedHosts: jb.failed_hosts || 0,
+                          skippedHosts: jb.skipped_hosts || 0,
+                          totalHosts: jb.total_hosts || 0,
+                          total: jb.total || 0,
+                          overallProgress: jb.status === 'completed' ? 100 : (jb.overall_progress_percent || 0),
+                        });
+                      } else {
+                        updateJob(existing.id, { status: jb.status, progress: jb.completed || 0, overallProgress: jb.overall_progress_percent || 0 });
+                      }
+                    });
+                  }
+                } catch (e) {}
               }
-              // Fallback: just update lastSeen
-              updateHosts(prev => prev.map(h => ({...h, lastSeen: new Date().toISOString()})));
-              toast.success('Fleet data refreshed');
-            }}><span className="hidden sm:inline">Refresh</span></ActionButton>
+              toast.success('Fleet + jobs refreshed');
+            }}><span className="hidden sm:inline">Refresh Fleet + Jobs</span></ActionButton>
           </>}
         />
 
@@ -3767,12 +4047,12 @@
 
         {/* Stat Cards Row */}
         <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
-          <StatCard icon="Server" label="Total Hosts" value={total} color="primary" subtitle="across 5 sites" onClick={() => navigate('inventory')} />
-          <StatCard icon="CircleCheck" label="Online Now" value={online} color="success" subtitle={`${Math.round(online/total*100)}% available`} onClick={() => navigate('inventory', { filter: 'online' })} />
-          <StatCard icon="CircleOff" label="Offline" value={offline} color="danger" subtitle="requires attention" onClick={() => navigate('inventory', { filter: 'offline' })} />
-          <StatCard icon="RefreshCw" label="Pending Reboot" value={pendingReboot} color="warning" subtitle="awaiting restart" onClick={() => navigate('updates')} />
+          <StatCard icon="Server" label="Total Hosts" value={total} color="primary" subtitle="across all sites" onClick={() => navigate('inventory')} />
+          <StatCard icon="Wifi" label="Online Now" value={online} color="success" subtitle={`${total > 0 ? Math.round(online/total*100) : 0}% available`} onClick={() => navigate('inventory', { filter: 'online' })} />
+          <StatCard icon="WifiOff" label="Offline" value={offline} color="danger" subtitle="requires attention" onClick={() => navigate('inventory', { filter: 'offline' })} />
+          <StatCard icon="Loader2" label="Running Jobs" value={runningJobs} color="info" subtitle={runningJobs > 0 ? `${runningJobs} active` : 'none running'} onClick={() => navigate('queue')} />
           <StatCard icon="ShieldAlert" label="Updates Available" value={updatesAvailable} color="warning" subtitle={`${critical} critical`} onClick={() => navigate('updates')} />
-          <StatCard icon="XCircle" label="Failed Jobs (24h)" value={failedJobs24h} color="danger" subtitle="needs review" onClick={() => navigate('reports')} />
+          <StatCard icon="CheckCircle2" label="Completed Jobs" value={completedJobs} color="success" subtitle={`${failedJobs24h} failed`} onClick={() => navigate('queue')} />
         </div>
 
         {/* Two-column middle */}
@@ -3795,10 +4075,10 @@
           </SectionCard>
 
           {/* Active Jobs Panel */}
-          <SectionCard title="Active Jobs" description={`${activeJobs.filter(j => j.status === 'running').length} running · ${activeJobs.filter(j => j.status === 'queued').length} queued`} className="lg:col-span-2" actions={<ActionButton variant="ghost" size="xs" icon="ExternalLink" onClick={() => navigate('queue')}>View All</ActionButton>}>
+          <SectionCard title="Active Jobs" description={`${activeJobs.filter(j => j.status === 'running' || j.status === 'paused').length} running · ${activeJobs.filter(j => j.status === 'queued').length} queued`} className="lg:col-span-2" actions={<ActionButton variant="ghost" size="xs" icon="ExternalLink" onClick={() => navigate('queue')}>View All</ActionButton>}>
             <div className="space-y-1.5">
-              {activeJobs.length === 0 && <EmptyState icon="CheckCircle2" title="No active jobs" description="All quiet. Start a job from the Job Queue or trigger an action." />}
-              {activeJobs.map(job => (
+              {activeJobs.filter(j => j.status === 'running' || j.status === 'paused' || j.status === 'queued').length === 0 && <EmptyState icon="CheckCircle2" title="No active jobs" description="All quiet. Start a job from the Job Queue or trigger an action." />}
+              {activeJobs.filter(j => j.status === 'running' || j.status === 'paused' || j.status === 'queued').map(job => (
                 <div key={job.id} className="flex items-center gap-3 p-2 bg-surface-raised rounded border border-border hover:border-primary/40 cursor-pointer" onClick={() => openJob(job)}>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 mb-1">
@@ -3815,8 +4095,9 @@
                     <div className="text-[11px] text-text tnum">{fmtRel(job.startedAt)}</div>
                   </div>
                   <div className="flex gap-0.5">
-                    <IconButton icon="Pause" size="sm" title="Pause" onClick={(e) => { e.stopPropagation(); updateJob(job.id, { status: 'queued' }); toast.info(`Paused ${job.name}`); }} />
-                    <IconButton icon="X" size="sm" variant="danger" title="Cancel" onClick={(e) => { e.stopPropagation(); removeJob(job.id); toast.warning(`Cancelled ${job.name}`); }} />
+                    {job.status === 'paused' && <IconButton icon="Play" size="sm" title="Resume" onClick={async (e) => { e.stopPropagation(); if (job._backendJobId && window.SupportHubLANAPI) { try { await window.SupportHubLANAPI.resumeJob(job._backendJobId); } catch(_){} } updateJob(job.id, { status: 'running' }); toast.success(`Resumed ${job.name}`); }} />}
+                    {job.status === 'running' && <IconButton icon="Pause" size="sm" title="Pause" onClick={async (e) => { e.stopPropagation(); if (job._backendJobId && window.SupportHubLANAPI) { try { await window.SupportHubLANAPI.pauseJob(job._backendJobId); } catch(_){} } updateJob(job.id, { status: 'paused' }); toast.info(`Paused ${job.name}`); }} />}
+                    <IconButton icon="X" size="sm" variant="danger" title="Cancel" onClick={async (e) => { e.stopPropagation(); if (job._backendJobId && window.SupportHubLANAPI) { try { await window.SupportHubLANAPI.cancelJob(job._backendJobId); } catch(_){} } removeJob(job.id); toast.warning(`Cancelled ${job.name}`); }} />
                   </div>
                 </div>
               ))}
@@ -3956,16 +4237,18 @@
     if (!credInfo) return null;
     const hasAdCreds = credInfo.hasPassword && credInfo.username;
     const hasFbCreds = fbInfo && fbInfo.hasPassword && fbInfo.username;
-    const hasAny = hasAdCreds || hasFbCreds;
+    const hasAny = hasAdCreds && hasFbCreds;
+    const missing = [];
+    if (!hasAdCreds) missing.push('AD');
+    if (!hasFbCreds) missing.push('Local Admin');
     return (
-      <div className={`flex items-center gap-2 px-3 py-1.5 rounded border text-xs ${hasAny ? 'bg-success/10 border-success/30 text-success' : 'bg-warning/10 border-warning/30 text-warning'}`}>
-        <Icon name={hasAny ? 'ShieldCheck' : 'AlertTriangle'} size={14} />
-        {hasAdCreds
-          ? <span>AD: <span className="font-mono">{credInfo.domain}\\{credInfo.username}</span></span>
-          : hasFbCreds
-            ? <span>Local: <span className="font-mono">{fbInfo.domain ? fbInfo.domain + '\\' : ''}{fbInfo.username}</span></span>
-            : <span>No credentials configured — Settings → General → Domain or Fallback Credentials</span>}
-        {hasAdCreds && hasFbCreds && <span className="text-text-dim">· Fallback: <span className="font-mono">{fbInfo.domain ? fbInfo.domain + '\\' : ''}{fbInfo.username}</span></span>}
+      <div className={`flex items-center gap-2 px-3 py-1.5 rounded border text-xs ${hasAny ? 'bg-success/10 border-success/30 text-success' : 'bg-danger/10 border-danger/30 text-danger'}`}>
+        <Icon name={hasAny ? 'ShieldCheck' : 'XCircle'} size={14} />
+        {hasAny
+          ? <span>AD: <span className="font-mono">{credInfo.domain}\\{credInfo.username}</span> · Local: <span className="font-mono">{fbInfo.domain ? fbInfo.domain + '\\' : ''}{fbInfo.username}</span></span>
+          : missing.length === 2
+            ? <span>No credentials configured — Settings → General → Domain and Fallback Credentials</span>
+            : <span>Missing {missing.join(' and ')} credentials — Settings → General</span>}
       </div>
     );
   };
@@ -4018,69 +4301,7 @@
       }
     };
 
-    // ============================================================
-    // REAL PsTools execution — calls backend /api/pstools/* endpoints
-    // Replaces the demo theater that wrote 'success' to audit log
-    // without actually calling the backend.
-    // ============================================================
-    const runPsToolOnHost = async (tool, hostname, hostId, opts) => {
-      const jobId = 'job-' + Date.now();
-      const label = opts?.label || tool;
-      addJob({ id: jobId, name: `${label} — ${hostname}`, targets: [hostId], step: 'Querying (1/1)', progress: 10, startedAt: new Date().toISOString(), status: 'running' });
-      toast.info(`Running ${label} on ${hostname}…`);
 
-      if (!window.SupportHubLANAPI) {
-        updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed (no API client)' });
-        appendAudit({ action: `pstools.${tool}`, actionCategory: 'Scripts', targetType: 'Host', targetIds: [hostId], parameters: { hostname }, result: 'failed' });
-        toast.error('API client not loaded');
-        return;
-      }
-
-      try {
-        let result;
-        switch (tool) {
-          case 'psinfo':       result = await window.SupportHubLANAPI.pstoolsPsInfo(hostname); break;
-          case 'pslist':       result = await window.SupportHubLANAPI.pstoolsPsList(hostname); break;
-          case 'psloggedon':   result = await window.SupportHubLANAPI.pstoolsPsLoggedOn(hostname); break;
-          case 'psservice':    result = await window.SupportHubLANAPI.pstoolsPsService(hostname, opts?.action || 'query', opts?.serviceName); break;
-          case 'psfile':       result = await window.SupportHubLANAPI.pstoolsPsFile(hostname); break;
-          case 'psgetsid':     result = await window.SupportHubLANAPI.pstoolsPsGetSid(hostname); break;
-          case 'psexec':       result = await window.SupportHubLANAPI.pstoolsExecute('psexec', hostname, opts?.args || ''); break;
-          default:
-            updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed (unknown tool)' });
-            appendAudit({ action: `pstools.${tool}`, actionCategory: 'Scripts', targetType: 'Host', targetIds: [hostId], parameters: { hostname }, result: 'failed' });
-            toast.error(`Unknown PsTool: ${tool}`);
-            return;
-        }
-
-        if (result && result.success && !result.demo) {
-          updateJob(jobId, { status: 'completed', progress: 100, step: 'Done', completedAt: new Date().toISOString(), output: result.data || result.stdout || '' });
-          appendAudit({ action: `pstools.${tool}`, actionCategory: 'Scripts', targetType: 'Host', targetIds: [hostId], parameters: { hostname, ...(opts || {}) }, result: 'success', output: (result.data || '').slice(0, 2000) });
-          toast.success(`${label} completed on ${hostname}`, { detail: 'See Job Queue for output', duration: 4000 });
-        } else if (result && result.demo) {
-          updateJob(jobId, { status: 'failed', progress: 100, step: 'Demo mode — backend not connected' });
-          appendAudit({ action: `pstools.${tool}`, actionCategory: 'Scripts', targetType: 'Host', targetIds: [hostId], parameters: { hostname }, result: 'skipped' });
-          toast.warning(`${label} skipped — backend not connected. Run the SupportHubLAN server on a Windows admin PC to execute PsTools for real.`, { duration: 8000 });
-        } else {
-          updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed', completedAt: new Date().toISOString(), output: result?.error || '' });
-          appendAudit({ action: `pstools.${tool}`, actionCategory: 'Scripts', targetType: 'Host', targetIds: [hostId], parameters: { hostname }, result: 'failed', error: result?.error });
-          toast.error(`${label} failed on ${hostname}`, { detail: result?.error || 'Unknown error', duration: 8000 });
-        }
-      } catch (e) {
-        updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed', completedAt: new Date().toISOString(), output: e.message });
-        appendAudit({ action: `pstools.${tool}`, actionCategory: 'Scripts', targetType: 'Host', targetIds: [hostId], parameters: { hostname }, result: 'failed', error: e.message });
-        toast.error(`${label} failed on ${hostname}`, { detail: e.message, duration: 8000 });
-      }
-    };
-
-    // Bulk PsTools runner — for the toolbar PsInfo/PsLoggedOn/PsList/PsService buttons
-    const runPsToolBulk = async (tool, label) => {
-      if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; }
-      const targets = hosts.filter(h => selectedIds.includes(h.id));
-      for (const h of targets) {
-        await runPsToolOnHost(tool, h.hostname, h.id, { label });
-      }
-    };
 
     // Apply initial filter from route (e.g., from dashboard click)
     useEffect(() => {
@@ -4444,76 +4665,8 @@
 
             <BulkActionBar selectedCount={selectedIds.length} actions={bulkActions} onClear={() => setSelectedIds([])} />
 
-            {/* LED Status Legend */}
-            <div className="flex items-center gap-3 mb-2 text-[11px] text-text-dim">
-              <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-full bg-[#22c55e]" style={{boxShadow:'0 0 3px #22c55e'}} /> Online</span>
-              <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2.5 rounded-full bg-[#ef4444]" style={{boxShadow:'0 0 3px #ef4444'}} /> Offline</span>
-            </div>
 
-            {/* BatchPatch-style Action Toolbar */}
-            <ActionToolbar groups={[
-              { label: 'Hosts', items: [
-                { icon: 'Plus', label: 'Add', onClick: () => { setAddModalMethod(null); setShowAddModal(true); } },
-                { icon: 'RefreshCw', label: 'Refresh', onClick: async () => { toast.info('Refreshing computer data…'); await refreshHostsFromBackend(false); setGridVersion(v => v + 1); toast.success('Inventory refreshed'); } },
-              ]},
-              { label: 'Updates', items: [
-                { icon: 'Search', label: 'Check', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } addJob({ id: 'job-' + Date.now(), name: `Scan — ${selectedIds.length} hosts`, targets: [...selectedIds], step: 'Scanning (1/3)', progress: 5, startedAt: new Date().toISOString(), status: 'running' }); toast.info(`Scanning ${selectedIds.length} hosts…`); }, disabled: selectedIds.length === 0 },
-                { icon: 'ShieldCheck', label: 'Install', variant: 'success', onClick: async () => {
-                  if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; }
-                  const targetHosts = hosts.filter(h => selectedIds.includes(h.id));
-                  const targetNames = targetHosts.map(h => h.hostname);
-                  const jobId = 'job-' + Date.now();
-                  addJob({ id: jobId, name: `Install Updates — ${selectedIds.length} hosts`, targets: [...selectedIds], step: 'Installing (1/1)', progress: 30, startedAt: new Date().toISOString(), status: 'running' });
-                  toast.info(`Installing updates on ${selectedIds.length} host(s)…`);
-                  if (window.SupportHubLANAPI) {
-                    try {
-                      const result = await window.SupportHubLANAPI.installUpdates(targetNames, null, { rebootBehavior: 'if-required' });
-                      if (result && result.success && !result.demo) {
-                        updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, patchState: 'compliant' } : h));
-                        updateJob(jobId, { status: 'completed', progress: 100, step: 'Done', completedAt: new Date().toISOString(), output: result.data || '' });
-                        appendAudit({ action: 'updates.install', actionCategory: 'Updates', targetType: 'Host', targetIds: [...selectedIds], parameters: { hostnames: targetNames }, result: 'success' });
-                        toast.success(`Updates installed on ${selectedIds.length} host(s)`, { duration: 5000 });
-                      } else if (result && result.demo) {
-                        updateJob(jobId, { status: 'failed', progress: 100, step: 'Demo mode — backend not connected' });
-                        toast.warning('Install skipped — backend not connected.', { duration: 8000 });
-                      } else {
-                        updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed', completedAt: new Date().toISOString(), output: result?.error || '' });
-                        toast.error('Install failed', { detail: result?.error, duration: 8000 });
-                      }
-                    } catch (e) {
-                      updateJob(jobId, { status: 'failed', progress: 100, step: 'Failed', output: e.message });
-                      toast.error('Install failed', { detail: e.message, duration: 8000 });
-                    }
-                  }
-                }, disabled: selectedIds.length === 0 },
-                { icon: 'EyeOff', label: 'Hide', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } toast.success(`Hiding updates on ${selectedIds.length} host(s)`); }, disabled: selectedIds.length === 0 },
-              ]},
-              { label: 'PsTools', items: [
-                { icon: 'Info', label: 'PsInfo', onClick: () => runPsToolBulk('psinfo', 'PsInfo'), disabled: selectedIds.length === 0 },
-                { icon: 'Users', label: 'LoggedOn', onClick: () => runPsToolBulk('psloggedon', 'PsLoggedOn'), disabled: selectedIds.length === 0 },
-                { icon: 'Activity', label: 'PsList', onClick: () => runPsToolBulk('pslist', 'PsList'), disabled: selectedIds.length === 0 },
-                { icon: 'Server', label: 'PsService', onClick: () => runPsToolBulk('psservice', 'PsService'), disabled: selectedIds.length === 0 },
-              ]},
-              { label: 'Power', items: [
-                { icon: 'Power', label: 'Reboot', variant: 'danger', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } setConfirmReboot(true); }, disabled: selectedIds.length === 0 },
-                { icon: 'Wifi', label: 'WoL', variant: 'warning', onClick: () => { const offline = hosts.filter(h => h.onlineStatus === 'offline' && h.macAddress); if (offline.length === 0) { toast.info('No offline hosts with MAC.'); return; } executePowerAction({ action: 'wol', targetIds: offline.map(h => h.id) }); } },
-              ]},
-              { label: 'Deploy', items: [
-                { icon: 'Package', label: 'Install', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } setShowDeployModal(true); }, disabled: selectedIds.length === 0 },
-                { icon: 'Terminal', label: 'Run Cmd', onClick: () => { if (selectedIds.length === 0) { toast.warning('Select hosts first.'); return; } setShowCommandModal(true); }, disabled: selectedIds.length === 0 },
-              ]},
-              { label: 'Row Color', items: [
-                { icon: 'Palette', label: 'None', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: undefined } : h)); toast.info('Row color cleared.'); }, disabled: selectedIds.length === 0 },
-                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#4f83ff' } : h)); toast.info('Rows colored blue.'); }, disabled: selectedIds.length === 0 },
-                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#22c55e' } : h)); toast.info('Rows colored green.'); }, disabled: selectedIds.length === 0 },
-                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#ef4444' } : h)); toast.info('Rows colored red.'); }, disabled: selectedIds.length === 0 },
-                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#f59e0b' } : h)); toast.info('Rows colored orange.'); }, disabled: selectedIds.length === 0 },
-                { icon: 'Circle', label: '', onClick: () => { updateHosts(prev => prev.map(h => selectedIds.includes(h.id) ? { ...h, _rowColor: '#a855f7' } : h)); toast.info('Rows colored purple.'); }, disabled: selectedIds.length === 0 },
-              ]},
-              { label: 'Data', items: [
-                { icon: 'Download', label: 'Export', onClick: () => { const csv = ['hostname,ipAddress,osName,patchState,onlineStatus,site,owner'].concat(hosts.filter(h => selectedIds.length === 0 || selectedIds.includes(h.id)).map(h => [h.hostname, h.ipAddress, h.osName, h.patchState, h.onlineStatus, h.site, h.owner].join(','))).join('\n'); const blob = new Blob([csv], { type: 'text/csv' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'hosts-export.csv'; a.click(); URL.revokeObjectURL(url); toast.success('Exported to CSV'); } },
-              ]},
-            ]} />
+
 
             <SectionCard bodyClassName="p-0" key={hosts.length + ':' + gridVersion}>
               <DataTable
@@ -6395,12 +6548,16 @@
   };
 
   // Reusable host multi-selector
-  const HostSelector = ({ selected, onChange, filter }) => {
+  const HostSelector = ({ selected, onChange, filter, allowOffline }) => {
     const [search, setSearch] = useState('');
     const { hosts: allHosts } = useApp();
     const hosts = filter ? allHosts.filter(filter) : allHosts;
     const filtered = hosts.filter(h => !search || h.hostname.toLowerCase().includes(search.toLowerCase()) || h.ipAddress.includes(search));
-    const toggle = (id) => onChange(selected.includes(id) ? selected.filter(x => x !== id) : [...selected, id]);
+    const toggle = (id) => {
+      const host = hosts.find(h => h.id === id);
+      if (!allowOffline && host && host.onlineStatus === 'offline') return;
+      onChange(selected.includes(id) ? selected.filter(x => x !== id) : [...selected, id]);
+    };
     return (
       <div className="space-y-2">
         <div className="relative">
@@ -6410,20 +6567,26 @@
         <div className="flex items-center justify-between">
           <span className="text-meta text-text-dim">{selected.length} of {hosts.length} selected</span>
           <div className="flex gap-1">
-            <ActionButton size="xs" variant="ghost" onClick={() => onChange(filtered.map(h => h.id))}>Select All</ActionButton>
+            <ActionButton size="xs" variant="ghost" onClick={() => onChange(allowOffline ? filtered.map(h => h.id) : filtered.filter(h => h.onlineStatus !== 'offline').map(h => h.id))}>All</ActionButton>
+            <ActionButton size="xs" variant="ghost" onClick={() => onChange(filtered.filter(h => h.onlineStatus === 'online').map(h => h.id))}>Online</ActionButton>
             <ActionButton size="xs" variant="ghost" onClick={() => onChange([])}>Clear</ActionButton>
           </div>
         </div>
         <div className="max-h-72 overflow-y-auto border border-border rounded bg-surface-raised">
-          {filtered.map(h => (
-            <label key={h.id} className="flex items-center gap-2 p-1.5 hover:bg-surface cursor-pointer border-b border-border/30">
-              <input type="checkbox" checked={selected.includes(h.id)} onChange={() => toggle(h.id)} className="accent-primary" />
-              <Icon name="Server" size={12} className="text-text-dim" />
-              <span className="flex-1 font-mono text-xs text-text">{h.hostname}</span>
-              <span className="text-[10px] text-text-dim">{h.ipAddress}</span>
-              <StatusBadge variant={h.onlineStatus} size="xs" />
-            </label>
-          ))}
+          {filtered.map(h => {
+            const isOffline = h.onlineStatus === 'offline';
+            const disabled = isOffline && !allowOffline;
+            const labelClass = `flex items-center gap-2 p-1.5 hover:bg-surface cursor-pointer border-b border-border/30 ${disabled ? 'opacity-40 cursor-not-allowed' : ''}`;
+            return (
+              <label key={h.id} className={labelClass} title={disabled ? 'Host is offline. Enable offline option to include.' : ''}>
+                <input type="checkbox" checked={selected.includes(h.id)} onChange={() => toggle(h.id)} disabled={disabled} className="accent-primary" />
+                <Icon name="Server" size={12} className="text-text-dim" />
+                <span className="flex-1 font-mono text-xs text-text truncate">{h.hostname}</span>
+                <span className="text-[10px] text-text-dim">{h.ipAddress}</span>
+                <StatusBadge variant={h.onlineStatus} size="xs" />
+              </label>
+            );
+          })}
         </div>
       </div>
     );
@@ -6662,12 +6825,71 @@
     const toast = useToast();
     const { hosts, appendAudit } = useApp();
     const [activeTab, setActiveTab] = useState('services');
-    const [selectedTargets, setSelectedTargets] = useState(['h01']);
+    const [selectedTargets, setSelectedTargets] = useState(() => {
+      // Default to first online host, not hardcoded ID
+      const firstOnline = hosts.filter(h => h.onlineStatus === 'online')[0];
+      return firstOnline ? [firstOnline.id] : [];
+    });
     const [serviceSearch, setServiceSearch] = useState('');
     const [fleetSearchQuery, setFleetSearchQuery] = useState('');
     const [fleetSearchResults, setFleetSearchResults] = useState(null);
 
-    // Fleet search: query all hosts for a service/process by name
+    // Stateful service/process list
+    const [services, setServices] = useState([]);
+    const [processes, setProcesses] = useState([]);
+    const [loadingServices, setLoadingServices] = useState(false);
+
+    const targetHost = hosts.find(h => h.id === selectedTargets[0]) || null;
+
+    // Load services + processes when target host changes
+    useEffect(() => {
+      if (!targetHost || !window.SupportHubLANAPI) { setServices([]); setProcesses([]); return; }
+      let cancelled = false;
+      setLoadingServices(true);
+      (async () => {
+        try {
+          const svcResult = await window.SupportHubLANAPI.getServices(targetHost.hostname, null);
+          if (cancelled) return;
+          if (svcResult && svcResult.success && !svcResult.demo) {
+            let svcs = [];
+            try { svcs = JSON.parse(svcResult.data); } catch { svcs = []; }
+            const arr = Array.isArray(svcs) ? svcs : [svcs];
+            setServices(arr.map(s => ({
+              name: s.Name || s.name || '',
+              display: s.DisplayName || s.display || s.Name || '',
+              status: s.State || s.status || 'Unknown',
+              startType: s.StartMode || s.startType || '',
+              pid: null,
+              logOnAs: s.StartName || s.logOnAs || '',
+            })));
+          } else { setServices([]); }
+        } catch (e) { setServices([]); }
+
+        if (cancelled) return;
+        try {
+          const procResult = await window.SupportHubLANAPI.getProcesses(targetHost.hostname, null);
+          if (cancelled) return;
+          if (procResult && procResult.success && !procResult.demo) {
+            let procs = [];
+            try { procs = JSON.parse(procResult.data); } catch { procs = []; }
+            const arr = Array.isArray(procs) ? procs : [procs];
+            setProcesses(arr.map(p => ({
+              pid: p.ProcessId || p.pid || 0,
+              name: p.Name || p.name || '',
+              cpu: parseFloat(p.CPU || p.cpu || 0),
+              mem: parseFloat(p.MemMB || p.mem || p.WorkingSetSize || 0),
+              user: '',
+              startTime: p.CreationDate || p.startTime || '',
+            })));
+          } else { setProcesses([]); }
+        } catch (e) { setProcesses([]); }
+
+        if (!cancelled) setLoadingServices(false);
+      })();
+      return () => { cancelled = true; };
+    }, [targetHost?.id]);
+
+    // Fleet search across all online hosts
     const doFleetSearch = async () => {
       const q = fleetSearchQuery.trim().toLowerCase();
       if (!q) { toast.warning('Enter a service or process name to search.'); return; }
@@ -6690,7 +6912,6 @@
           }
         }
       } else {
-        // Demo fallback
         hosts.filter(h => h.onlineStatus === 'online').forEach(h => {
           results.push({ id: h.id, hostname: h.hostname, found: false, status: 'Demo', details: 'Backend not connected' });
         });
@@ -6700,55 +6921,6 @@
       appendAudit({ action: 'services.fleet-search', actionCategory: 'Scripts', targetType: 'Host', targetIds: results.map(r => r.id), parameters: { query: fleetSearchQuery, foundCount, totalSearched: results.length }, result: 'success' });
       toast.success(`Searched ${results.length} hosts — "${fleetSearchQuery}" found on ${foundCount}.`);
     };
-
-    // Stateful service/process list — loaded from backend when a host is selected
-    const [services, setServices] = useState([]);
-    const [processes, setProcesses] = useState([]);
-    const [loadingServices, setLoadingServices] = useState(false);
-
-    // Load services + processes when target host changes
-    const fetchServicesAndProcesses = useCallback(async () => {
-      if (!targetHost || !window.SupportHubLANAPI) return;
-      setLoadingServices(true);
-      try {
-        const svcResult = await window.SupportHubLANAPI.getServices(targetHost.hostname, null);
-        if (svcResult && svcResult.success && !svcResult.demo) {
-          let svcs = [];
-          try { svcs = JSON.parse(svcResult.data); } catch { svcs = []; }
-          const arr = Array.isArray(svcs) ? svcs : [svcs];
-          setServices(arr.map(s => ({
-            name: s.Name || s.name || '',
-            display: s.DisplayName || s.display || s.Name || '',
-            status: s.State || s.status || 'Unknown',
-            startType: s.StartMode || s.startType || '',
-            pid: null,
-            logOnAs: s.StartName || s.logOnAs || '',
-          })));
-        } else { setServices([]); }
-      } catch (e) { setServices([]); }
-
-      try {
-        const procResult = await window.SupportHubLANAPI.getProcesses(targetHost.hostname, null);
-        if (procResult && procResult.success && !procResult.demo) {
-          let procs = [];
-          try { procs = JSON.parse(procResult.data); } catch { procs = []; }
-          const arr = Array.isArray(procs) ? procs : [procs];
-          setProcesses(arr.map(p => ({
-            pid: p.ProcessId || p.pid || 0,
-            name: p.Name || p.name || '',
-            cpu: parseFloat(p.CPU || p.cpu || 0),
-            mem: parseFloat(p.MemMB || p.mem || p.WorkingSetSize || 0),
-            user: '',
-            startTime: p.CreationDate || p.startTime || '',
-          })));
-        } else { setProcesses([]); }
-      } catch (e) { setProcesses([]); }
-      setLoadingServices(false);
-    }, [targetHost]);
-
-    useEffect(() => { fetchServicesAndProcesses(); }, [selectedTargets[0]]);
-
-    const targetHost = hosts.find(h => h.id === selectedTargets[0]);
 
     const setServiceStatus = (name, status) => {
       setServices(prev => prev.map(s => s.name === name ? { ...s, status, pid: null } : s));
@@ -7488,7 +7660,8 @@
     const toast = useToast();
     const { queueDraft, setQueueDraft, addJob, addSavedQueue, appendAudit, hosts } = useApp();
     // queueDraft (persistent across navigation) contains: name, description, mode, errorHandling,
-    // retryCount, retryDelay, notifyOn, steps, selectedTargets
+    // retryCount, retryDelay, notifyOn, steps, selectedTargets, runOnOfflineHosts, runWhenComesOnline,
+    // onlineDelayMinutes, syntaxValidated
     const draft = queueDraft;
     const patchDraft = (patch) => setQueueDraft(d => ({ ...d, ...patch }));
     const setSteps = (updater) => setQueueDraft(d => ({ ...d, steps: typeof updater === 'function' ? updater(d.steps) : updater }));
@@ -7508,6 +7681,50 @@
     const retryDelay = draft.retryDelay;
     const notifyOn = draft.notifyOn;
     const selectedTargets = draft.selectedTargets;
+    const runOnOfflineHosts = draft.runOnOfflineHosts || false;
+    const runWhenComesOnline = draft.runWhenComesOnline || false;
+    const onlineDelayMinutes = draft.onlineDelayMinutes || 5;
+    const syntaxValidated = draft.syntaxValidated || false;
+
+    // Validation state
+    const [validationErrors, setValidationErrors] = useState([]);
+    const [validationRan, setValidationRan] = useState(false);
+
+    const runValidation = () => {
+      const issues = [];
+      steps.forEach((step, idx) => {
+        const n = idx + 1;
+        if (!step.type || step.type === 'unknown') {
+          issues.push({ step: n, label: step.label || 'Step ' + n, severity: 'error', message: 'Missing step type' });
+          return;
+        }
+        if (step.config?.code && /\{HOST_IP\}|\{HOST_NAME\}|\{USER\}|\{PASS\}|\{QUEUE_ID\}|\{JOB_NAME\}|\{TIMESTAMP\}/.test(step.config.code)) {
+          issues.push({ step: n, label: step.label || 'Step ' + n, severity: 'warning', message: 'Contains template variables — auto-substituted at runtime' });
+        }
+        if (step.config?.command && /\{HOST_IP\}|\{HOST_NAME\}/.test(step.config.command)) {
+          issues.push({ step: n, label: step.label || 'Step ' + n, severity: 'warning', message: 'Contains template variables — auto-substituted at runtime' });
+        }
+        if ((step.type === 'run-command' || step.type === 'psexec-run') && (!step.config?.code && !step.config?.command)) {
+          issues.push({ step: n, label: step.label || 'Step ' + n, severity: 'error', message: 'No command configured' });
+        }
+        if (['start-service','stop-service','restart-service','check-service'].includes(step.type) && !step.config?.serviceName) {
+          issues.push({ step: n, label: step.label || 'Step ' + n, severity: 'error', message: 'No service name configured' });
+        }
+        if (step.type === 'wait-minutes' && (!step.config?.minutes || step.config.minutes < 1)) {
+          issues.push({ step: n, label: step.label || 'Step ' + n, severity: 'warning', message: 'Wait time not set (default 1 min)' });
+        }
+      });
+      if (selectedTargets.length === 0) {
+        issues.push({ step: 0, label: 'Targets', severity: 'error', message: 'No target hosts selected' });
+      }
+      if (steps.length === 0) {
+        issues.push({ step: 0, label: 'Queue', severity: 'error', message: 'No steps added to queue' });
+      }
+      const hasErrors = issues.some(i => i.severity === 'error');
+      patchDraft({ syntaxValidated: !hasErrors });
+      setValidationErrors(issues);
+      setValidationRan(true);
+    };
 
     const addStep = (stepDef) => {
       const newStep = { id: `qs${stepIdRef.current++}`, type: stepDef.type, label: stepDef.label, category: activeCategory, config: {} };
@@ -7528,6 +7745,10 @@
     const executeQueue = async () => {
       if (steps.length === 0) { toast.warning('Add at least one step before executing.'); return; }
       if (selectedTargets.length === 0) { toast.warning('Select at least one target host.'); return; }
+      if (!syntaxValidated) {
+        const runFirst = window.confirm('Syntax validation has not been run. Errors may cause the queue to fail.\n\nClick OK to run validation now, or Cancel to execute anyway.');
+        if (runFirst) { runValidation(); return; }
+      }
       const targetHostnames = hosts.filter(h => selectedTargets.includes(h.id)).map(h => h.hostname);
       if (targetHostnames.length === 0) { toast.error('Could not resolve hostnames for selected targets.'); return; }
 
@@ -7536,10 +7757,23 @@
         id: localJobId,
         name: name || 'Untitled Queue',
         targets: [...selectedTargets],
+        hostnames: [...targetHostnames],
+        steps: [...steps],
         step: `Step 1/${steps.length}: ${steps[0].label}`,
         progress: 0,
+        overallProgress: 0,
+        currentHostProgress: 0,
         startedAt: new Date().toISOString(),
         status: 'running',
+        logs: [],
+        perHostProgress: {},
+        completedHosts: 0,
+        failedHosts: 0,
+        skippedHosts: 0,
+        totalHosts: targetHostnames.length,
+        totalSteps: steps.length * targetHostnames.length,
+        total: steps.length * targetHostnames.length,
+        _isRealJob: true,
       };
       addJob(job);
       toast.info(`Submitting queue "${name}" to backend…`);
@@ -7722,9 +7956,32 @@
             )}
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <SectionCard title="Targets">
-                <HostSelector selected={selectedTargets} onChange={setSelectedTargets} />
-              </SectionCard>
+              <div className="space-y-2">
+                <SectionCard title="Targets">
+                  <HostSelector selected={selectedTargets} onChange={setSelectedTargets} allowOffline={runOnOfflineHosts} />
+                </SectionCard>
+                <SectionCard title="Offline Hosts">
+                  <div className="space-y-2">
+                    <label className="flex items-center gap-2 text-xs text-text">
+                      <input type="checkbox" checked={runOnOfflineHosts} onChange={e => patchDraft({ runOnOfflineHosts: e.target.checked })} className="accent-primary" />
+                      Include offline hosts in queue
+                    </label>
+                    {runOnOfflineHosts && (
+                      <div className="pl-4 border-l-2 border-border space-y-2">
+                        <label className="flex items-center gap-2 text-xs text-text">
+                          <input type="checkbox" checked={runWhenComesOnline} onChange={e => patchDraft({ runWhenComesOnline: e.target.checked })} className="accent-primary" />
+                          Auto-run when host comes online
+                        </label>
+                        {runWhenComesOnline && (
+                          <FormField label="Delay after host comes online (minutes)">
+                            <Input type="number" value={onlineDelayMinutes} min={1} max={60} onChange={e => patchDraft({ onlineDelayMinutes: parseInt(e.target.value) || 5 })} />
+                          </FormField>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </SectionCard>
+              </div>
               <SectionCard title="Error Handling & Notifications">
                 <div className="space-y-2">
                   <FormField label="Error Handling"><Select value={errorHandling} onChange={e => patchDraft({ errorHandling: e.target.value })}><option value="stop">Stop on first failure</option><option value="continue">Continue on failure</option><option value="retry">Retry N times</option></Select></FormField>
@@ -7754,27 +8011,178 @@
           </div>
         </div>
 
-        {/* Dry Run Modal */}
-        <Modal open={showDryRun} onClose={() => setShowDryRun(false)} title="Dry Run Preview" subtitle="No actions performed — validation only" size="lg"
-          footer={<ActionButton variant="primary" onClick={() => setShowDryRun(false)}>Close</ActionButton>}
+        {/* Dry Run / Syntax Validation Modal */}
+        <Modal open={showDryRun} onClose={() => setShowDryRun(false)} title="Syntax Validation" subtitle="Validates step configuration before execution" size="lg"
+          footer={<div className="flex gap-2"><ActionButton variant="secondary" onClick={() => setShowDryRun(false)}>Close</ActionButton><ActionButton variant="primary" icon="CheckCircle" onClick={runValidation}>Run Validation</ActionButton></div>}
         >
-          {steps.length === 0 ? <EmptyState icon="ListOrdered" title="No steps to preview" /> : (
-            <div className="space-y-1.5">
-              <div className="text-xs text-text-dim mb-2">Queue <span className="font-mono text-text">{name}</span> will execute on <span className="text-text">{selectedTargets.length} host(s)</span> in <span className="text-text">{mode}</span> mode.</div>
-              {steps.map((step, idx) => (
-                <div key={step.id} className="flex items-center gap-3 p-2 bg-surface-raised rounded border border-border">
-                  <span className="inline-flex items-center justify-center w-6 h-6 rounded bg-success/15 text-success tnum text-xs font-semibold">{idx + 1}</span>
-                  <Icon name={(STEP_TYPES[step.category] || STEP_TYPES['control']).icon} size={13} className="text-text-dim" />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-xs text-text">{step.label}</div>
-                    <div className="text-[10px] text-text-dim">Will execute on {selectedTargets.length} host(s)</div>
-                  </div>
-                  <Badge color="success">Will run</Badge>
-                </div>
-              ))}
+          {!validationRan ? (
+            <div className="text-center py-6 text-text-dim text-xs">Click "Run Validation" to check all {steps.length} step(s) for issues.</div>
+          ) : validationErrors.length === 0 ? (
+            <div className="flex items-center gap-2 p-3 bg-success/10 rounded border border-success/30">
+              <Icon name="CheckCircle" size={16} className="text-success" />
+              <div><div className="text-xs font-medium text-success">All checks passed</div><div className="text-[10px] text-text-dim">{steps.length} step(s) validated, {selectedTargets.length} target(s)</div></div>
             </div>
+          ) : (
+            <>
+              <div className={`flex items-center gap-2 p-3 rounded border ${validationErrors.some(e => e.severity === 'error') ? 'bg-danger/10 border-danger/30' : 'bg-warning/10 border-warning/30'}`}>
+                <Icon name={validationErrors.some(e => e.severity === 'error') ? "XCircle" : "AlertTriangle"} size={16} className={validationErrors.some(e => e.severity === 'error') ? "text-danger" : "text-warning"} />
+                <div><div className="text-xs font-medium">{validationErrors.filter(e => e.severity === 'error').length} error(s), {validationErrors.filter(e => e.severity === 'warning').length} warning(s)</div></div>
+              </div>
+              <div className="space-y-1 max-h-64 overflow-y-auto mt-2">
+                {validationErrors.map((e, i) => (
+                  <div key={i} className={`flex items-start gap-2 p-2 rounded text-xs ${e.severity === 'error' ? 'bg-danger/5 border border-danger/20' : 'bg-warning/5 border border-warning/20'}`}>
+                    <span className="text-[10px] font-mono text-text-dim mt-0.5 min-w-[20px]">#{e.step || '?'}</span>
+                    <div className="flex-1 min-w-0"><span className="text-text">{e.label}</span><span className="text-text-dim ml-1">— {e.message}</span></div>
+                    <Icon name={e.severity === 'error' ? "XCircle" : "AlertTriangle"} size={12} className={e.severity === 'error' ? "text-danger" : "text-warning"} />
+                  </div>
+                ))}
+              </div>
+            </>
           )}
         </Modal>
+      </div>
+    );
+  };
+
+  const QueueHistoryTab = ({ activeJobs, addJob, hosts, removeJob }) => {
+    const [expandedIds, setExpandedIds] = useState({});
+    const [expandedHosts, setExpandedHosts] = useState({});
+    const toggleExpand = (id) => setExpandedIds(prev => ({ ...prev, [id]: !prev[id] }));
+    const toggleHost = (jobId, hostname) => setExpandedHosts(prev => ({ ...prev, [`${jobId}:${hostname}`]: !prev[`${jobId}:${hostname}`] }));
+    const completedJobs = activeJobs.filter(j => j.status === 'completed' || j.status === 'failed' || j.status === 'cancelled');
+
+    const deleteJob = (job) => {
+      if (job._backendJobId && window.SupportHubLANAPI) {
+        window.SupportHubLANAPI.deleteJob(job._backendJobId).catch(() => {});
+      }
+      removeJob(job.id);
+    };
+
+    const fetchFromBackend = () => {
+      if (!window.SupportHubLANAPI) return;
+      window.SupportHubLANAPI.getJobs().then(r => {
+        if (r && r.success && r.data) {
+          r.data.forEach(jb => {
+            const existing = activeJobs.find(j => j._backendJobId === jb.jobId);
+            if (!existing && (jb.status === 'completed' || jb.status === 'failed' || jb.status === 'cancelled')) {
+              addJob({
+                id: 'hist-' + jb.jobId,
+                _backendJobId: jb.jobId,
+                name: jb.queueName || 'Queue ' + jb.jobId,
+                status: jb.status,
+                progress: jb.completed || 100,
+                step: jb.status === 'completed' ? 'Done' : jb.status,
+                startedAt: jb.startedAt,
+                completedAt: jb.completedAt,
+                hostnames: jb.hostnames || [],
+                steps: jb.steps || [],
+                targets: (jb.hostnames || []).map((hn, i) => 't' + i),
+                perHostProgress: jb.perHostProgress || {},
+                logs: jb.logs || [],
+                completedHosts: jb.completed_hosts || 0,
+                failedHosts: jb.failed_hosts || 0,
+                skippedHosts: jb.skipped_hosts || 0,
+                totalHosts: jb.total_hosts || 0,
+                total: jb.total || 0,
+                overallProgress: 100,
+              });
+            }
+          });
+        }
+      }).catch(() => {});
+    };
+
+    // Filter logs for a specific host
+    const hostLogs = (job, hostname) => (job.logs || []).filter(l => l.hostname === hostname);
+
+    return (
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <span className="text-meta text-text-dim uppercase">Queue History — {completedJobs.length} completed</span>
+          <ActionButton variant="secondary" size="xs" icon="RefreshCw" onClick={fetchFromBackend}>Refresh from Backend</ActionButton>
+        </div>
+        {completedJobs.length === 0 ? (
+          <EmptyState icon="History" title="No completed queues" description="Execute a queue to see results here." />
+        ) : (
+          <div className="space-y-2">
+            {completedJobs.map(job => {
+              const perHost = job.perHostProgress || {};
+              const hostCount = job.hostnames?.length || job.targets?.length || 0;
+              const successCount = Object.values(perHost).filter(h => h.status === 'success').length;
+              const failCount = Object.values(perHost).filter(h => h.status === 'failed').length;
+              const skipCount = Object.values(perHost).filter(h => h.status === 'unreachable').length;
+              const expanded = expandedIds[job.id];
+              return (
+                <div key={job.id} className="border border-border rounded overflow-hidden">
+                  <div className="flex items-center gap-3 p-3 bg-surface-raised cursor-pointer hover:bg-surface" onClick={() => toggleExpand(job.id)}>
+                    <Icon name={expanded ? "ChevronDown" : "ChevronRight"} size={14} className="text-text-dim" />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium text-text truncate">{job.name}</span>
+                        <StatusBadge variant={job.status === 'completed' ? 'online' : job.status === 'failed' ? 'critical' : 'offline'} size="xs" />
+                      </div>
+                      <div className="flex items-center gap-3 mt-0.5 text-[10px] text-text-dim">
+                        <span>{job.startedAt ? fmtRel(job.startedAt) : ''}</span>
+                        <span>{hostCount} host(s)</span>
+                        <span className="text-success">{successCount} ok</span>
+                        <span className="text-danger">{failCount} failed</span>
+                        <span className="text-warning">{skipCount} skipped</span>
+                      </div>
+                    </div>
+                    <ProgressBar value={job.overallProgress || job.progress || 100} max={100} color={job.status === 'completed' ? 'success' : job.status === 'failed' ? 'danger' : 'muted'} className="w-16" />
+                    <IconButton icon="Trash" size="sm" variant="danger" title="Delete" onClick={(e) => { e.stopPropagation(); deleteJob(job); }} />
+                  </div>
+                  {expanded && (
+                    <div className="p-3 bg-surface border-t border-border space-y-3">
+                      {Object.keys(perHost).length > 0 ? (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                          {Object.entries(perHost).map(([hostname, hp]) => {
+                            const colorMap = { success: 'border-success/40 bg-success/5', failed: 'border-danger/40 bg-danger/5', unreachable: 'border-warning/40 bg-warning/5', running: 'border-info/40 bg-info/5' };
+                            const badgeMap = { success: 'online', failed: 'critical', unreachable: 'offline', running: 'running', pending: 'queued' };
+                            const hKey = `${job.id}:${hostname}`;
+                            const hExpanded = expandedHosts[hKey];
+                            const hLogs = hostLogs(job, hostname);
+                            return (
+                              <div key={hostname}>
+                                <div
+                                  className={`p-2 rounded border cursor-pointer transition-colors ${colorMap[hp.status] || 'border-border'} hover:opacity-80`}
+                                  onClick={() => hLogs.length > 0 && toggleHost(job.id, hostname)}
+                                >
+                                  <div className="flex items-center gap-1.5">
+                                    <StatusBadge variant={badgeMap[hp.status] || 'queued'} size="xs" />
+                                    <span className="font-mono text-xs text-text truncate flex-1">{hostname}</span>
+                                    <span className="text-[10px] text-text-dim">{hp.status}</span>
+                                    {hLogs.length > 0 && <Icon name={hExpanded ? "ChevronUp" : "ChevronDown"} size={10} className="text-text-dim" />}
+                                  </div>
+                                  {hp.error && <div className="text-[9px] text-danger mt-0.5 truncate">{hp.error.slice(0, 80)}</div>}
+                                  {hp.output && <div className="text-[9px] text-text-dim mt-0.5 truncate">{hp.output.slice(0, 80)}</div>}
+                                </div>
+                                {hExpanded && hLogs.length > 0 && (
+                                  <div className="mt-1 ml-4 p-2 bg-surface-raised border border-border rounded text-[10px] font-mono space-y-0.5 max-h-40 overflow-y-auto">
+                                    {hLogs.map((l, i) => (
+                                      <div key={i} className={l.success ? 'text-text-dim' : 'text-danger'}>
+                                        <span className="text-text-dim">[{l.time?.slice(11, 19) || '--:--:--'}]</span>{' '}
+                                        <span>{l.command || l.step}</span>
+                                        <span> — {l.success ? 'OK' : 'FAIL'}{l.error ? ': ' + l.error : ''}</span>
+                                        {l.output && <div className="text-text-dim ml-8">{l.output.slice(0, 200)}</div>}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div className="text-text-dim text-xs">No per-host data available.</div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     );
   };
@@ -7808,22 +8216,30 @@
 
         {activeTab === 'running' && (
           <div className="space-y-3">
-            {activeJobs.length === 0 && <EmptyState icon="CheckCircle2" title="No active jobs" description="Build a queue and click Execute, or trigger an action from another screen." />}
-            {activeJobs.map(job => (
+            {activeJobs.filter(j => j.status === 'running' || j.status === 'paused' || j.status === 'queued').length === 0 && <EmptyState icon="CheckCircle2" title="No active jobs" description="Build a queue and click Execute, or trigger an action from another screen." />}
+            {activeJobs.filter(j => j.status === 'running' || j.status === 'paused' || j.status === 'queued').map(job => (
               <SectionCard key={job.id} title={job.name} description={`${job.targets.length} targets · started ${fmtRel(job.startedAt)}`} actions={<div className="flex gap-1"><IconButton icon="Pause" size="sm" title="Pause" onClick={() => { const bjid = job._backendJobId || (window._jobIdMap ? Object.entries(window._jobIdMap).find(([,l]) => l === job.id)?.[0] : null) || job.id; if (window.SupportHubLANAPI) { window.SupportHubLANAPI.pauseJob(bjid); } updateJob(job.id, { status: 'paused' }); toast.info(`Paused ${job.name}`); }} /><IconButton icon="X" size="sm" variant="danger" title="Cancel" onClick={() => { const bjid = job._backendJobId || (window._jobIdMap ? Object.entries(window._jobIdMap).find(([,l]) => l === job.id)?.[0] : null) || job.id; if (window.SupportHubLANAPI) { window.SupportHubLANAPI.cancelJob(bjid); } removeJob(job.id); toast.warning(`Cancelled ${job.name}`); }} /></div>}>
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
                   <div className="lg:col-span-1">
-                    <div className="text-meta text-text-dim uppercase mb-1">Current Step</div>
+                    <div className="text-meta text-text-dim uppercase mb-1">Progress</div>
                     <div className="text-sm text-text mb-2">{job.step}</div>
-                    <ProgressBar value={job.progress} showLabel color="info" />
+                    <ProgressBar value={(job.completedHosts + (job.failedHosts || 0) + (job.skippedHosts || 0)) || job.progress} max={job.totalHosts || job.hostnames?.length || 100} showLabel color="info" />
+                    {job.currentHostProgress > 0 && <div className="mt-2"><div className="text-[10px] text-text-dim mb-0.5">Current host progress</div><ProgressBar value={job.currentHostProgress} max={100} color="primary" height="h-1.5" /></div>}
                     <div className="mt-3 flex items-center gap-2"><StatusBadge variant={job.status} /></div>
+                    <div className="mt-2 text-[10px] text-text-dim">
+                      {job.completedHosts !== undefined ? `${job.completedHosts || 0} done / ${job.failedHosts || 0} failed / ${job.skippedHosts || 0} skipped / ${job.totalHosts || job.hostnames?.length || 0} total` : `Step ${job.progress || 0}/${job.total || 0}`}
+                    </div>
                   </div>
                   <div className="lg:col-span-2">
                     <div className="text-meta text-text-dim uppercase mb-2">Step Tracker</div>
-                    <JobStepTracker steps={savedQueues[0]?.steps || [{ id: 's1', label: 'Step 1' }, { id: 's2', label: 'Step 2' }, { id: 's3', label: 'Step 3' }]} currentStepIndex={parseInt(job.step.match(/(\d+)/)?.[1] || 1) - 1} />
+                    <JobStepTracker steps={(job.steps?.length ? job.steps : (savedQueues[0]?.steps?.length ? savedQueues[0].steps : [{ id: 's1', label: 'Step 1' }, { id: 's2', label: 'Step 2' }, { id: 's3', label: 'Step 3' }]))} currentStepIndex={parseInt((job.step || '').match(/(\d+)/)?.[1] || 1) - 1} />
                   </div>
                 </div>
-                <div className="mt-3 flex justify-end">
+                <div className="mt-3 flex justify-end gap-2">
+                  {job.status === 'paused' && <ActionButton variant="warning" size="sm" icon="Play" onClick={() => { if (job._backendJobId && window.SupportHubLANAPI) { window.SupportHubLANAPI.resumeJob(job._backendJobId); } updateJob(job.id, { status: 'running' }); }}>Resume</ActionButton>}
+                  {job.status === 'running' && <ActionButton variant="secondary" size="sm" icon="Pause" onClick={async () => { if (job._backendJobId && window.SupportHubLANAPI) { try { await window.SupportHubLANAPI.pauseJob(job._backendJobId); } catch(_){} } updateJob(job.id, { status: 'paused' }); }}>Pause</ActionButton>}
+                  {(job.status === 'running' || job.status === 'paused') && <ActionButton variant="danger" size="sm" icon="XCircle" onClick={async () => { if (job._backendJobId && window.SupportHubLANAPI) { try { await window.SupportHubLANAPI.cancelJob(job._backendJobId); } catch(_){} } removeJob(job.id); }}>Stop</ActionButton>}
+                  {(job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') && <ActionButton variant="secondary" size="sm" icon="Trash" onClick={() => { if (job._backendJobId && window.SupportHubLANAPI) { try { window.SupportHubLANAPI.deleteJob(job._backendJobId); } catch(_){} } removeJob(job.id); }}>Delete</ActionButton>}
                   <ActionButton variant="secondary" size="sm" icon="ExternalLink" onClick={() => openJob(job)}>View Details</ActionButton>
                 </div>
               </SectionCard>
@@ -7884,22 +8300,7 @@
         )}
 
         {activeTab === 'history' && (
-          <SectionCard bodyClassName="p-0">
-            <DataTable
-              columns={[
-                { key: 'queueName', label: 'Queue Name' },
-                { key: 'startedAt', label: 'Started', render: r => <span className="text-text-dim">{fmtRel(r.startedAt)}</span> },
-                { key: 'duration', label: 'Duration' },
-                { key: 'steps', label: 'Steps', render: r => <span className="tnum">{r.steps}</span> },
-                { key: 'targets', label: 'Targets', render: r => <span className="tnum">{r.targets}</span> },
-                { key: 'result', label: 'Result', render: r => <StatusBadge variant={r.result === 'success' ? 'success' : r.result === 'partial' ? 'partial' : 'failed'} size="xs" /> },
-                { key: 'actions', label: 'Actions', render: () => <IconButton icon="Eye" size="sm" title="View trace" /> },
-              ]}
-              rows={jobLogs.map(j => ({...j, id: j.id}))}
-              onRowClick={() => {}}
-              maxRows={15}
-            />
-          </SectionCard>
+          <QueueHistoryTab activeJobs={activeJobs} addJob={addJob} hosts={hosts} removeJob={removeJob} />
         )}
 
         {activeTab === 'templates' && (
@@ -8703,50 +9104,6 @@
     );
   };
 
-  // Domain Suffix Section — simple domain suffix for FQDN resolution
-  const DomainSuffixSection = () => {
-    const toast = useToast();
-    const [domain, setDomain] = useState('');
-    const [source, setSource] = useState('');
-    const [loading, setLoading] = useState(false);
-
-    useEffect(() => {
-      if (window.SupportHubLANAPI) {
-        window.SupportHubLANAPI.getDomainSuffix().then(r => {
-          if (r && r.success && r.data) {
-            setDomain(r.data.domain || '');
-            setSource(r.data.source || '');
-          }
-        }).catch(() => {});
-      }
-    }, []);
-
-    const save = async () => {
-      setLoading(true);
-      try {
-        if (window.SupportHubLANAPI) {
-          const r = await window.SupportHubLANAPI.setDomainSuffix(domain.trim());
-          if (r && r.success && !r.demo) {
-            toast.success('Domain suffix saved. Short hostnames will now resolve to FQDN.');
-          } else {
-            toast.warning('Backend not connected');
-          }
-        }
-      } catch (e) { toast.error('Save failed: ' + e.message); }
-      setLoading(false);
-    };
-
-    return (
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
-        <FormField label="Domain (e.g. plant.fccl.com)" hint={source === 'env' ? 'Set from .env DEFAULT_DOMAIN' : 'Leave blank for no suffix'}>
-          <Input placeholder="plant.fccl.com" value={domain} onChange={e => setDomain(e.target.value)} />
-        </FormField>
-        <div className="flex gap-2">
-          <ActionButton variant="primary" icon="Save" loading={loading} onClick={save}>Save</ActionButton>
-        </div>
-      </div>
-    );
-  };
 
   // Domain Credentials Section — used in Settings → General
   const DomainCredentialsSection = () => {
@@ -9015,10 +9372,6 @@
               <div className="mt-3"><ActionButton variant="primary" icon="Check" onClick={() => { appendAudit({ action: 'settings.general-save', actionCategory: 'Inventory', targetType: 'Host', targetIds: [], parameters: {}, result: 'success' }); toast.success('General settings saved.'); }}>Save</ActionButton></div>
             </SectionCard>
 
-            {/* Domain Suffix — converts short hostnames to FQDN */}
-            <SectionCard title="Default Domain Suffix" description="Appended to short hostnames when running commands. E.g. mis-pc-03708 + plant.fccl.com = mis-pc-03708.plant.fccl.com. Only for domain-joined PCs.">
-              <DomainSuffixSection />
-            </SectionCard>
 
             {/* Domain Credentials — used by ALL remote commands */}
             <SectionCard title="Default Domain Credentials" description="Domain admin credentials used for ALL remote commands (hardware scan, services, processes, updates, power, scripts). Without these, remote commands will fail with 'Access Denied'.">
@@ -9770,6 +10123,10 @@
       notifyOn: ['failure'],
       steps: [],
       selectedTargets: [],
+      runOnOfflineHosts: false,
+      runWhenComesOnline: false,
+      onlineDelayMinutes: 5,
+      syntaxValidated: false,
     }));
 
     // ---- Mutators ----
@@ -9822,6 +10179,7 @@
             if (old) {
               nh._hardwareInfo = old._hardwareInfo;
               nh._lastApps = old._lastApps;
+              nh._lastServices = old._lastServices;
               nh._rowColor = old._rowColor;
             }
             return nh;
@@ -10046,6 +10404,7 @@
       const targetHosts = hosts.filter(h => targetIds.includes(h.id));
       const targetNames = targetHosts.map(h => h.hostname);
       const actionLabel = action === 'reboot' ? 'Reboot' : action === 'shutdown' ? 'Shutdown' : action === 'wol' ? 'Wake on LAN' : action;
+      const notify = (type, message, detail) => window.dispatchEvent(new CustomEvent('supporthublan:notify', { detail: { type, message, detail } }));
 
       addJob({
         id: jobId,
@@ -10056,12 +10415,12 @@
         startedAt: new Date().toISOString(),
         status: 'running',
       });
-      toast.info(`${actionLabel} on ${targetIds.length} host(s)…`);
+      notify('info', `${actionLabel} on ${targetIds.length} host(s)…`);
 
       if (!window.SupportHubLANAPI) {
         updateJob(jobId, { progress: 100, step: 'Failed (no API client)', status: 'failed', completedAt: new Date().toISOString() });
         appendAudit({ action: `power.${action}`, actionCategory: 'Power', targetType: 'Host', targetIds: [...targetIds], parameters: { mode, hostnames: targetNames }, result: 'failed' });
-        toast.error('API client not loaded');
+        notify('error', 'API client not loaded');
         return jobId;
       }
 
@@ -10083,7 +10442,7 @@
         if (successCount > 0 && !demoMode) {
           updateJob(jobId, { progress: 100, step: `Done — ${successCount}/${targetHosts.length} succeeded`, status: 'completed', completedAt: new Date().toISOString() });
           appendAudit({ action: `power.${action}`, actionCategory: 'Power', targetType: 'Host', targetIds: [...targetIds], parameters: { mode, hostnames: targetNames }, result: 'success' });
-          toast.success(`${actionLabel} sent to ${successCount}/${targetHosts.length} host(s)`, { duration: 5000 });
+          notify('success', `${actionLabel} sent to ${successCount}/${targetHosts.length} host(s)`);
           // Optimistically update host status
           if (action === 'wol') {
             updateHosts(prev => prev.map(h => targetIds.includes(h.id) ? { ...h, onlineStatus: 'online', pingStatus: 'up' } : h));
@@ -10095,16 +10454,16 @@
         } else if (demoMode) {
           updateJob(jobId, { progress: 100, step: 'Demo mode — backend not connected', status: 'failed', completedAt: new Date().toISOString() });
           appendAudit({ action: `power.${action}`, actionCategory: 'Power', targetType: 'Host', targetIds: [...targetIds], parameters: { mode, hostnames: targetNames }, result: 'skipped' });
-          toast.warning(`${actionLabel} skipped — backend not connected. Run the SupportHubLAN server on a Windows admin PC to send real power commands.`, { duration: 8000 });
+          notify('warning', `${actionLabel} skipped — backend not connected. Run the SupportHubLAN server on a Windows admin PC to send real power commands.`);
         } else {
           updateJob(jobId, { progress: 100, step: `Failed — ${failCount}/${targetHosts.length} failed`, status: 'failed', completedAt: new Date().toISOString() });
           appendAudit({ action: `power.${action}`, actionCategory: 'Power', targetType: 'Host', targetIds: [...targetIds], parameters: { mode, hostnames: targetNames }, result: 'failed' });
-          toast.error(`${actionLabel} failed on ${failCount} host(s)`, { duration: 8000 });
+          notify('error', `${actionLabel} failed on ${failCount} host(s)`);
         }
       } catch (e) {
         updateJob(jobId, { progress: 100, step: 'Failed', status: 'failed', completedAt: new Date().toISOString() });
         appendAudit({ action: `power.${action}`, actionCategory: 'Power', targetType: 'Host', targetIds: [...targetIds], parameters: { mode, hostnames: targetNames }, result: 'failed', error: e.message });
-        toast.error(`${actionLabel} failed`, { detail: e.message, duration: 8000 });
+        notify('error', `${actionLabel} failed`, e.message);
       }
       return jobId;
     }, [hosts, addJob, appendAudit, updateHosts, updateJob, addJobLog]);
@@ -10400,13 +10759,14 @@
       return () => window.removeEventListener('keydown', handler);
     }, [showShortcuts, drawer.open, navigate, closeDrawer, toggleTheme]);
 
-    // ---- Job progression effect: advance running jobs every 1.5s ----
+    // ---- Job progression effect: advance FAKE/DEMO jobs only (skip real backend jobs) ----
     useEffect(() => {
       const tick = setInterval(() => {
         setActiveJobs(prev => {
           let mutated = false;
           const next = prev.map(job => {
-            if (job.status !== 'running') return job;
+            // Skip real backend jobs — their progress comes from WebSocket
+            if (job.status !== 'running' || job._isRealJob || job._backendJobId) return job;
             mutated = true;
             const newProgress = Math.min(100, job.progress + Math.random() * 12 + 5);
             // Parse step label formats:
@@ -10432,13 +10792,8 @@
             }
             return { ...job, progress: newProgress, step: stepLabel };
           });
-          // Remove completed jobs after 5s (mark with a _completedAt timestamp)
-          const now = Date.now();
-          const filtered = next.filter(j => j.status !== 'complete' || !j._completedAt || now - j._completedAt < 5000).map(j => {
-            if (j.status === 'complete' && !j._completedAt) return { ...j, _completedAt: now };
-            return j;
-          });
-          return mutated ? filtered : prev;
+          // Keep all jobs visible — completed jobs stay in history, not auto-removed
+          return mutated ? next : prev;
         });
       }, 1500);
       return () => clearInterval(tick);

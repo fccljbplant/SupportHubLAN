@@ -159,6 +159,7 @@ function loadStore() {
     credentials: [],
     audit_log: [],
     jobs: [],
+    queue_audit_log: [],
     settings: {},
   };
   _nextId = { inventories: 2, hosts: 1, credentials: 1, audit_log: 1 };
@@ -270,7 +271,7 @@ const hosts = {
     const s = loadStore();
     const h = s.hosts.find(x => x.id === id);
     if (!h) return { success: false, error: 'not found' };
-    const allowed = ['hostname', 'ip_address', 'mac_address', 'fqdn', 'os', 'os_version', 'site', 'owner', 'department', 'tags', 'notes', 'online_status', 'patch_state', 'pending_reboot', 'last_seen', 'last_audit', 'custom_fields', 'build', 'cpu', 'ram', 'manufacturer', 'model', 'serial', 'logged_on_user'];
+    const allowed = ['hostname', 'ip_address', 'mac_address', 'fqdn', 'os', 'os_version', 'site', 'owner', 'department', 'tags', 'notes', 'online_status', 'patch_state', 'pending_reboot', 'last_seen', 'last_audit', 'custom_fields', 'build', 'cpu', 'ram', 'manufacturer', 'model', 'serial', 'logged_on_user', 'pending_queue_ids', 'last_seen_online_at', 'last_seen_offline_at'];
     for (const k of allowed) { if (fields[k] !== undefined) h[k] = fields[k]; }
     h.updated_at = new Date().toISOString();
     saveStore();
@@ -369,18 +370,30 @@ const jobs = {
     const s = loadStore();
     const existing = s.jobs.find(j => j.id === job.id);
     if (existing) {
-      if (job.status) existing.status = job.status;
+      if (job.status !== undefined) existing.status = job.status;
       if (job.progress !== undefined) existing.progress = job.progress;
-      if (job.step) existing.step = job.step;
-      if (job.completed_at) existing.completed_at = job.completed_at;
-      if (job.output) existing.output = job.output;
-      if (job.logs) existing.logs = job.logs;
-      if (job.perHostProgress) existing.perHostProgress = job.perHostProgress;
-      if (job.steps) existing.steps = job.steps;
-      if (job.summary) existing.summary = job.summary;
-      if (job.hostnames) existing.hostnames = job.hostnames;
-      if (job.queueName) existing.queueName = job.queueName;
+      if (job.step !== undefined) existing.step = job.step;
+      if (job.completed_at !== undefined) existing.completed_at = job.completed_at;
+      if (job.output !== undefined) existing.output = job.output;
+      if (job.logs !== undefined) existing.logs = job.logs;
+      if (job.perHostProgress !== undefined) existing.perHostProgress = job.perHostProgress;
+      if (job.steps !== undefined) existing.steps = job.steps;
+      if (job.summary !== undefined) existing.summary = job.summary;
+      if (job.hostnames !== undefined) existing.hostnames = job.hostnames;
+      if (job.queueName !== undefined) existing.queueName = job.queueName;
       if (job.totalSteps !== undefined) existing.totalSteps = job.totalSteps;
+      if (job.target_scope !== undefined) existing.target_scope = job.target_scope;
+      if (job.run_on_offline_hosts !== undefined) existing.run_on_offline_hosts = job.run_on_offline_hosts;
+      if (job.run_when_comes_online !== undefined) existing.run_when_comes_online = job.run_when_comes_online;
+      if (job.run_when_comes_online_delay_minutes !== undefined) existing.run_when_comes_online_delay_minutes = job.run_when_comes_online_delay_minutes;
+      if (job.syntax_validated !== undefined) existing.syntax_validated = job.syntax_validated;
+      if (job.error_handling !== undefined) existing.error_handling = job.error_handling;
+      if (job.overall_progress_percent !== undefined) existing.overall_progress_percent = job.overall_progress_percent;
+      if (job.current_host_progress_percent !== undefined) existing.current_host_progress_percent = job.current_host_progress_percent;
+      if (job.completed_hosts !== undefined) existing.completed_hosts = job.completed_hosts;
+      if (job.failed_hosts !== undefined) existing.failed_hosts = job.failed_hosts;
+      if (job.skipped_hosts !== undefined) existing.skipped_hosts = job.skipped_hosts;
+      if (job.total_hosts !== undefined) existing.total_hosts = job.total_hosts;
     } else {
       s.jobs.push({
         id: job.id, name: job.name || '', status: job.status || 'queued',
@@ -392,6 +405,18 @@ const jobs = {
         steps: job.steps || null, summary: job.summary || null,
         hostnames: job.hostnames || null, queueName: job.queueName || null,
         totalSteps: job.totalSteps || 0,
+        target_scope: job.target_scope || 'selected_hosts',
+        run_on_offline_hosts: job.run_on_offline_hosts || false,
+        run_when_comes_online: job.run_when_comes_online || false,
+        run_when_comes_online_delay_minutes: job.run_when_comes_online_delay_minutes || 5,
+        syntax_validated: job.syntax_validated || false,
+        error_handling: job.error_handling || 'continue',
+        overall_progress_percent: job.overall_progress_percent || 0,
+        current_host_progress_percent: job.current_host_progress_percent || 0,
+        completed_hosts: job.completed_hosts || 0,
+        failed_hosts: job.failed_hosts || 0,
+        skipped_hosts: job.skipped_hosts || 0,
+        total_hosts: job.total_hosts || 0,
       });
     }
     saveStore();
@@ -408,6 +433,19 @@ const jobs = {
       steps: j.steps || [], hostnames: j.hostnames || [],
       perHostProgress: j.perHostProgress || {},
       logs: j.logs || [], summary: j.summary || null,
+      completedAt: j.completed_at || null,
+      target_scope: j.target_scope || 'selected_hosts',
+      run_on_offline_hosts: j.run_on_offline_hosts || false,
+      run_when_comes_online: j.run_when_comes_online || false,
+      run_when_comes_online_delay_minutes: j.run_when_comes_online_delay_minutes || 5,
+      syntax_validated: j.syntax_validated || false,
+      error_handling: j.error_handling || 'continue',
+      overall_progress_percent: j.overall_progress_percent || 0,
+      current_host_progress_percent: j.current_host_progress_percent || 0,
+      completed_hosts: j.completed_hosts || 0,
+      failed_hosts: j.failed_hosts || 0,
+      skipped_hosts: j.skipped_hosts || 0,
+      total_hosts: j.total_hosts || (j.hostnames ? j.hostnames.length : 0),
     };
   },
   delete: (id) => { const s = loadStore(); const before = s.jobs.length; s.jobs = s.jobs.filter(j => j.id !== id); saveStore(); return { success: true, removed: before !== s.jobs.length }; },
@@ -419,6 +457,15 @@ const jobs = {
     perHostProgress: j.perHostProgress || {},
     logs: j.logs || [], summary: j.summary || null,
     completedAt: j.completed_at || null,
+    target_scope: j.target_scope || 'selected_hosts',
+    run_on_offline_hosts: j.run_on_offline_hosts || false,
+    syntax_validated: j.syntax_validated || false,
+    error_handling: j.error_handling || 'continue',
+    overall_progress_percent: j.overall_progress_percent || 0,
+    completed_hosts: j.completed_hosts || 0,
+    failed_hosts: j.failed_hosts || 0,
+    skipped_hosts: j.skipped_hosts || 0,
+    total_hosts: j.total_hosts || (j.hostnames ? j.hostnames.length : 0),
   })),
   clear: () => { const s = loadStore(); s.jobs = []; saveStore(); return { success: true }; },
 };
@@ -440,9 +487,46 @@ const settings = {
   getAll: () => loadStore().settings,
 };
 
+// ==========================================================================
+// QUEUE AUDIT LOG
+// ==========================================================================
+const queue_audit = {
+  add: (entry) => {
+    const s = loadStore();
+    s.queue_audit_log.push({
+      id: nextId('queue_audit_log') || Date.now(),
+      queue_id: entry.queue_id || '', queue_name: entry.queue_name || '',
+      job_id: entry.job_id || '', job_name: entry.job_name || '',
+      host_id: entry.host_id || null, host_name: entry.host_name || '',
+      host_ip: entry.host_ip || '',
+      step_number: entry.step_number || 0, step_label: entry.step_label || '',
+      command_executed: entry.command_executed || '',
+      started_at: entry.started_at || new Date().toISOString(),
+      completed_at: entry.completed_at || new Date().toISOString(),
+      duration_seconds: entry.duration_seconds || 0,
+      exit_code: entry.exit_code !== undefined ? entry.exit_code : null,
+      stdout: entry.stdout || '', stderr: entry.stderr || '',
+      status: entry.status || 'unknown', triggered_by: entry.triggered_by || 'manual',
+    });
+    if (s.queue_audit_log.length > 10000) s.queue_audit_log = s.queue_audit_log.slice(-10000);
+    saveStore();
+    return { success: true };
+  },
+  list: (limit = 200, offset = 0) => loadStore().queue_audit_log.slice().reverse().slice(offset, offset + limit),
+  getByQueue: (queueId, limit = 500) => loadStore().queue_audit_log.filter(e => e.queue_id === queueId).reverse().slice(0, limit),
+  getByHost: (hostname, limit = 200) => loadStore().queue_audit_log.filter(e => e.host_name === hostname).reverse().slice(0, limit),
+  search: (query, limit = 200) => {
+    const q = query.toLowerCase();
+    return loadStore().queue_audit_log.filter(e =>
+      (e.queue_name || '').toLowerCase().includes(q) || (e.host_name || '').toLowerCase().includes(q) || (e.command_executed || '').toLowerCase().includes(q)
+    ).reverse().slice(0, limit);
+  },
+  clear: () => { const s = loadStore(); s.queue_audit_log = []; saveStore(); return { success: true }; },
+};
+
 module.exports = {
   encryptField, decryptField,
-  inventories, hosts, credentials, audit, jobs, settings,
+  inventories, hosts, credentials, audit, jobs, settings, queue_audit,
   USE_JSON_FALLBACK: true, // kept for backward compat (server.js checks this)
   db: null, // kept for backward compat
 };

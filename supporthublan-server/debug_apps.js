@@ -3,8 +3,8 @@ const path = require('path');
 const fs = require('fs');
 
 const pstoolsPath = path.join(__dirname, 'PSTools') + path.sep;
-const hostname = 'ADMIN-PC-01049.plant.fccl.com';
-const cred = { username: 'deskadmin', password: 'Fauji$#@1', domain: 'plant.fccl.com', fullUsername: 'plant.fccl.com\\deskadmin', source: 'env-default' };
+const hostname = 'ADMIN-PC-01049.your.domain.com';
+const cred = { username: '', password: '', domain: '', fullUsername: 'your.domain.com\\deskadmin', source: 'env-default' };
 
 function credentialArgs(credential, hostname) {
   if (!credential || !credential.username || !credential.password) return [];

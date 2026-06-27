@@ -6,9 +6,9 @@ const fs = require('fs');
 const PSTOOLS_PATH = 'C:\\PSTools\\';
 const target = '192.168.10.31';
 const cred = {
-  username: 'Deskadmin',
-  password: 'Fauji$#@1',
-  domain: 'plant.fccl.com'
+  username: 'YOUR_USERNAME',
+  password: 'YOUR_PASSWORD',
+  domain: 'your.domain.com'
 };
 
 const exe = path.join(PSTOOLS_PATH, 'psexec.exe');

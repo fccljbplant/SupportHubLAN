@@ -189,8 +189,8 @@ Open `http://localhost:8080`.
 PORT=8080
 PSTOOLS_PATH=.\\PSTools\\
 BIND_ADDRESS=0.0.0.0
-DEFAULT_DOMAIN=plant.fccl.com
-DEFAULT_USERNAME=deskadmin
+DEFAULT_DOMAIN=your.domain.com
+DEFAULT_USERNAME=your-username
 DEFAULT_PASSWORD=your-password
 ADMIN_USER=
 ADMIN_PASS=

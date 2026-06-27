@@ -421,14 +421,14 @@
         return _available;
       }
 
-      async function apiCall(endpoint, body) {
+      async function apiCall(endpoint, body, method = 'POST') {
         const available = await checkBackend();
         if (!available) return { success: false, demo: true, error: 'Backend not available — running in demo mode' };
         try {
           const resp = await fetch(API_URL + endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
+            method,
+            headers: method === 'GET' ? {} : { 'Content-Type': 'application/json' },
+            body: method === 'GET' ? undefined : JSON.stringify(body),
           });
           return await resp.json();
         } catch (e) {
@@ -485,6 +485,12 @@
 
         // Job Queue
         executeQueue: (steps, hostnames, credential, errorHandling, queueName) => apiCall('/api/queues/execute', { steps, hostnames, credential, errorHandling, queueName }),
+        cancelJob: (jobId) => apiCall('/api/jobs/' + jobId + '/cancel', {}),
+        pauseJob: (jobId) => apiCall('/api/jobs/' + jobId + '/pause', {}),
+        resumeJob: (jobId) => apiCall('/api/jobs/' + jobId + '/resume', {}),
+        deleteJob: (jobId) => apiCall('/api/jobs/' + jobId, {}, 'DELETE'),
+        getJobs: () => apiGet('/api/jobs'),
+        getJob: (jobId) => apiGet('/api/jobs/' + jobId),
 
         // LAPS — Local Admin Password Solution
         retrieveLaps: (hostnames, credential) => apiCall('/api/laps/retrieve', { hostnames, credential }),
@@ -7552,6 +7558,9 @@
           const backendJobId = result.data?.jobId;
           if (backendJobId && window._supporthublanWs) {
             window._supporthublanWs.send(JSON.stringify({ type: 'subscribe', jobId: backendJobId }));
+            window._jobIdMap = window._jobIdMap || {};
+            window._jobIdMap[backendJobId] = localJobId;
+            updateJob(localJobId, { _backendJobId: backendJobId });
           }
           appendAudit({
             action: 'queues.execute', actionCategory: 'Job Queue',
@@ -7801,7 +7810,7 @@
           <div className="space-y-3">
             {activeJobs.length === 0 && <EmptyState icon="CheckCircle2" title="No active jobs" description="Build a queue and click Execute, or trigger an action from another screen." />}
             {activeJobs.map(job => (
-              <SectionCard key={job.id} title={job.name} description={`${job.targets.length} targets · started ${fmtRel(job.startedAt)}`} actions={<div className="flex gap-1"><IconButton icon="Pause" size="sm" title="Pause" onClick={() => { updateJob(job.id, { status: 'queued' }); toast.info(`Paused ${job.name}`); }} /><IconButton icon="X" size="sm" variant="danger" title="Cancel" onClick={() => { removeJob(job.id); toast.warning(`Cancelled ${job.name}`); }} /></div>}>
+              <SectionCard key={job.id} title={job.name} description={`${job.targets.length} targets · started ${fmtRel(job.startedAt)}`} actions={<div className="flex gap-1"><IconButton icon="Pause" size="sm" title="Pause" onClick={() => { const bjid = job._backendJobId || (window._jobIdMap ? Object.entries(window._jobIdMap).find(([,l]) => l === job.id)?.[0] : null) || job.id; if (window.SupportHubLANAPI) { window.SupportHubLANAPI.pauseJob(bjid); } updateJob(job.id, { status: 'paused' }); toast.info(`Paused ${job.name}`); }} /><IconButton icon="X" size="sm" variant="danger" title="Cancel" onClick={() => { const bjid = job._backendJobId || (window._jobIdMap ? Object.entries(window._jobIdMap).find(([,l]) => l === job.id)?.[0] : null) || job.id; if (window.SupportHubLANAPI) { window.SupportHubLANAPI.cancelJob(bjid); } removeJob(job.id); toast.warning(`Cancelled ${job.name}`); }} /></div>}>
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
                   <div className="lg:col-span-1">
                     <div className="text-meta text-text-dim uppercase mb-1">Current Step</div>

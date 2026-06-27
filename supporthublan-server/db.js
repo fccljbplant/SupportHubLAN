@@ -374,6 +374,13 @@ const jobs = {
       if (job.step) existing.step = job.step;
       if (job.completed_at) existing.completed_at = job.completed_at;
       if (job.output) existing.output = job.output;
+      if (job.logs) existing.logs = job.logs;
+      if (job.perHostProgress) existing.perHostProgress = job.perHostProgress;
+      if (job.steps) existing.steps = job.steps;
+      if (job.summary) existing.summary = job.summary;
+      if (job.hostnames) existing.hostnames = job.hostnames;
+      if (job.queueName) existing.queueName = job.queueName;
+      if (job.totalSteps !== undefined) existing.totalSteps = job.totalSteps;
     } else {
       s.jobs.push({
         id: job.id, name: job.name || '', status: job.status || 'queued',
@@ -381,12 +388,38 @@ const jobs = {
         targets: job.targets ? JSON.stringify(job.targets) : null,
         started_at: job.started_at || null, completed_at: job.completed_at || null,
         output: job.output || null, inventory_id: job.inventory_id || null,
+        logs: job.logs || null, perHostProgress: job.perHostProgress || null,
+        steps: job.steps || null, summary: job.summary || null,
+        hostnames: job.hostnames || null, queueName: job.queueName || null,
+        totalSteps: job.totalSteps || 0,
       });
     }
     saveStore();
     return { success: true };
   },
-  list: (limit = 100) => loadStore().jobs.slice().reverse().slice(0, limit),
+  get: (id) => {
+    const s = loadStore();
+    const j = s.jobs.find(j => j.id === id);
+    if (!j) return null;
+    return {
+      jobId: j.id, queueName: j.queueName || j.name,
+      status: j.status, startedAt: j.started_at,
+      completed: j.progress, total: j.totalSteps || 0,
+      steps: j.steps || [], hostnames: j.hostnames || [],
+      perHostProgress: j.perHostProgress || {},
+      logs: j.logs || [], summary: j.summary || null,
+    };
+  },
+  delete: (id) => { const s = loadStore(); const before = s.jobs.length; s.jobs = s.jobs.filter(j => j.id !== id); saveStore(); return { success: true, removed: before !== s.jobs.length }; },
+  list: (limit = 100) => loadStore().jobs.slice().reverse().slice(0, limit).map(j => ({
+    jobId: j.id, queueName: j.queueName || j.name || '',
+    status: j.status || 'unknown', startedAt: j.started_at || null,
+    completed: j.progress || 0, total: j.totalSteps || 0,
+    steps: j.steps || [], hostnames: j.hostnames || [],
+    perHostProgress: j.perHostProgress || {},
+    logs: j.logs || [], summary: j.summary || null,
+    completedAt: j.completed_at || null,
+  })),
   clear: () => { const s = loadStore(); s.jobs = []; saveStore(); return { success: true }; },
 };
 

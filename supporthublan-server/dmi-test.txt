@@ -1,0 +1,94 @@
+﻿# dmidecode 2.10
+SMBIOS 3.1 present.
+
+Handle 0x0002, DMI type 1, 27 bytes
+System Information
+	Manufacturer: HP
+	Product Name: HP EliteBook 850 G5
+	Version: SBKPF
+	Serial Number: 5CG9196CZ7
+	UUID: B1E1C741-F78F-747A-1120-D63A3DEC655C
+	Wake-up Type: Power Switch
+	SKU Number: 2FH35AV
+	Family: 103C_5336AN HP EliteBook
+
+Handle 0x0007, DMI type 16, 23 bytes
+Physical Memory Array
+	Location: System Board Or Motherboard
+	Use: System Memory
+	Error Correction Type: None
+	Maximum Capacity: 32 GB
+	Error Information Handle: Not Provided
+	Number Of Devices: 2
+
+Handle 0x0010, DMI type 4, 48 bytes
+Processor Information
+	Socket Designation: U3E1
+	Type: Central Processor
+	Family: <OUT OF SPEC>
+	Manufacturer: Intel(R) Corporation
+	ID: EA 06 08 00 FF FB EB BF
+	Version: Intel(R) Core(TM) i7-8650U CPU @ 1.90GHz
+	Voltage: 0.7 V
+	External Clock: 100 MHz
+	Max Speed: 4200 MHz
+	Current Speed: 1900 MHz
+	Status: Populated, Enabled
+	Upgrade: <OUT OF SPEC>
+	L1 Cache Handle: 0x000D
+	L2 Cache Handle: 0x000E
+	L3 Cache Handle: 0x000F
+	Serial Number: To Be Filled By O.E.M.
+	Asset Tag: To Be Filled By O.E.M.
+	Part Number: To Be Filled By O.E.M.
+	Core Count: 4
+	Core Enabled: 4
+	Thread Count: 8
+	Characteristics:
+		64-bit capable
+
+Handle 0x0016, DMI type 17, 40 bytes
+Memory Device
+	Array Handle: 0x0007
+	Error Information Handle: Not Provided
+	Total Width: 64 bits
+	Data Width: 64 bits
+	Size: 8192 MB
+	Form Factor: SODIMM
+	Set: None
+	Locator: Bottom-Slot 1(left)
+	Bank Locator: ChannelA0
+	Type: <OUT OF SPEC>
+	Type Detail: Synchronous
+	Speed: 2400 MHz
+	Manufacturer: Samsung
+	Serial Number: 31A65520
+	Asset Tag:  
+	Part Number: M471A1K43CB1-CTD    
+	Rank: 1
+
+Handle 0x0008, DMI type 17, 40 bytes
+Memory Device
+	Array Handle: 0x0007
+	Error Information Handle: Not Provided
+	Total Width: 64 bits
+	Data Width: 64 bits
+	Size: 8192 MB
+	Form Factor: SODIMM
+	Set: None
+	Locator: Bottom-Slot 2(right)
+	Bank Locator: ChannelB0
+	Type: <OUT OF SPEC>
+	Type Detail: Synchronous
+	Speed: 2400 MHz
+	Manufacturer: Samsung
+	Serial Number: 9585315D
+	Asset Tag:  
+	Part Number: M471A1K43DB1-CTD    
+	Rank: 1
+
+Handle 0x0018, DMI type 32, 11 bytes
+System Boot Information
+	Status: No errors detected
+
+

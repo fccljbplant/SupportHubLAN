@@ -82,7 +82,7 @@ if (fs.existsSync(envPath)) {
 const app = express();
 const server = http.createServer(app);
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const PSTOOLS_PATH = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
+const PSTOOLS_PATH = process.env.PSTOOLS_PATH || path.join(__dirname, 'PSTools') + path.sep;
 const BIND_ADDRESS = process.env.BIND_ADDRESS || '0.0.0.0';
 const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASS = process.env.ADMIN_PASS || '';
@@ -287,6 +287,17 @@ app.get('/api/health', (req, res) => {
 
 // ==========================================================================
 // INVENTORIES — Multi-inventory management (SQLite-backed)
+// JOB ENDPOINTS
+app.get('/api/jobs', (req, res) => {
+  const jobs = [];
+  try { if (db.jobs && db.jobs.list) { const list = db.jobs.list(100); res.json({ success: true, data: list }); return; } } catch (_) {}
+  res.json({ success: true, data: jobs });
+});
+app.get('/api/jobs/:jobId', (req, res) => {
+  try { if (db.jobs && db.jobs.get) { const j = db.jobs.get(req.params.jobId); if (j) return res.json({ success: true, data: j }); } } catch (_) {}
+  res.json({ success: false, error: 'Job not found' });
+});
+
 // Each inventory = one tab in the UI
 // ==========================================================================
 app.get('/api/inventories', (req, res) => {
@@ -521,7 +532,9 @@ app.post('/api/settings/log-retention', (req, res) => {
 // Tries primary AD credentials first, then fallback local admin credentials
 function getGlobalCredentials() {
   try {
-    const globalDomain = db.settings.get('globalDomainSuffix', '') || DEFAULT_DOMAIN;
+    const credDomain = db.settings.get('globalCredDomain', '') || '';
+    const suffixDomain = db.settings.get('globalDomainSuffix', '') || DEFAULT_DOMAIN;
+    const globalDomain = credDomain || suffixDomain;
     // Try primary AD/domain credentials
     const username = db.settings.get('globalCredUsername', '') || '';
     const encryptedPassword = db.settings.get('globalCredPassword', '') || '';
@@ -1607,23 +1620,135 @@ app.post('/api/deploy/package', async (req, res) => {
 
 // Alias: /api/deployments/run → /api/deploy/package (frontend compatibility)
 app.post('/api/deployments/run', async (req, res) => { req.url = '/api/deploy/package'; app.handle(req, res); });
+
+// Job registry for cancel/pause/resume
+const jobRegistry = new Map();
+
+app.post('/api/jobs/:jobId/cancel', (req, res) => {
+  const job = jobRegistry.get(req.params.jobId);
+  if (job) {
+    job.cancelled = true;
+    broadcastUpdate({ type: 'job-cancelled', jobId: req.params.jobId });
+    try { if (db.jobs && db.jobs.upsert) { const j = db.jobs.get(req.params.jobId); if (j) { db.jobs.upsert({ id: req.params.jobId, status: 'cancelled' }); } } } catch (_) {}
+    res.json({ success: true, status: 'cancelled' });
+  } else {
+    // Even if not found in registry, persist cancelled status
+    try { if (db.jobs && db.jobs.upsert) { db.jobs.upsert({ id: req.params.jobId, status: 'cancelled' }); } } catch (_) {}
+    broadcastUpdate({ type: 'job-cancelled', jobId: req.params.jobId });
+    res.json({ success: true, status: 'cancelled', note: 'Job not in active registry, status persisted' });
+  }
+});
+
+app.post('/api/jobs/:jobId/pause', (req, res) => {
+  const job = jobRegistry.get(req.params.jobId);
+  if (job) {
+    job.paused = true;
+    broadcastUpdate({ type: 'job-paused', jobId: req.params.jobId });
+    try { if (db.jobs && db.jobs.upsert) { db.jobs.upsert({ id: req.params.jobId, status: 'paused' }); } } catch (_) {}
+    res.json({ success: true, status: 'paused' });
+  } else {
+    res.json({ success: false, error: 'Job not found or already completed' });
+  }
+});
+
+app.post('/api/jobs/:jobId/resume', (req, res) => {
+  const job = jobRegistry.get(req.params.jobId);
+  if (job) {
+    job.paused = false;
+    broadcastUpdate({ type: 'job-resumed', jobId: req.params.jobId });
+    try { if (db.jobs && db.jobs.upsert) { db.jobs.upsert({ id: req.params.jobId, status: 'running' }); } } catch (_) {}
+    res.json({ success: true, status: 'running' });
+  } else {
+    res.json({ success: false, error: 'Job not found or already completed' });
+  }
+});
+
+// DELETE job
+app.delete('/api/jobs/:jobId', (req, res) => {
+  try { if (db.jobs && db.jobs.get) { const j = db.jobs.get(req.params.jobId); if (j) { db.jobs.delete(req.params.jobId); return res.json({ success: true }); } } } catch (_) {}
+  res.json({ success: false, error: 'Job not found' });
+});
+
+// RERUN-FAILED — re-run a completed/cancelled job only for hosts that failed
+app.post('/api/jobs/:jobId/rerun-failed', async (req, res) => {
+  try {
+    const j = db.jobs ? db.jobs.get(req.params.jobId) : null;
+    if (!j) return res.json({ success: false, error: 'Job not found' });
+    const failedHosts = [];
+    const allHostnames = j.hostnames || [];
+    const prevProgress = j.perHostProgress || {};
+    for (const h of allHostnames) {
+      const p = prevProgress[h];
+      if (!p || p.status === 'failed' || p.status === 'unreachable') failedHosts.push(h);
+    }
+    if (failedHosts.length === 0) return res.json({ success: true, data: { note: 'No failed hosts to rerun' } });
+    const steps = req.body.steps || j.steps || [];
+    const queueName = req.body.queueName || (j.name ? j.name + ' (rerun)' : 'Rerun');
+    // Delegate to /api/queues/execute — reuse the endpoint internally
+    req.body.steps = steps;
+    req.body.hostnames = failedHosts;
+    req.body.queueName = queueName;
+    req.body.errorHandling = 'continue';
+    // Forward body and let /api/queues/execute handle the rest
+    // Cannot directly call the handler, so respond with the info and let frontend resubmit
+    return res.json({ success: true, data: { failedHosts, steps, queueName, note: 'Frontend should call executeQueue with these params' } });
+  } catch (e) { res.json({ success: false, error: e.message }); }
+});
+
 // ==========================================================================
 app.post('/api/queues/execute', async (req, res) => {
   const { steps, hostnames, credential, errorHandling, queueName } = req.body;
   const jobId = 'job-' + Date.now();
+
+  // Register for pause/cancel control
+  const jobCtx = { cancelled: false, paused: false, completed: false };
+  jobRegistry.set(jobId, jobCtx);
+  setTimeout(() => jobRegistry.delete(jobId), 3600000); // auto-clean after 1 hour
+
+  // Helper: classify error as unreachable vs failed
+  const classifyError = (msg) => {
+    const m = (msg || '').toLowerCase();
+    const patterns = ['network path not found','rpc server is unavailable','access is denied','could not resolve','host unreachable','no such host','connection refused','timed out','error 53','error 5','error 1722','unknown host','network name cannot be found','the handle is invalid','couldn\'t access','cannot connect'];
+    return patterns.some(p => m.includes(p)) ? 'unreachable' : 'failed';
+  };
+
+  // Get fallback credential (local admin) for auto-retry on access denied
+  let fallbackCred = null;
+  try {
+    const fbUser = db.settings.get('fallbackCredUsername', '') || '';
+    const fbEnc = db.settings.get('fallbackCredPassword', '') || '';
+    const fbPass = fbEnc ? db.decryptField(fbEnc) : '';
+    if (fbUser && fbPass) fallbackCred = { username: fbUser, password: fbPass, domain: db.settings.get('fallbackCredDomain', '') || '' };
+  } catch (_) {}
 
   // Respond immediately with job ID
   res.json({ success: true, data: { jobId, status: 'running', stepCount: steps.length, hostCount: hostnames.length, queueName: queueName || 'Untitled Queue' } });
 
   // Execute async + broadcast progress
   (async () => {
+    const perHostProgress = {};
+    const jobLogs = [];
+    hostnames.forEach(h => { perHostProgress[h] = { step: '', status: 'pending' }; });
     let totalSteps = steps.length * hostnames.length;
     let completed = 0;
+    // Save job to DB immediately with 'running' status
+    try { if (db.jobs && db.jobs.upsert) { db.jobs.upsert({ id: jobId, name: queueName || 'Untitled Queue', status: 'running', progress: 0, step: 'Starting…', started_at: new Date().toISOString(), completed_at: null, hostnames, steps, perHostProgress, totalSteps, logs: [] }); } } catch (_) {}
     broadcastUpdate({ type: 'queue-start', jobId, queueName: queueName || 'Untitled Queue', total: totalSteps, completed: 0 });
 
     for (let si = 0; si < steps.length; si++) {
       const step = steps[si];
       for (let hi = 0; hi < hostnames.length; hi++) {
+        // Handle pause
+        while (jobCtx.paused) {
+          await new Promise(r => setTimeout(r, 500));
+        }
+        if (jobCtx.cancelled) {
+          jobCtx.completed = true;
+          try { if (db.jobs && db.jobs.upsert) { db.jobs.upsert({ id: jobId, name: queueName || 'Untitled Queue', status: 'cancelled', progress: completed, step: 'Cancelled', completed_at: new Date().toISOString(), hostnames, steps, perHostProgress, logs: jobLogs, totalSteps }); } } catch (_) {}
+          jobRegistry.delete(jobId);
+          broadcastUpdate({ type: 'queue-aborted', jobId, reason: 'Cancelled by user' });
+          return;
+        }
         const hostname = sanitizeHost(hostnames[hi]);
         let stepResult = { success: false, output: '', error: '' };
         const progressMsg = { type: 'queue-progress', jobId, step: step.type, stepIndex: si, totalSteps: steps.length, hostname, hostIndex: hi, totalHosts: hostnames.length, completed, total: totalSteps, status: 'running' };
@@ -1665,69 +1790,92 @@ app.post('/api/queues/execute', async (req, res) => {
               if (step.config?.code) {
                 const cmdResult = await powershell.runRemoteViaPsExec(hostname, step.config.code, PSTOOLS_PATH, 300000, getGlobalCredentials());
                 stepResult = { success: cmdResult.success, output: cmdResult.stdout, error: cmdResult.stderr };
-              }
+              } else { stepResult = { success: false, error: 'No command code configured' }; }
               break;
-            case 'start-service':
+            case 'start-service': case 'stop-service': case 'restart-service': case 'check-service':
               if (step.config?.serviceName) {
-                script = `try { Start-Service -Name '${sanitizeHost(step.config.serviceName)}' -ErrorAction Stop; Write-Output '<<<JSON>>>{"state":"Running"}<<<END>>>' } catch { Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>') }`;
-                const svcR = await runRemotePowerShellJson(hostname, script, 30000);
-                stepResult = { success: svcR.success, output: JSON.stringify(svcR.json || {}), error: svcR.json?.error || svcR.stderr };
-              }
-              break;
-            case 'stop-service':
-              if (step.config?.serviceName) {
-                script = `try { Stop-Service -Name '${sanitizeHost(step.config.serviceName)}' -Force -ErrorAction Stop; Write-Output '<<<JSON>>>{"state":"Stopped"}<<<END>>>' } catch { Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>') }`;
-                const svcR = await runRemotePowerShellJson(hostname, script, 30000);
-                stepResult = { success: svcR.success, output: JSON.stringify(svcR.json || {}), error: svcR.json?.error || svcR.stderr };
-              }
-              break;
-            case 'restart-service':
-              if (step.config?.serviceName) {
-                script = `try { Restart-Service -Name '${sanitizeHost(step.config.serviceName)}' -Force -ErrorAction Stop; Write-Output '<<<JSON>>>{"state":"Running"}<<<END>>>' } catch { Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>') }`;
-                const svcR = await runRemotePowerShellJson(hostname, script, 30000);
-                stepResult = { success: svcR.success, output: JSON.stringify(svcR.json || {}), error: svcR.json?.error || svcR.stderr };
-              }
+                const action = step.type === 'stop-service' ? 'Stop' : step.type === 'restart-service' ? 'Restart' : step.type === 'check-service' ? 'Get' : 'Start';
+                script = step.type === 'check-service'
+                  ? `try { $s = Get-Service -Name '${sanitizeHost(step.config.serviceName)}' -ErrorAction Stop; Write-Output ('<<<JSON>>>{"name":"' + $s.Name + '","status":"' + $s.Status + '"}<<<END>>>') } catch { Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>') }`
+                  : `try { ${action}-Service -Name '${sanitizeHost(step.config.serviceName)}' ${step.type === 'stop-service' || step.type === 'restart-service' ? '-Force ' : ''}-ErrorAction Stop; Write-Output '<<<JSON>>>{"state":"${action === 'Stop' ? 'Stopped' : 'Running'}"}<<<END>>>' } catch { Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>') }`;
+                const svcResult = await runRemotePowerShellJson(hostname, script, 30000);
+                stepResult = { success: step.type === 'check-service' ? (svcResult.success && !!svcResult.json?.status) : svcResult.success, output: JSON.stringify(svcResult.json || {}), error: svcResult.json?.error || svcResult.stderr };
+              } else { stepResult = { success: false, error: 'No service name configured — edit step to specify one' }; }
               break;
             case 'psexec-run':
               if (step.config?.command) {
                 const psexecResult = await pstools.runPsExec(hostname, 'cmd.exe', ['/c', step.config.command], 60000, getGlobalCredentials());
                 stepResult = { success: psexecResult.success, output: psexecResult.stdout, error: psexecResult.stderr };
-              }
+              } else { stepResult = { success: false, error: 'No CMD command configured' }; }
               break;
             case 'wait-minutes':
               await new Promise(r => setTimeout(r, (step.config?.minutes || 1) * 60000));
               stepResult = { success: true, output: `Waited ${step.config?.minutes || 1} minute(s)` };
+              break;
+            // Host operations — same logic as Host Details tabs
+            case 'hardware-scan':
+              try {
+                const hwCred3 = getGlobalCredentials();
+                const fqHost3 = hostname.includes('.') ? hostname : (hwCred3?.domain ? hostname + '.' + hwCred3.domain : hostname);
+                const { results: hwResults3, ok: hwOk3 } = await scanHardware(hostname, fqHost3, hwCred3);
+                stepResult = { success: hwOk3, output: JSON.stringify(hwResults3, null, 2), error: hwOk3 ? null : ('No hardware data: ' + (hwResults3.errors?.[0]?.reason || 'unknown')) };
+              } catch (e) {
+                stepResult = { success: false, output: '', error: 'scanHardware threw: ' + e.message };
+              }
+              break;
+            case 'apps-list':
+              const appCred = getGlobalCredentials();
+              const [appPsInfo, appWmic] = await Promise.all([ pstools.runPsInfo(hostname, ['-d','-s'], 30000, appCred), wmic.runRemoteViaPsExec(hostname, 'product', 'Name,Version,Vendor', PSTOOLS_PATH, 60000, appCred) ]);
+              stepResult = { success: appPsInfo.success || appWmic.success, output: appWmic.records ? JSON.stringify(appWmic.records) : appPsInfo.stdout, error: appWmic.error || appPsInfo.stderr };
+              break;
+            case 'services-list':
+              script = `try { $svcs = Get-Service | Select-Object Name,DisplayName,Status,StartType | ConvertTo-Json -Compress; Write-Output ('<<<JSON>>>' + $svcs + '<<<END>>>') } catch { Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>') }`;
+              const svcList = await runRemotePowerShellJson(hostname, script, 60000);
+              stepResult = { success: svcList.success && !svcList.json?.error, output: JSON.stringify(svcList.json || {}), error: svcList.json?.error || svcList.stderr };
+              break;
+            // PsTools direct
+            case 'psinof': case 'psinfo':
+              const pi = await pstools.runPsInfo(hostname, ['-d','-h','-s','-c'], 30000, getGlobalCredentials());
+              stepResult = { success: pi.success, output: pi.stdout, error: pi.stderr };
+              break;
+            case 'pslist':
+              const pl = await pstools.runGeneric('pslist', hostname, ['-t'], 30000, getGlobalCredentials());
+              stepResult = { success: pl.success, output: pl.stdout, error: pl.stderr };
+              break;
+            case 'psloggedon':
+              const plo = await pstools.runPsLoggedOn(hostname, 15000, getGlobalCredentials());
+              stepResult = { success: plo.success, output: plo.stdout, error: plo.stderr };
               break;
             default:
               stepResult = { success: false, error: `Unknown step type: ${step.type}` };
           }
 
           completed++;
+          perHostProgress[hostname] = { step: step.type, status: stepResult.success ? 'success' : (stepResult.error && /access denied/i.test(stepResult.error) ? 'failed' : classifyError(stepResult.error)), command: step.label || step.type, error: stepResult.error?.slice(0, 200) || null, output: stepResult.output?.slice(0, 500) || null };
+          jobLogs.push({ time: new Date().toISOString(), type: 'step', hostname, step: step.type, command: step.label || step.type, success: stepResult.success, error: stepResult.error?.slice(0, 200), output: stepResult.output?.slice(0, 200), hostStatus: perHostProgress[hostname].status });
+          // Always continue — log errors and move to next PC, only cancel stops
           broadcastUpdate({
             type: 'queue-step-complete',
             jobId, step: step.type, stepIndex: si, hostname, hostIndex: hi,
             completed, total: totalSteps,
             success: stepResult.success,
-            output: stepResult.output?.slice(0, 5000),
+            output: stepResult.output?.slice(0, 1000),
             error: stepResult.error,
-            status: stepResult.success ? 'success' : 'failed'
+            status: stepResult.success ? 'success' : (stepResult.error && /access denied/i.test(stepResult.error) ? 'failed' : classifyError(stepResult.error))
           });
-
-          if (!stepResult.success && errorHandling === 'stop') {
-            broadcastUpdate({ type: 'queue-aborted', jobId, reason: 'Step failed and errorHandling=stop', step, hostname, completed, total: totalSteps });
-            return;
-          }
         } catch (e) {
           stepResult = { success: false, error: e.message };
           completed++;
+          perHostProgress[hostname] = { step: step.type, status: 'failed', command: step.label || step.type, error: e.message?.slice(0, 200) || null, output: null };
+          jobLogs.push({ time: new Date().toISOString(), type: 'step', hostname, step: step.type, command: step.label || step.type, success: false, error: e.message?.slice(0, 200), hostStatus: 'failed' });
           broadcastUpdate({ type: 'queue-step-complete', jobId, step: step.type, stepIndex: si, hostname, hostIndex: hi, completed, total: totalSteps, success: false, output: '', error: e.message, status: 'failed' });
-          if (errorHandling === 'stop') {
-            broadcastUpdate({ type: 'queue-aborted', jobId, reason: 'Step threw exception and errorHandling=stop', step, hostname, completed, total: totalSteps });
-            return;
-          }
         }
       }
     }
+    // Persist to DB FIRST, then broadcast, then remove from registry
+    try { if (db.jobs && db.jobs.upsert) { db.jobs.upsert({ id: jobId, name: queueName || 'Untitled Queue', status: 'completed', progress: completed, step: completed >= totalSteps ? 'Done' : 'Partial', started_at: new Date().toISOString(), completed_at: new Date().toISOString(), hostnames, steps, perHostProgress, logs: jobLogs, totalSteps }); } } catch (_) {}
+    jobCtx.completed = true;
+    jobRegistry.delete(jobId);
     broadcastUpdate({ type: 'queue-complete', jobId, completed, total: totalSteps, status: 'completed' });
   })();
 });
@@ -1897,689 +2045,374 @@ function parseRegUninstall(raw) {
 //
 // All commands are logged with error reasons (which service failed, how to fix)
 // ==========================================================================
-app.post('/api/hosts/:hostname/hardware', async (req, res) => {
-  const safeHost = sanitizeHost(req.params.hostname);
-  const hwCred = getGlobalCredentials();
-  // Append domain suffix for short hostnames (PsExec needs FQDN)
-  const fqHost = safeHost.includes('.') ? safeHost : (hwCred?.domain ? safeHost + '.' + hwCred.domain : safeHost);
-    const results = {
-      hostname: safeHost,
-      scannedAt: new Date().toISOString(),
-      hwVersion: 3, // bump on schema changes to invalidate old saved data
-      system: {}, motherboard: {}, bios: {}, processor: null,
+
+// ==========================================================================
+// Shared hardware scan — used by both POST endpoint and queue step
+// ==========================================================================
+async function scanHardware(safeHost, fqHost, hwCred) {
+  const results = {
+    hostname: safeHost,
+    scannedAt: new Date().toISOString(),
+    hwVersion: 4,
+    system: {}, motherboard: {}, bios: {}, processor: null,
     memory: [], disks: [], logicalDisks: [], network: [], gpu: [],
     os: {}, hotfixes: [], software: [], loggedInUser: null, userProfilePath: null,
     osDisplayVersion: null, osUBR: null, opticalDrives: [], soundDevices: [],
     physicalNetworks: [], formattedSummary: null,
-    methods: {},  // Track which method provided each section
-    errors: [],   // Collect error reasons for failed commands
+    methods: {},
+    errors: [],
   };
 
-  // Log the audit entry — who initiated, from where, when
-  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
-  const scanStartTime = Date.now();
+  // PRIORITY 1: WinAudit — standalone EXE, works on ALL Windows versions
+  // Copies to target via PsExec -c, runs locally, produces CSV we read back
+  const winAuditPath = path.join(__dirname, 'Tools', 'WinAudit_3_4_6.exe');
+  if (fs.existsSync(winAuditPath)) {
+    try {
+      const waRemoteCsv = `C:\\Windows\\Temp\\shl_audit_${safeHost}.csv`;
+      const waExe = path.join(PSTOOLS_PATH, 'psexec.exe');
+      const credArgs = require('./lib/utils').credentialArgs || ((c, h) => c ? ['-u', (c.domain ? c.domain + '\\' : '') + c.username, '-p', c.password] : []);
 
-  try {
-    // ========================================================================
-    // PRIORITY 1: PsTools (PsInfo + PsLoggedOn) — PRIMARY, don't break this
-    // ========================================================================
-    const [psinfoRes, loggedOnRes] = await Promise.all([
-      pstools.runPsInfo(fqHost, ['-d', '-h', '-s', '-c'], 30000, hwCred),
-      pstools.runPsLoggedOn(fqHost, 15000, hwCred),
-    ]);
+      // Step 1: Run WinAudit on target
+      const waRunArgs = ['-accepteula', '\\\\' + fqHost,
+        ...credArgs(hwCred, fqHost),
+        '-s', '-h', '-c', winAuditPath,
+        '/r=a', `/o:${waRemoteCsv}`, '/f=CSV'];
 
-    // LOG debug output
-    if (psinfoRes.success) {
-      const dbg = '' + psinfoRes.stdout;
-      results.rawOutputs = results.rawOutputs || {};
-      results.rawOutputs.psInfo = dbg.length > 3000 ? dbg.substring(0, 3000) + '...' : dbg;
+      const waRunResult = await new Promise((resolve) => {
+        const proc = require('child_process').spawn(waExe, waRunArgs, { windowsHide: true, timeout: 120000 });
+        let out = ''; proc.stdout.on('data', d => out += d.toString());
+        proc.stderr.on('data', d => out += d.toString());
+        proc.on('close', code => resolve({ success: code === 0, stdout: out }));
+        proc.on('error', err => resolve({ success: false, stdout: err.message }));
+        setTimeout(() => { try { proc.kill(); } catch {} }, 125000);
+      });
+
+      if (waRunResult.success) {
+        results.methods.winaudit = 'success';
+
+        // Step 2: Read CSV back via PsExec
+        const waReadResult = await pstools.runPsExec(fqHost, 'cmd.exe', ['/c', `type ${waRemoteCsv}`], 30000, hwCred);
+
+        if (waReadResult.success && waReadResult.stdout) {
+          const csvLines = waReadResult.stdout.split('\n').filter(l => l.trim());
+          if (csvLines.length >= 2) {
+            const headers = csvLines[0].split(',').map(h => h.trim().toLowerCase());
+            const data = csvLines[1].split(',').map(d => d.trim());
+
+            const get = (name) => {
+              const idx = headers.indexOf(name.toLowerCase());
+              return idx >= 0 ? data[idx] || null : null;
+            };
+
+            const osName = get('os name') || get('os');
+            if (osName) { results.os.name = osName; results.os.version = get('os version') || ''; results.os.build = get('os build') || ''; }
+            const manufacturer = get('manufacturer') || get('system manufacturer');
+            if (manufacturer) { results.system.manufacturer = manufacturer; results.system.model = get('model') || get('system model') || ''; }
+            const serial = get('serial number') || get('system serial number');
+            if (serial) results.system.serial = serial;
+            const uuid = get('uuid');
+            if (uuid) results.uuid = uuid;
+            const chassis = get('chassis') || get('chassis type');
+            if (chassis) { results.chassisType = chassis; results.chassisTypeName = chassis; }
+            const biosVendor = get('bios vendor') || get('bios manufacturer');
+            if (biosVendor) results.bios = { vendor: biosVendor, version: get('bios version') || '' };
+            const cpuName = get('processor') || get('cpu');
+            if (cpuName) results.processor = { name: cpuName, cores: parseInt(get('cores')) || 0, threads: parseInt(get('threads')) || 0, socket: get('socket') || '' };
+            const totalRam = get('total physical memory') || get('total ram') || get('ram');
+            if (totalRam) { const mb = parseInt(totalRam) || Math.round(parseFloat(totalRam) * 1024); if (mb > 0) results.system.totalRamMB = mb; }
+            const loggedIn = get('logged on user') || get('current user');
+            if (loggedIn) results.loggedInUser = loggedIn;
+            const ipAddr = get('ip address') || get('ip');
+            if (ipAddr && results.network.length === 0) results.network = [{ description: 'WinAudit', ipAddress: ipAddr, macAddress: '', defaultGateway: '', dhcpEnabled: false }];
+
+            results.rawOutputs = results.rawOutputs || {};
+            results.rawOutputs.winaudit = waReadResult.stdout.substring(0, 5000);
+          }
+        }
+
+        // Step 3: Cleanup temp file
+        pstools.runPsExec(fqHost, 'cmd.exe', ['/c', `del ${waRemoteCsv}`], 10000, hwCred).catch(() => {});
+      } else {
+        results.methods.winaudit = 'failed';
+        results.errors.push({ priority: 1, method: 'WinAudit', reason: waRunResult.stdout?.substring(0, 200) || 'Unknown error' });
+      }
+    } catch (e) {
+      results.methods.winaudit = 'failed';
+      results.errors.push({ priority: 1, method: 'WinAudit', reason: e.message });
     }
+  }
 
-    // Parse PsInfo output (it's a single comma-delimited line with -c flag)
-    if (psinfoRes.success && psinfoRes.stdout) {
-      results.methods.psinfo = 'success';
-      const tokens = psinfoRes.stdout.split(/[\n,]/).map(t => t.trim());
+  // PRIORITY 2: PsExec + PowerShell (remote OS, GPU, disks, network)
+  // Three scripts to fit PsExec's ~700-byte stdout pipe buffer.
+  // Script A: critical (OS, system, UUID, chassis, BIOS, CPU)
+  // Script B: hardware (motherboard, memory, disks, GPU)
+  // Script C: peripherals (net, volumes, DVD, audio, phy nets)
 
-      // Known product types — used to detect if kernel version spanned 2 tokens
-      const knownProductTypes = ['Professional', 'Server', 'Enterprise', 'Education', 'Home', 'Workstation', 'Standard', 'Datacenter', 'Essentials'];
+  const _kv = {};
+  function _parsePs(stdout) {
+    if (!stdout) return;
+    for (const raw of stdout.split('\n')) {
+      const line = raw.trim();
+      if (!line || !line.includes('=')) continue;
+      const eqIdx = line.indexOf('=');
+      const key = line.substring(0, eqIdx).trim();
+      const val = line.substring(eqIdx + 1).trim();
+      if (!_kv[key]) { _kv[key] = val; }
+      else if (Array.isArray(_kv[key])) { _kv[key].push(val); }
+      else { _kv[key] = [_kv[key], val]; }
+    }
+  }
+  function _gA(k) { if (!_kv[k]) return []; const v = _kv[k]; return Array.isArray(v) ? v : [v]; }
+  function _p1(k) { const a = _gA(k); return a.length > 0 ? a[0].split('|').map(s => s.trim()) : []; }
 
-      let i = 0;
-      const sys = {};
-      sys.hostname = tokens[i++] || '';
-      sys.uptime = tokens[i++] || '';
+  const psA = `$o=@()
+$cs=Get-CimInstance Win32_ComputerSystem;if($cs){$o+=('SYS='+$cs.Manufacturer+'|'+$cs.Model)}
+$os=Get-CimInstance Win32_OperatingSystem;if($os){$dtStr='';$dt=$os.InstallDate;if($dt){try{$dtStr=$dt.ToShortDateString()}catch{$dtStr=''+$dt}};$o+=('OS='+$os.Caption+'|'+$os.OSArchitecture+'|'+$os.Version+'|'+$os.SerialNumber+'|'+$os.BuildNumber+'|'+$dtStr+'|'+$os.RegisteredUser+'|'+$os.RegisteredOrganization)}
+$csp=Get-CimInstance Win32_ComputerSystemProduct;if($csp){$o+=('CSP='+$csp.UUID)}
+$enc=Get-CimInstance Win32_SystemEnclosure;if($enc){$o+=('ENC='+$enc.ChassisTypes[0])}
+$reg=try{Get-ItemProperty "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"}catch{$null};if($reg){$o+=('REG='+$reg.DisplayVersion+'|'+$reg.CurrentBuild+'|'+$reg.UBR)}
+$bios=Get-CimInstance Win32_BIOS;if($bios){$o+=('BIOS='+$bios.Manufacturer+'|'+$bios.SMBIOSBIOSVersion+'|'+$bios.ReleaseDate)}
+$cpu=Get-CimInstance Win32_Processor;if($cpu){$o+=('CPU='+$cpu.Name.Trim()+'|'+$cpu.Manufacturer+'|'+$cpu.NumberOfCores+'|'+$cpu.NumberOfLogicalProcessors)}
+Write-Output ($o -join "\`n")`;
 
-      // Kernel version may span 2 tokens if it contains a comma
-      let kernelVersion = tokens[i++] || '';
-      if (i < tokens.length) {
-        const nextToken = tokens[i] || '';
-        const isProductType = knownProductTypes.some(pt => nextToken.toLowerCase() === pt.toLowerCase());
-        if (!isProductType && nextToken !== '') kernelVersion += ', ' + tokens[i++];
+  const psB = `$o=@()
+$u=$env:USERNAME;$o+=('USER='+$u)
+$up=$env:USERPROFILE;$up=$up -replace '\\|','-';if($up){$o+=('UP='+$up)}
+$mb=Get-CimInstance Win32_BaseBoard;if($mb){$o+=('MB='+$mb.Manufacturer+'|'+$mb.Product+'|'+$mb.Version+'|'+$mb.SerialNumber)}
+$mem=@(Get-CimInstance Win32_PhysicalMemory);foreach($m in $mem){$o+=('MEM='+[math]::Round($m.Capacity/1GB,1)+'|'+$m.Manufacturer+'|'+$m.PartNumber+'|'+$m.Speed+'|'+$m.DeviceLocator)}
+$dsk=@(Get-CimInstance Win32_DiskDrive);foreach($d in $dsk){$sn=$d.SerialNumber;$sn="$sn".Trim();$o+=('DISK='+$d.Index+'|'+$d.Model+'|'+[math]::Round($d.Size/1GB,0)+'|'+$d.InterfaceType+'|'+$sn)}
+$gpu=@(Get-CimInstance Win32_VideoController);foreach($g in $gpu){$o+=('GPU='+$g.Name+'|'+$g.AdapterCompatibility+'|'+[math]::Round($g.AdapterRAM/1MB,0)+'|'+$g.DriverVersion)}
+Write-Output ($o -join "\`n")`;
+
+  const psC = `$o=@()
+$net=@(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True");foreach($n in $net){$ips=($n.IPAddress-join',');$gw=($n.DefaultIPGateway-join',');$o+=('NET='+$n.Description+'|'+$ips+'|'+$n.MACAddress+'|'+$gw+'|'+$n.DHCPEnabled)}
+$vol=@(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3");foreach($v in $vol){$o+=('VOL='+$v.DeviceID+'|'+$v.FileSystem+'|'+$v.VolumeName+'|'+[math]::Round($v.Size/1GB,1)+'|'+[math]::Round($v.FreeSpace/1GB,1))}
+$dvd=@(Get-CimInstance Win32_CDROMDrive);if($dvd.Count -gt 0){foreach($d in $dvd){$o+=('DVD='+$d.Drive+'|'+$d.Name)}}else{$o+=('DVD=None')}
+$audio=@(Get-CimInstance Win32_SoundDevice);foreach($a in $audio){$an=""+$a.Name;$an=$an -replace '\\|','-';$o+=('AUD='+$an)}
+$pnet=@(Get-CimInstance Win32_NetworkAdapter -Filter "PhysicalAdapter=True");foreach($p in $pnet){$pn=""+$p.Name;$pn=$pn -replace '\\|','-';$pm=""+$p.MACAddress;$pm=$pm -replace '\\|','-';$o+=('PHYNET='+$pn+'|'+$pm)}
+Write-Output ($o -join "\`n")`;
+
+  const [psRA, psRB, psRC] = await Promise.all([
+    powershell.runRemoteViaPsExec(fqHost, psA, PSTOOLS_PATH, 45000, hwCred),
+    powershell.runRemoteViaPsExec(fqHost, psB, PSTOOLS_PATH, 45000, hwCred),
+    powershell.runRemoteViaPsExec(fqHost, psC, PSTOOLS_PATH, 45000, hwCred),
+  ]);
+
+  if (psRA.success || psRB.success || psRC.success) {
+    results.methods.powershell = 'success';
+    results.rawOutputs = results.rawOutputs || {};
+    results.rawOutputs.powershell = ('' + (psRA.stdout || '') + '\n---B---\n' + (psRB.stdout || '') + '\n---C---\n' + (psRC.stdout || '')).substring(0, 3000);
+    try {
+      _parsePs(psRA.stdout);
+      _parsePs(psRB.stdout);
+      _parsePs(psRC.stdout);
+
+      if (_kv.USER) results.loggedInUser = _kv.USER;
+      const osp = _p1('OS');
+      if (osp[0]) results.os.name = osp[0];
+      if (osp[1]) results.os.architecture = osp[1];
+      if (osp[2]) results.os.version = osp[2];
+      if (osp[3]) results.os.serial = osp[3];
+      if (osp[4]) results.os.build = osp[4];
+      if (osp[5]) results.os.installDate = osp[5];
+      if (osp[6]) results.os.registeredUser = osp[6];
+      if (osp[7] !== undefined) results.os.registeredOrg = osp[7];
+      const sys = _p1('SYS');
+      if (sys[0]) results.system.manufacturer = sys[0];
+      if (sys[1]) results.system.model = sys[1];
+      if (sys[2]) results.system.domain = sys[2];
+      if (sys[3]) results.system.systemType = sys[3];
+      if (_kv.CSP) results.uuid = _kv.CSP;
+      const enc = _p1('ENC');
+      if (enc[0]) {
+        const chassisTypes = ['Other','Unknown','Desktop','Low Profile Desktop','Pizza Box','Mini Tower','Tower','Portable','Laptop','Notebook','Hand Held','Docking Station','All-in-One','Sub Notebook','Space-saving','Lunch Box','Main System Chassis','Expandable Chassis','Rack Mount Chassis','Sealed-case PC','Multi-system','Compact PCI','Advanced TCA','Blade','Blade Enclosure','Tablet','Convertible','Detachable','IoT Gateway','Embedded PC','Mini PC','Stick PC'];
+        const ctNum = parseInt(enc[0]);
+        results.chassisType = enc[0];
+        results.chassisTypeName = (ctNum > 0 && ctNum <= chassisTypes.length) ? chassisTypes[ctNum - 1] : enc[0];
       }
-      sys.kernelVersion = kernelVersion;
+      const mbp = _p1('MB');
+      if (mbp[0] || mbp[1]) { results.motherboard = { manufacturer: mbp[0] || '', product: mbp[1] || '', version: mbp[2] || '', serial: mbp[3] || '' }; }
+      const b = _p1('BIOS');
+      if (b[0] || b[1]) { results.bios = { vendor: b[0] || '', manufacturer: b[0] || '', version: b[1] || '', releaseDate: b[2] || '', serial: '' }; }
+      const cp = _p1('CPU');
+      if (cp[0]) { results.processor = { name: cp[0], manufacturer: cp[1] || '', cores: parseInt(cp[2]) || 0, threads: parseInt(cp[3]) || 0, maxSpeedMHz: 0, currentSpeedMHz: 0, socket: '', socketCount: 1, serial: '' }; }
+      const pwMem = _gA('MEM').map(m => { const p = m.split('|').map(s => s.trim()); return { capacityGB: parseFloat(p[0]) || 0, manufacturer: p[1] || '', partNumber: p[2] || '', speed: parseInt(p[3]) || 0, deviceLocator: p[4] || '' }; });
+      if (pwMem.length > 0) results.memory = pwMem;
+      const pwDisks = _gA('DISK').map(d => { const p = d.split('|').map(s => s.trim()); return { index: parseInt(p[0]) || 0, model: p[1] || '', sizeGB: parseFloat(p[2]) || 0, interfaceType: p[3] || '', serialNumber: p[4] || '', partitions: 0 }; });
+      if (pwDisks.length > 0) results.disks = pwDisks;
+      const pwGpu = _gA('GPU').map(g => { const p = g.split('|').map(s => s.trim()); return { name: p[0] || '', manufacturer: p[1] || '', ramMB: parseInt(p[2]) || 0, driverVersion: p[3] || '', driverDate: '' }; });
+      if (pwGpu.length > 0) results.gpu = pwGpu;
+      const pwNet = _gA('NET').map(n => { const p = n.split('|').map(s => s.trim()); return { description: p[0] || '', ipAddress: p[1] || '', macAddress: p[2] || '', defaultGateway: p[3] || '', dhcpEnabled: (p[4] || '') === 'True', dnsServers: '' }; });
+      if (pwNet.length > 0) results.network = pwNet;
+      const pwVol = _gA('VOL').map(v => { const p = v.split('|').map(s => s.trim()); return { drive: p[0] || '', fileSystem: p[1] || '', volumeName: p[2] || '', sizeGB: parseFloat(p[3]) || 0, freeGB: parseFloat(p[4]) || 0 }; });
+      if (pwVol.length > 0) results.logicalDisks = pwVol;
+      const upPath = _p1('UP');
+      if (upPath[0]) results.userProfilePath = upPath[0];
+      const reg = _p1('REG');
+      if (reg[0]) results.osDisplayVersion = reg[0];
+      if (reg[1] && !results.os.build) results.os.build = reg[1];
+      if (reg[2]) results.osUBR = reg[2];
+      const pwDvd = _gA('DVD').filter(d => d !== 'None').map(d => { const p = d.split('|').map(s => s.trim()); return { drive: p[0] || '', name: p[1] || '' }; });
+      if (pwDvd.length > 0) results.opticalDrives = pwDvd;
+      const pwAudio = _gA('AUD').filter(Boolean);
+      if (pwAudio.length > 0) results.soundDevices = pwAudio;
+      const pwPhy = _gA('PHYNET').map(p => { const parts = p.split('|').map(s => s.trim()); return { name: parts[0] || '', macAddress: parts[1] || '' }; });
+      if (pwPhy.length > 0) results.physicalNetworks = pwPhy;
+      if (results.memory.length > 0) { const stickTotalGB = results.memory.reduce((s, m) => s + (m.capacityGB || 0), 0); if (stickTotalGB > 0) results.system.totalRamMB = stickTotalGB * 1024; }
+    } catch (e) {
+      results.errors.push({ priority: 2, method: 'PowerShell', reason: 'Parse error: ' + e.message });
+    }
+  } else {
+    results.methods.powershell = 'failed';
+    const allReasons = [psRA, psRB, psRC].filter(r => r.reason).map(r => r.reason).join('; ');
+    results.errors.push({ priority: 2, method: 'PowerShell', reason: allReasons || 'No output from PowerShell script' });
+  }
 
-      sys.productType = tokens[i++] || '';
-      sys.productVersion = tokens[i++] || '';
-      sys.servicePack = tokens[i++] || '';
-      sys.kernelBuild = tokens[i++] || '';
-      sys.registeredOrg = tokens[i++] || '';
-      sys.registeredOwner = tokens[i++] || '';
-      sys.ieVersion = tokens[i++] || '';
-      sys.systemRoot = tokens[i++] || '';
-      sys.processors = tokens[i++] || '';
-      sys.processorSpeed = tokens[i++] || '';
-      sys.processorType = tokens[i++] || '';
-      sys.physicalMemory = tokens[i++] || '';
-      sys.videoDriver = tokens[i++] || '';
-
-      // Parse system info from PsInfo
-      const ramMatch = /(\d+)\s*(MB|GB|TB)/i.exec(sys.physicalMemory || '');
-      let totalRamMB = 0;
-      if (ramMatch) {
-        const n = parseInt(ramMatch[1], 10);
-        const u = ramMatch[2].toUpperCase();
-        totalRamMB = u === 'GB' ? n * 1024 : u === 'TB' ? n * 1024 * 1024 : n;
-      }
-
-      const speedMatch = /([\d.]+)\s*GHz/i.exec(sys.processorSpeed || '');
-      const maxSpeedMHz = speedMatch ? Math.round(parseFloat(speedMatch[1]) * 1000) : 0;
-
-      let cpuManufacturer = '';
-      if (/Intel/i.test(sys.processorType)) cpuManufacturer = 'Intel';
-      else if (/AMD|Advanced Micro/i.test(sys.processorType)) cpuManufacturer = 'AMD';
-
-      results.system = {
-        manufacturer: '',  // PsInfo doesn't provide this
-        model: '',         // PsInfo doesn't provide this
-        serial: '',        // PsInfo doesn't provide this
-        systemType: '',
-        domain: '',
-        totalRamMB,
-      };
-
-      results.processor = sys.processorType ? {
-        name: sys.processorType,
-        manufacturer: cpuManufacturer,
-        cores: 0,   // PsInfo doesn't provide core count — filled by PowerShell/wmic below
-        threads: parseInt(sys.processors || '0', 10),
-        maxSpeedMHz,
-        currentSpeedMHz: maxSpeedMHz,
-        socket: '',
-        socketCount: 1,
-      } : null;
-
-      results.os = {
-        name: sys.kernelVersion || '',
-        version: sys.productVersion || '',
-        build: sys.kernelBuild || '',
-        architecture: '',
-        installDate: '',
-        lastBoot: '',
-        serial: '',
-        registeredOrg: sys.registeredOrg || '',
-        registeredUser: sys.registeredOwner || '',
-      };
-
-      // Parse disk volumes from PsInfo tokens
-      const logicalDisks = [];
-      while (i < tokens.length && /^[A-Z]:$/i.test(tokens[i])) {
-        const drive = tokens[i++];
-        const type = tokens[i++] || '';
-        const format = tokens[i++] || '';
-        const label = tokens[i++] || '';
-        const size = tokens[i++] || '';
-        const free = tokens[i++] || '';
-        i++; // skip free%
-        const sizeMatch = /([\d.]+)\s*(GB|MB|TB)/i.exec(size);
-        const freeMatch = /([\d.]+)\s*(GB|MB|TB)/i.exec(free);
-        let sizeGB = 0, freeGB = 0;
-        if (sizeMatch) { const n = parseFloat(sizeMatch[1]); const u = sizeMatch[2].toUpperCase(); sizeGB = u === 'TB' ? n * 1024 : n; }
-        if (freeMatch) { const n = parseFloat(freeMatch[1]); const u = freeMatch[2].toUpperCase(); freeGB = u === 'TB' ? n * 1024 : n; }
-        logicalDisks.push({ drive, sizeGB: Math.round(sizeGB * 100) / 100, freeGB: Math.round(freeGB * 100) / 100, fileSystem: format, volumeName: label });
-      }
-      results.logicalDisks = logicalDisks;
-
-      // Parse GPU from PsInfo
-      if (sys.videoDriver) {
-        results.gpu = sys.videoDriver.split(/[,;]/).map(s => s.trim()).filter(Boolean).map(name => ({
-          name, manufacturer: '', ramMB: 0, driverVersion: '', driverDate: '',
-        }));
-      }
-
-      // Parse hotfixes and software from remaining tokens
-      let foundSoftware = false;
-      for (; i < tokens.length; i++) {
-        const token = tokens[i].trim();
-        if (!token) continue;
-        const kbMatch = token.match(/KB\d+/i);
-        if (kbMatch && !foundSoftware) {
-          results.hotfixes.push(kbMatch[0].toUpperCase());
-        } else if (!foundSoftware && /^n\/a/i.test(token)) {
-          continue;
-        } else {
-          foundSoftware = true;
-          if (!results.hotfixes.includes(token)) {
-            results.software.push({ name: token });
+  // dmidecode — ONLY for the local machine (SMBIOS is the server's, not the target's)
+  const localHost = require('os').hostname().toLowerCase();
+  const scanTarget = (safeHost || fqHost).split('.')[0].toLowerCase();
+  if (scanTarget === localHost || scanTarget === 'localhost' || scanTarget === '127.0.0.1') {
+    const dmiPath = path.join(__dirname, 'Tools', 'dmidecode.exe');
+    try {
+      if (fs.existsSync(dmiPath)) {
+        const dmi = require('child_process').spawnSync(dmiPath, ['-t','system','-t','baseboard','-t','processor','-t','memory','-t','chassis'], { timeout: 10000, windowsHide: true });
+        if (dmi.stdout && dmi.stdout.toString('utf8').trim()) {
+          const dmiData = require('./lib/dmidecode').parseDmidecode(dmi.stdout.toString('utf8'));
+          results.methods.dmidecode = 'success';
+          results.rawOutputs = results.rawOutputs || {};
+          results.rawOutputs.dmidecode = dmi.stdout.toString('utf8').substring(0, 3000);
+          if (!results.system.manufacturer && dmiData.system) { results.system.manufacturer = dmiData.system.manufacturer || ''; results.system.model = dmiData.system.product || ''; results.system.serial = dmiData.system.serial || ''; }
+          if (!results.motherboard?.manufacturer && dmiData.motherboard) results.motherboard = dmiData.motherboard;
+          if (!results.bios?.vendor && dmiData.bios) results.bios = dmiData.bios;
+          if (!results.uuid && dmiData.system?.uuid) results.uuid = dmiData.system.uuid;
+          if (!results.chassisType && dmiData.chassis?.type) {
+            const ct = dmiData.chassis.type;
+            const chassisTypes = ['Other','Unknown','Desktop','Low Profile Desktop','Pizza Box','Mini Tower','Tower','Portable','Laptop','Notebook','Hand Held','Docking Station','All-in-One','Sub Notebook','Space-saving','Lunch Box','Main System Chassis','Expandable Chassis','Rack Mount Chassis','Sealed-case PC','Multi-system','Compact PCI','Advanced TCA','Blade','Blade Enclosure','Tablet','Convertible','Detachable','IoT Gateway','Embedded PC','Mini PC','Stick PC'];
+            const ctNum = parseInt(ct);
+            results.chassisType = ct;
+            results.chassisTypeName = (ctNum > 0 && ctNum <= chassisTypes.length) ? chassisTypes[ctNum - 1] : ct;
+          }
+          if (!results.formFactor && dmiData.motherboard?.type) results.formFactor = dmiData.motherboard.type;
+          if (!results.processor && dmiData.processor) results.processor = { name: dmiData.processor.model || '', manufacturer: dmiData.processor.manufacturer || '', cores: parseInt(dmiData.processor.cores) || 0, threads: parseInt(dmiData.processor.threads) || 0, maxSpeedMHz: parseInt(dmiData.processor.maxSpeed) || 0, currentSpeedMHz: parseInt(dmiData.processor.currentSpeed) || 0, socket: dmiData.processor.socket || '', socketCount: 1, serial: dmiData.processor.id || '' };
+          if (results.memory.length === 0 && dmiData.memory_slots && dmiData.memory_slots.length > 0) {
+            results.memory = dmiData.memory_slots.map(m => ({ deviceLocator: m.locator || '', capacityGB: m.size ? (m.size.includes('GB') ? parseFloat(m.size) : (parseFloat(m.size) || 0) / 1024) : 0, manufacturer: m.manufacturer || '', partNumber: m.part || '', speed: parseInt(m.speed) || 0 }));
+            const stickTotalGB = results.memory.reduce((s, m) => s + (m.capacityGB || 0), 0);
+            if (stickTotalGB > 0) results.system.totalRamMB = Math.round(stickTotalGB * 1024);
           }
         }
       }
-    } else if (psinfoRes.reason) {
-      results.methods.psinfo = 'failed';
-      results.errors.push({ priority: 1, method: 'PsInfo', ...psinfoRes });
+    } catch (e) {
+      results.errors.push({ priority: 0, method: 'dmidecode', reason: e.message });
     }
+  }
 
-    // Parse logged-on user from PsLoggedOn
+  // FALLBACK: wmic (runs on remote via PsExec, no CIM/WinRM needed)
+  // Only runs for fields that are still empty after dmidecode + PowerShell
+  const wmicMissing = [];
+  if (!results.os?.name) wmicMissing.push('OS');
+  if (!results.system?.manufacturer && !results.system?.model) wmicMissing.push('CS');
+  if (!results.bios?.vendor) wmicMissing.push('BIOS');
+  if (!results.motherboard?.manufacturer) wmicMissing.push('BASEBOARD');
+  if (!results.processor?.name) wmicMissing.push('CPU');
+
+  const wmicQueries = {
+    OS: { args: ['OS', 'get', 'Caption,Version,BuildNumber,SerialNumber,InstallDate,RegisteredUser,Organization', '/format:csv'], parser: (lines) => {
+      for (const l of lines) { if (l.includes(',')) { const p = l.split(','); if (p.length >= 2) { results.os.name = results.os.name || p[1]?.trim(); results.os.version = results.os.version || p[2]?.trim(); results.os.build = results.os.build || p[3]?.trim(); results.os.serial = results.os.serial || p[4]?.trim(); if (p[5]) results.os.installDate = p[5].trim(); if (p[6]) results.os.registeredUser = p[6].trim(); if (p[7]) results.os.registeredOrg = p[7].trim(); } } } return results.os.name ? true : false; } },
+    CS: { args: ['COMPUTERSYSTEM', 'get', 'Manufacturer,Model,SystemType', '/format:csv'], parser: (lines) => {
+      for (const l of lines) { if (l.includes(',')) { const p = l.split(','); if (p.length >= 2) { results.system.manufacturer = results.system.manufacturer || p[1]?.trim(); results.system.model = results.system.model || p[2]?.trim(); results.system.systemType = results.system.systemType || p[3]?.trim(); } } } return results.system.manufacturer ? true : false; } },
+    BIOS: { args: ['BIOS', 'get', 'Manufacturer,SMBIOSBIOSVersion,ReleaseDate,SerialNumber', '/format:csv'], parser: (lines) => {
+      for (const l of lines) { if (l.includes(',')) { const p = l.split(','); if (p.length >= 2) { results.bios.vendor = results.bios.vendor || p[1]?.trim(); results.bios.manufacturer = results.bios.manufacturer || p[1]?.trim(); results.bios.version = results.bios.version || p[2]?.trim(); results.bios.releaseDate = results.bios.releaseDate || p[3]?.trim(); results.bios.serial = results.bios.serial || p[4]?.trim(); } } } return results.bios.vendor ? true : false; } },
+    BASEBOARD: { args: ['BASEBOARD', 'get', 'Manufacturer,Product,Version,SerialNumber', '/format:csv'], parser: (lines) => {
+      for (const l of lines) { if (l.includes(',')) { const p = l.split(','); if (p.length >= 2) { results.motherboard.manufacturer = results.motherboard.manufacturer || p[1]?.trim(); results.motherboard.product = results.motherboard.product || p[2]?.trim(); results.motherboard.version = results.motherboard.version || p[3]?.trim(); results.motherboard.serial = results.motherboard.serial || p[4]?.trim(); } } } return results.motherboard.manufacturer ? true : false; } },
+    CPU: { args: ['CPU', 'get', 'Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed', '/format:csv'], parser: (lines) => {
+      for (const l of lines) { if (l.includes(',')) { const p = l.split(','); if (p.length >= 2) { if (!results.processor?.name) results.processor = { name: p[1]?.trim() || '', manufacturer: p[2]?.trim() || '', cores: parseInt(p[3]) || 0, threads: parseInt(p[4]) || 0, maxSpeedMHz: parseInt(p[5]) || 0, currentSpeedMHz: parseInt(p[5]) || 0, socket: '', socketCount: 1, serial: '' }; } } } return results.processor?.name ? true : false; } },
+  };
+
+  for (const key of wmicMissing) {
+    const q = wmicQueries[key];
+    if (!q) continue;
+    try {
+      const res = await pstools.runPsExec(fqHost, 'wmic.exe', q.args, 20000, hwCred);
+      if (res.success && res.stdout) {
+        const lines = res.stdout.split('\n').map(l => l.trim()).filter(Boolean);
+        const ok = q.parser(lines);
+        if (ok) {
+          if (!results.methods.wmic) results.methods.wmic = [];
+          if (Array.isArray(results.methods.wmic)) results.methods.wmic.push(key);
+        }
+      }
+    } catch (e) {
+      results.errors.push({ priority: 2, method: `wmic(${key})`, reason: e.message });
+    }
+  }
+
+  // PRIORITY 3: psloggedon
+  if (!results.loggedInUser) {
+    const loggedOnRes = await pstools.runPsLoggedOn(fqHost, 15000, hwCred);
     if (loggedOnRes.success && loggedOnRes.stdout) {
       results.methods.psloggedon = 'success';
-      results.rawOutputs = results.rawOutputs || {};
-      results.rawOutputs.psLoggedOn = loggedOnRes.stdout.substring(0, 2000);
       const userMatch = loggedOnRes.stdout.match(/([A-Za-z0-9._-]+\\[A-Za-z0-9._-]+)/);
       if (userMatch) results.loggedInUser = userMatch[1];
     } else if (loggedOnRes.reason) {
       results.methods.psloggedon = 'failed';
-      results.errors.push({ priority: 1, method: 'PsLoggedOn', ...loggedOnRes });
+      results.errors.push({ priority: 3, method: 'PsLoggedOn', ...loggedOnRes });
     }
+  }
 
-    // ========================================================================
-    // PRIORITY 2: PowerShell (via PsExec) — fills gaps PsInfo couldn't provide
-    // ========================================================================
-    // PsInfo doesn't provide: motherboard, BIOS details, CPU cores, RAM sticks,
-    // physical disk details, network adapters. Use PowerShell locally via PsExec.
-    // ========================================================================
-    const psScript = `
-Write-Output "PSTART=1"
-$u=$env:USERNAME
-Write-Output "USER=$u"
-$up=$env:USERPROFILE;$up=$up -replace '\|','-';if($up){Write-Output "UP=$up"}
-$reg=(Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion");if($reg){Write-Output "REG=$($reg.DisplayVersion)|$($reg.CurrentBuild)|$($reg.UBR)"}
-$cs=(Get-CimInstance Win32_ComputerSystem);if($cs){Write-Output "SYS=$($cs.Manufacturer)|$($cs.Model)|$($cs.SystemType)|$($cs.Domain)|$($cs.TotalPhysicalMemory)"}
-$os=(Get-CimInstance Win32_OperatingSystem);if($os){Write-Output "OS=$($os.Caption)|$($os.OSArchitecture)|$($os.Version)|$($os.SerialNumber)"}
-$mb=(Get-CimInstance Win32_BaseBoard);if($mb){Write-Output "MB=$($mb.Manufacturer)|$($mb.Product)|$($mb.Version)|$($mb.SerialNumber)"}
-$bios=(Get-CimInstance Win32_BIOS);if($bios){Write-Output "BIOS=$($bios.Manufacturer)|$($bios.SMBIOSBIOSVersion)|$($bios.ReleaseDate)|$($bios.SerialNumber)"}
-$cpu=(Get-CimInstance Win32_Processor);if($cpu){Write-Output "CPU=$($cpu.Name.Trim())|$($cpu.Manufacturer)|$($cpu.NumberOfCores)|$($cpu.NumberOfLogicalProcessors)|$($cpu.MaxClockSpeed)"}
-$mem=@(Get-CimInstance Win32_PhysicalMemory);foreach($m in $mem){Write-Output "MEM=$([math]::Round($m.Capacity/1GB,1))|$($m.Manufacturer)|$($m.PartNumber)|$($m.Speed)|$($m.DeviceLocator)"}
-$dsk=@(Get-CimInstance Win32_DiskDrive);foreach($d in $dsk){$sn=$d.SerialNumber;$sn="$sn".Trim();Write-Output "DISK=$($d.Index)|$($d.Model)|$([math]::Round($d.Size/1GB,0))|$($d.InterfaceType)|$sn"}
-$gpu=@(Get-CimInstance Win32_VideoController);foreach($g in $gpu){Write-Output "GPU=$($g.Name)|$($g.AdapterCompatibility)|$([math]::Round($g.AdapterRAM/1MB,0))|$($g.DriverVersion)"}
-$net=@(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True");foreach($n in $net){$ips=($n.IPAddress-join',');$gw=($n.DefaultIPGateway-join',');Write-Output "NET=$($n.Description)|$ips|$($n.MACAddress)|$gw|$($n.DHCPEnabled)"}
-$vol=@(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3");foreach($v in $vol){Write-Output "VOL=$($v.DeviceID)|$($v.FileSystem)|$($v.VolumeName)|$([math]::Round($v.Size/1GB,1))|$([math]::Round($v.FreeSpace/1GB,1))"}
-$dvd=@(Get-CimInstance Win32_CDROMDrive);if($dvd.Count -gt 0){foreach($d in $dvd){Write-Output "DVD=$($d.Drive)|$($d.Name)"}}else{Write-Output "DVD=None"}
-$audio=@(Get-CimInstance Win32_SoundDevice);foreach($a in $audio){$an=""+$a.Name;$an=$an -replace '\|','-';Write-Output "AUD=$an"}
-$pnet=@(Get-CimInstance Win32_NetworkAdapter -Filter "PhysicalAdapter=True");foreach($p in $pnet){$pn=""+$p.Name;$pn=$pn -replace '\|','-';$pm=""+$p.MACAddress;$pm=$pm -replace '\|','-';Write-Output "PHYNET=$pn|$pm"}
-Write-Output "PEND=1"
-Write-Output "===SUMMARY_START==="
-[PSCustomObject]@{
-    "Logged-In User"        = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    "User Profile Path"     = $env:USERPROFILE
-    "Windows Edition"       = (Get-CimInstance Win32_OperatingSystem | ForEach-Object { $_.Caption })
-    "Windows Version/Build" = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" | ForEach-Object { "Version: $($_.DisplayVersion) (OS Build: $($_.CurrentBuild).$($_.UBR))" })
-    "OS Architecture"       = (Get-CimInstance Win32_OperatingSystem | ForEach-Object { $_.OSArchitecture })
-    "Corporate System Info" = (Get-CimInstance Win32_ComputerSystem | ForEach-Object { "$($_.Manufacturer) - Model: $($_.Model)" })
-    "Motherboard Info"      = (Get-CimInstance Win32_BaseBoard | ForEach-Object { "Make: $($_.Manufacturer) | Board: $($_.Product)" })
-    "BIOS & Firmware"       = (Get-CimInstance Win32_BIOS | ForEach-Object { "Vendor: $($_.Manufacturer) | Version: $($_.SMBIOSBIOSVersion) | Main S/N: $($_.SerialNumber)" })
-    "Processor (CPU)"       = ((Get-CimInstance Win32_Processor | ForEach-Object { "$($_.Name.Trim()) ($($_.NumberOfCores) Cores / $($_.NumberOfLogicalProcessors) Threads)" }) -join ' | ')
-    "Installed RAM Sticks"  = ((Get-CimInstance Win32_PhysicalMemory | ForEach-Object { "$($_.DeviceLocator): $([math]::round($_.Capacity/1GB))GB $($_.Speed)MHz ($($_.Manufacturer.Trim()))" }) -join ' | ')
-    "Storage Drives (All)"  = ((Get-CimInstance Win32_DiskDrive | ForEach-Object { "Drive $($_.Index): $($_.Model) ($([math]::round($_.Size/1GB))GB)" }) -join ' | ')
-    "Optical/DVD Drives"    = (if ($dvd = Get-CimInstance Win32_CDROMDrive) { ($dvd | ForEach-Object { "Drive $($_.Drive): $($_.Name)" }) -join ' | ' } else { "None Detected" })
-    "Video/Graphics Cards"  = ((Get-CimInstance Win32_VideoController | ForEach-Object { "$($_.Name) (Driver v$($_.DriverVersion))" }) -join ' | ')
-    "Network Interfaces"    = ((Get-CimInstance Win32_NetworkAdapter | Where-Object { $_.PhysicalAdapter } | ForEach-Object { "$($_.Name) [MAC: $($_.MACAddress)]" }) -join ' | ')
-    "Sound/Audio Hardware"  = ((Get-CimInstance Win32_SoundDevice | ForEach-Object { $_.Name }) -join ' | ')
-} | Format-List | Out-String
-    `.trim();
+  const hasAnyData = results.system?.manufacturer || results.system?.model || results.system?.totalRamMB ||
+    results.motherboard?.manufacturer || results.motherboard?.product ||
+    results.bios?.manufacturer || results.bios?.version ||
+    results.processor?.name ||
+    results.memory.length > 0 || results.disks.length > 0 || results.logicalDisks.length > 0 ||
+    results.network.length > 0 || results.gpu.length > 0 ||
+    results.os?.name ||
+    results.hotfixes.length > 0 || results.software.length > 0 ||
+    results.loggedInUser;
 
-    const psResult = await powershell.runRemoteViaPsExec(fqHost, psScript, PSTOOLS_PATH, 45000, hwCred);
+  return { results, ok: hasAnyData };
+}
 
-    if (psResult.success && psResult.stdout) {
-      results.methods.powershell = 'success';
-      const dbgPs = '' + psResult.stdout;
-      results.rawOutputs = results.rawOutputs || {};
-      results.rawOutputs.powershell = dbgPs.length > 3000 ? dbgPs.substring(0, 3000) + '...' : dbgPs;
-      try {
-        // Parse KEY=VALUE|VALUE|... lines
-        const kv = {};
-        for (const raw of psResult.stdout.split('\n')) {
-          const line = raw.trim();
-          if (!line || !line.includes('=')) continue;
-          const eqIdx = line.indexOf('=');
-          const key = line.substring(0, eqIdx).trim();
-          const val = line.substring(eqIdx + 1).trim();
-          if (!kv[key]) { kv[key] = val; }
-          else if (Array.isArray(kv[key])) { kv[key].push(val); }
-          else { kv[key] = [kv[key], val]; }
-        }
-        const getArr = (k) => { if (!kv[k]) return []; const v = kv[k]; return Array.isArray(v) ? v : [v]; };
-        const pipe1 = (k) => { const a = getArr(k); return a.length > 0 ? a[0].split('|').map(s => s.trim()) : []; };
+// ==========================================================================
+// HARDWARE AUDIT — Multi-method scan with PRIORITY ORDER:
+//   1st: dmidecode (local SMBIOS)                     — PRIMARY, <1s, no network
+//   2nd: PowerShell (via PsExec)                      — remote OS, GPU, disks, network
+//   3rd: psloggedon (via PsLoggedOn)                  — logged-in user
+//
+// All commands are logged with error reasons (which service failed, how to fix)
+// ==========================================================================
+app.post('/api/hosts/:hostname/hardware', async (req, res) => {
+  const safeHost = sanitizeHost(req.params.hostname);
+  const hwCred = getGlobalCredentials();
+  const fqHost = safeHost.includes('.') ? safeHost : (hwCred?.domain ? safeHost + '.' + hwCred.domain : safeHost);
+  const scanStartTime = Date.now();
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  let results = null;
 
-        // USER
-        if (kv.USER) results.loggedInUser = kv.USER;
+  try {
+    const r = await scanHardware(safeHost, fqHost, hwCred);
+    results = r.results;
+    const ok = r.ok;
 
-        // OS: Caption|Arch|Version|Serial
-        const osp = pipe1('OS');
-        if (osp[0]) results.os.name = osp[0];
-        if (osp[1]) results.os.architecture = osp[1];
-        if (osp[2]) results.os.build = osp[2];
-        if (osp[3]) results.os.serial = osp[3];
-
-        // SYS: MFR|MODEL|TYPE|DOMAIN|RAM
-        const sys = pipe1('SYS');
-        if (sys[0]) results.system.manufacturer = sys[0];
-        if (sys[1]) results.system.model = sys[1];
-        if (sys[2]) results.system.systemType = sys[2];
-        if (sys[3]) results.system.domain = sys[3];
-        if (sys[4]) { const b = parseInt(sys[4], 10); if (b > 0) results.system.totalRamMB = Math.round(b / (1024 * 1024)); }
-
-        // MB: MFR|PROD|VER|SN
-        const mbp = pipe1('MB');
-        if (mbp[0] || mbp[1]) results.motherboard = { manufacturer: mbp[0] || '', product: mbp[1] || '', version: mbp[2] || '', serial: mbp[3] || '' };
-
-        // BIOS: MFR|VER|DATE|SN
-        const b = pipe1('BIOS');
-        if (b[0] || b[1]) results.bios = { manufacturer: b[0] || '', version: b[1] || '', releaseDate: b[2] || '', serial: b[3] || '' };
-
-        // CPU: NAME|MFR|CORES|THREADS|SPEED
-        const cp = pipe1('CPU');
-        if (cp[0]) {
-          if (!results.processor) results.processor = {};
-          results.processor.name = cp[0]; results.processor.manufacturer = cp[1] || '';
-          results.processor.cores = parseInt(cp[2]) || 0; results.processor.threads = parseInt(cp[3]) || 0;
-          results.processor.maxSpeedMHz = parseInt(cp[4]) || 0; results.processor.currentSpeedMHz = results.processor.maxSpeedMHz;
-          results.processor.socketCount = 1; results.processor.socket = '';
-        }
-
-        // MEM: capGB|MFR|PN|speed|locator (multiple)
-        results.memory = getArr('MEM').map(m => { const p = m.split('|').map(s => s.trim()); return { capacityGB: parseFloat(p[0]) || 0, manufacturer: p[1] || '', partNumber: p[2] || '', speed: parseInt(p[3]) || 0, deviceLocator: p[4] || '' }; });
-
-        // DISK: index|model|sizeGB|iface|SN (multiple)
-        results.disks = getArr('DISK').map(d => { const p = d.split('|').map(s => s.trim()); return { index: parseInt(p[0]) || 0, model: p[1] || '', sizeGB: parseFloat(p[2]) || 0, interfaceType: p[3] || '', serialNumber: p[4] || '', partitions: 0 }; });
-
-        // GPU: name|compat|ramMB|driver (multiple)
-        results.gpu = getArr('GPU').map(g => { const p = g.split('|').map(s => s.trim()); return { name: p[0] || '', manufacturer: p[1] || '', ramMB: parseInt(p[2]) || 0, driverVersion: p[3] || '', driverDate: '' }; });
-
-        // NET: desc|ip|mac|gw|dhcp (multiple)
-        results.network = getArr('NET').map(n => { const p = n.split('|').map(s => s.trim()); return { description: p[0] || '', ipAddress: p[1] || '', macAddress: p[2] || '', defaultGateway: p[3] || '', dhcpEnabled: (p[4] || '') === 'True', dnsServers: '' }; });
-
-        // VOL: drive|FS|name|sizeGB|freeGB (multiple)
-        results.logicalDisks = getArr('VOL').map(v => { const p = v.split('|').map(s => s.trim()); return { drive: p[0] || '', fileSystem: p[1] || '', volumeName: p[2] || '', sizeGB: parseFloat(p[3]) || 0, freeGB: parseFloat(p[4]) || 0 }; });
-
-        // UP: user profile path
-        const upPath = pipe1('UP');
-        if (upPath[0]) results.userProfilePath = upPath[0];
-
-        // REG: DisplayVersion|CurrentBuild|UBR
-        const reg = pipe1('REG');
-        if (reg[0]) results.osDisplayVersion = reg[0];
-        if (reg[1]) results.os.build = reg[1]; // CurrentBuild overrides PsInfo build
-        if (reg[2]) results.osUBR = reg[2];
-
-        // DVD: drive|name (multiple, or "None")
-        results.opticalDrives = getArr('DVD').filter(d => d !== 'None').map(d => { const p = d.split('|').map(s => s.trim()); return { drive: p[0] || '', name: p[1] || '' }; });
-
-        // AUD: audio device names (multiple)
-        results.soundDevices = getArr('AUD').filter(Boolean);
-
-        // PHYNET: name|mac (multiple, physical adapters only)
-        results.physicalNetworks = getArr('PHYNET').map(p => { const parts = p.split('|').map(s => s.trim()); return { name: parts[0] || '', macAddress: parts[1] || '' }; });
-
-        // ── Force PowerShell data to take precedence over PsInfo ──
-        // If PowerShell returned any system data, prefer it over PsInfo's guesses
-        // RAM: use sum of individual sticks first (installed capacity, most accurate),
-        // fall back to TotalPhysicalMemory from Win32_ComputerSystem (already in sys[4])
-        if (results.methods.powershell === 'success') {
-          const stickTotalGB = results.memory.reduce((s, m) => s + (m.capacityGB || 0), 0);
-          if (stickTotalGB > 0) results.system.totalRamMB = stickTotalGB * 1024;
-        }
-
-        // ── Parse Format-List summary from user's PowerShell command ──
-        // After PEND=1, the script outputs ===SUMMARY_START=== followed by
-        // the Format-List output with "Label : Value" pairs
-        const summaryMarker = '===SUMMARY_START===';
-        const summaryIdx = psResult.stdout.indexOf(summaryMarker);
-        if (summaryIdx !== -1) {
-          const summaryBlock = psResult.stdout.substring(summaryIdx + summaryMarker.length).trim();
-          const summaryLines = summaryBlock.split('\n').filter(Boolean);
-          const formattedSummary = {};
-          for (const rawLine of summaryLines) {
-            const sepIdx = rawLine.indexOf(' : ');
-            if (sepIdx !== -1) {
-              const key = rawLine.substring(0, sepIdx).trim();
-              const val = rawLine.substring(sepIdx + 3).trim();
-              if (key && val) formattedSummary[key] = val;
-            }
-          }
-          if (Object.keys(formattedSummary).length > 0) {
-            results.formattedSummary = formattedSummary;
-          }
-        }
-      } catch (e) {
-        results.errors.push({ priority: 2, method: 'PowerShell', reason: 'Parse error: ' + e.message });
-      }
-    } else if (psResult.reason) {
-      results.methods.powershell = 'failed';
-      results.errors.push({ priority: 2, method: 'PowerShell', ...psResult });
-    } else {
-      results.methods.powershell = 'failed';
-      results.errors.push({ priority: 2, method: 'PowerShell', reason: 'No output from PowerShell script' });
-    }
-
-    // ========================================================================
-    // PRIORITY 2b: systeminfo.exe over RPC — bypasses UAC Admin$ restrictions
-    // Runs when PsExec-based methods fail due to UAC/Admin$ block.
-    // systeminfo.exe /S HOST uses RPC (port 135) — same protocol as PsLoggedOn.
-    // Does NOT require Admin$ share, PsExec, or WinRM.
-    // ========================================================================
-    if (results.methods.powershell !== 'success' && results.methods.psinfo !== 'success') {
-      const siResult = await pstools.runSystemInfo(fqHost, 45000, hwCred);
-      if (siResult.success && siResult.parsed) {
-        results.methods.systeminfo = 'success';
-        results.rawOutputs = results.rawOutputs || {};
-        results.rawOutputs.systeminfo = siResult.stdout.substring(0, 3000);
-        const si = siResult.parsed;
-
-        // — System —
-        if (si['System Manufacturer'] && !results.system.manufacturer) results.system.manufacturer = si['System Manufacturer'];
-        if (si['System Model'] && !results.system.model) results.system.model = si['System Model'];
-        if (si['System Type'] && !results.system.systemType) results.system.systemType = si['System Type'];
-        if (si['Domain'] && !results.system.domain) results.system.domain = si['Domain'];
-        if (si['Total Physical Memory']) {
-          const memMatch = /([\d,]+)\s*MB/i.exec(si['Total Physical Memory']);
-          if (memMatch) {
-            const ramMB = parseInt(memMatch[1].replace(/,/g, ''), 10);
-            if (ramMB > 0 && !results.system.totalRamMB) results.system.totalRamMB = ramMB;
-          }
-        }
-
-        // — OS —
-        if (si['OS Name'] && !results.os.name) results.os.name = si['OS Name'];
-        if (si['OS Version'] && !results.os.version) results.os.version = si['OS Version'];
-        if (si['Registered Owner'] && !results.os.registeredUser) results.os.registeredUser = si['Registered Owner'];
-        if (si['Registered Organization'] && !results.os.registeredOrg) results.os.registeredOrg = si['Registered Organization'];
-        if (si['Original Install Date']) results.os.installDate = results.os.installDate || si['Original Install Date'];
-        if (si['System Boot Time']) results.os.lastBoot = results.os.lastBoot || si['System Boot Time'];
-
-        // — BIOS —
-        if (si['BIOS Version']) {
-          if (!results.bios.version || !results.bios.manufacturer) {
-            const biosStr = si['BIOS Version'];
-            const biosComma = biosStr.indexOf(',');
-            if (biosComma > 0) {
-              const biosInfo = biosStr.substring(0, biosComma).trim();
-              const biosDate = biosStr.substring(biosComma + 1).trim();
-              results.bios = results.bios || {};
-              if (!results.bios.version) results.bios.version = biosInfo;
-              if (!results.bios.releaseDate) results.bios.releaseDate = biosDate;
-              const spaceIdx = biosInfo.lastIndexOf(' ');
-              if (spaceIdx > 0 && !results.bios.manufacturer) {
-                const mfr = biosInfo.substring(0, spaceIdx).trim();
-                if (!/^\d/.test(mfr)) results.bios.manufacturer = mfr;
-              }
-            }
-          }
-        }
-
-        // — Processor —
-        if (si['Processor(s)'] && (!results.processor || !results.processor.name)) {
-          const procStr = si['Processor(s)'];
-          // Try "[01]: <name>" format first, fall back to using the whole string
-          let procMatch = procStr.match(/\[01\]:\s*(.+)/);
-          if (!procMatch) procMatch = procStr.match(/\[01\]:\s+([^\]]+)/);
-          const procName = procMatch ? procMatch[1].trim() : procStr.replace(/\n/g, ' ').replace(/^\d+\s+Processor.*Installed\.\s*/i, '').trim();
-          if (procName) {
-            const mhzMatch = /~(\d+)\s*Mhz/i.exec(procName) || /(\d+)\s*Mhz/i.exec(procName);
-            const mfr = /GenuineIntel/i.test(procName) ? 'Intel' : /AuthenticAMD/i.test(procName) ? 'AMD' : '';
-            results.processor = { ...(results.processor || {}),
-              name: procName, manufacturer: mfr || (results.processor && results.processor.manufacturer || ''),
-              maxSpeedMHz: mhzMatch ? parseInt(mhzMatch[1]) : (results.processor && results.processor.maxSpeedMHz || 0),
-              currentSpeedMHz: mhzMatch ? parseInt(mhzMatch[1]) : (results.processor && results.processor.currentSpeedMHz || 0),
-              cores: (results.processor && results.processor.cores) || 0,
-              threads: (results.processor && results.processor.threads) || 0,
-              socket: '', socketCount: 1,
-            };
-          }
-        }
-
-        // — Hotfixes —
-        if (si['Hotfix(s)']) {
-          const hfStr = si['Hotfix(s)'];
-          const kbMatches = hfStr.match(/KB\d{5,}/gi);
-          if (kbMatches && results.hotfixes.length === 0) {
-            results.hotfixes = kbMatches.map(kb => kb.toUpperCase());
-          }
-        }
-
-        // — Network Cards —
-        if (si['Network Card(s)'] && results.network.length === 0) {
-          const netStr = si['Network Card(s)'];
-          const lines = netStr.split('\n');
-          let currentNic = null;
-          const nics = [];
-          for (const rawLine of lines) {
-            const t = rawLine.trim();
-            if (!t || /^\d+\s+NIC\(s\)\s+Installed/i.test(t)) continue;
-            // NIC header: "[01]: AdapterName" (not an IP address or short token)
-            const nicHdr = t.match(/^\[(\d{2})\]:\s+(.+)/);
-            if (nicHdr && nicHdr[2].length > 10 && !/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/.test(nicHdr[2]) && !/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/.test(nicHdr[2])) {
-              if (currentNic) nics.push(currentNic);
-              currentNic = { desc: nicHdr[2], ip: '', dhcp: false, gateway: '' };
-              continue;
-            }
-            if (!currentNic) continue;
-            // IP address sub-item (inside a NIC block): "  [01]: 10.0.1.50"
-            const ipM = t.match(/^\[01\]:\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
-            if (ipM) { currentNic.ip = currentNic.ip || ipM[1]; continue; }
-            const dhM = t.match(/DHCP Enabled:\s*(Yes|No)/i);
-            if (dhM) { currentNic.dhcp = dhM[1] === 'Yes'; continue; }
-            const gwM = t.match(/DHCP Server:\s*(\S+)/i);
-            if (gwM) { currentNic.gateway = gwM[1]; continue; }
-          }
-          if (currentNic) nics.push(currentNic);
-          results.network = nics.map(n => ({
-            description: n.desc,
-            ipAddress: n.ip,
-            macAddress: '',
-            defaultGateway: n.gateway,
-            dhcpEnabled: n.dhcp,
-            dnsServers: '',
-          }));
-        }
-      } else if (siResult.reason) {
-        results.methods.systeminfo = 'failed';
-        results.errors.push({ priority: 3, method: 'systeminfo', ...siResult });
-      }
-    }
-
-    // ========================================================================
-    // PRIORITY 2c: wmic /node:HOST over DCOM/RPC — fills gaps systeminfo can't
-    // Queries WMI classes for: motherboard, individual RAM sticks, physical
-    // disks, volumes, GPU details. Uses DCOM (port 135) — same RPC protocol
-    // as PsLoggedOn and systeminfo. Does NOT require Admin$ or PsExec.
-    // ========================================================================
-    const needWmic = results.methods.powershell !== 'success'
-      && (results.memory.length === 0 || results.disks.length === 0
-          || results.logicalDisks.length === 0 || !results.motherboard?.product
-          || results.gpu.length === 0);
-    if (needWmic) {
-      const wmicClasses = [
-        { wmiClass: 'computersystem', fields: 'Manufacturer,Model,SystemType,Domain,TotalPhysicalMemory,SerialNumber' },
-        { wmiClass: 'baseboard', fields: 'Manufacturer,Product,Version,SerialNumber' },
-        { wmiClass: 'cpu', fields: 'Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed' },
-        { wmiClass: 'memorychip', fields: 'Capacity,Manufacturer,PartNumber,Speed,DeviceLocator' },
-        { wmiClass: 'diskdrive', fields: 'Index,Model,Size,InterfaceType,SerialNumber' },
-        { wmiClass: 'logicaldisk where DriveType=3', fields: 'DeviceID,FileSystem,VolumeName,Size,FreeSpace' },
-        { wmiClass: 'path win32_videocontroller', fields: 'Name,AdapterCompatibility,AdapterRAM,DriverVersion' },
-        { wmiClass: 'nicconfig where IPEnabled=True', fields: 'Description,IPAddress,MACAddress,DefaultIPGateway,DHCPEnabled' },
-      ];
-      const wmicPromises = wmicClasses.map(c =>
-        wmic.runRemote(fqHost, c.wmiClass, c.fields, 20000, hwCred)
-          .then(r => ({ ...c, ...r }))
-      );
-      const wmicResults = await Promise.all(wmicPromises);
-      let wmicAnySuccess = false;
-      for (const wr of wmicResults) {
-        if (wr.success && wr.records && wr.records.length > 0) {
-          wmicAnySuccess = true;
-          const rec = wr.records[0];
-
-          if (wr.wmiClass === 'computersystem') {
-            if (rec.Manufacturer && !results.system.manufacturer) results.system.manufacturer = rec.Manufacturer;
-            if (rec.Model && !results.system.model) results.system.model = rec.Model;
-            if (rec.SystemType && !results.system.systemType) results.system.systemType = rec.SystemType;
-            if (rec.Domain && !results.system.domain) results.system.domain = rec.Domain;
-            if (rec.TotalPhysicalMemory) {
-              const b = parseInt(rec.TotalPhysicalMemory, 10);
-              if (b > 0 && !results.system.totalRamMB) results.system.totalRamMB = Math.round(b / (1024 * 1024));
-            }
-            if (rec.SerialNumber && !results.system.serial) results.system.serial = rec.SerialNumber;
-          }
-
-          if (wr.wmiClass === 'baseboard') {
-            if (!results.motherboard?.product) {
-              results.motherboard = {
-                manufacturer: rec.Manufacturer || '',
-                product: rec.Product || '',
-                version: rec.Version || '',
-                serial: rec.SerialNumber || '',
-              };
-            }
-          }
-
-          if (wr.wmiClass === 'cpu') {
-            if (rec.Name && !results.processor?.name) {
-              const mhz = rec.MaxClockSpeed ? parseInt(rec.MaxClockSpeed, 10) : 0;
-              results.processor = {
-                name: String(rec.Name).trim(),
-                manufacturer: rec.Manufacturer || '',
-                cores: parseInt(rec.NumberOfCores) || 0,
-                threads: parseInt(rec.NumberOfLogicalProcessors) || 0,
-                maxSpeedMHz: mhz,
-                currentSpeedMHz: mhz,
-                socket: '',
-                socketCount: 1,
-              };
-            }
-          }
-
-          if (wr.wmiClass === 'memorychip') {
-            if (results.memory.length === 0) {
-              results.memory = wr.records.map(r => ({
-                capacityGB: r.Capacity ? Math.round(parseInt(r.Capacity, 10) / (1024 * 1024 * 1024) * 10) / 10 : 0,
-                manufacturer: (r.Manufacturer || '').trim(),
-                partNumber: (r.PartNumber || '').trim(),
-                speed: parseInt(r.Speed) || 0,
-                deviceLocator: (r.DeviceLocator || '').trim(),
-              }));
-            }
-          }
-
-          if (wr.wmiClass === 'diskdrive') {
-            if (results.disks.length === 0) {
-              results.disks = wr.records.map(r => ({
-                index: parseInt(r.Index) || 0,
-                model: (r.Model || '').trim(),
-                sizeGB: r.Size ? Math.round(parseInt(r.Size, 10) / (1024 * 1024 * 1024)) : 0,
-                interfaceType: (r.InterfaceType || '').trim(),
-                serialNumber: (r.SerialNumber || '').trim(),
-                partitions: 0,
-              }));
-            }
-          }
-
-          if (wr.wmiClass === 'logicaldisk where DriveType=3') {
-            if (results.logicalDisks.length === 0) {
-              results.logicalDisks = wr.records.map(r => {
-                const sizeB = parseInt(r.Size, 10) || 0;
-                const freeB = parseInt(r.FreeSpace, 10) || 0;
-                return {
-                  drive: (r.DeviceID || '').trim(),
-                  fileSystem: (r.FileSystem || '').trim(),
-                  volumeName: (r.VolumeName || '').trim(),
-                  sizeGB: Math.round(sizeB / (1024 * 1024 * 1024) * 10) / 10,
-                  freeGB: Math.round(freeB / (1024 * 1024 * 1024) * 10) / 10,
-                };
-              });
-            }
-          }
-
-          if (wr.wmiClass === 'path win32_videocontroller') {
-            if (results.gpu.length === 0) {
-              results.gpu = wr.records.map(r => ({
-                name: (r.Name || '').trim(),
-                manufacturer: (r.AdapterCompatibility || '').trim(),
-                ramMB: parseInt(r.AdapterRAM) ? Math.round(parseInt(r.AdapterRAM, 10) / (1024 * 1024)) : 0,
-                driverVersion: (r.DriverVersion || '').trim(),
-                driverDate: '',
-              }));
-            }
-          }
-
-          if (wr.wmiClass === 'nicconfig where IPEnabled=True') {
-            if (results.network.length === 0) {
-              results.network = wr.records.map(r => ({
-                description: (r.Description || '').trim(),
-                ipAddress: (r.IPAddress || '').trim().replace(/[{}"]/g, ''),
-                macAddress: (r.MACAddress || '').trim(),
-                defaultGateway: (r.DefaultIPGateway || '').trim().replace(/[{}"]/g, ''),
-                dhcpEnabled: String(r.DHCPEnabled || '').toLowerCase() === 'true',
-                dnsServers: '',
-              }));
-            }
-          }
-        }
-      }
-      if (wmicAnySuccess) {
-        results.methods.wmic_dcom = 'success';
-        // Compute RAM total from individual sticks if wmic provided them
-        const stickTotalGB = results.memory.reduce((s, m) => s + (m.capacityGB || 0), 0);
-        if (stickTotalGB > 0 && !results.system.totalRamMB) results.system.totalRamMB = stickTotalGB * 1024;
-      } else {
-        results.methods.wmic_dcom = 'failed';
-        const firstWmicFail = wmicResults.find(wr => wr.reason);
-        if (firstWmicFail) results.errors.push({ priority: 3, method: 'wmic DCOM', ...firstWmicFail });
-      }
-    }
-
-    // ========================================================================
-    // GUARD: if no method returned any data, return a clear failure with diagnostics
-    // ========================================================================
-    const hasAnyData = results.system?.manufacturer || results.system?.model || results.system?.totalRamMB ||
-                       results.motherboard?.manufacturer || results.motherboard?.product ||
-                       results.bios?.manufacturer || results.bios?.version ||
-                       results.processor?.name ||
-                       results.memory.length > 0 || results.disks.length > 0 || results.logicalDisks.length > 0 ||
-                       results.network.length > 0 || results.gpu.length > 0 ||
-                       results.os?.name ||
-                       results.hotfixes.length > 0 || results.software.length > 0 ||
-                       results.loggedInUser;
-
-    if (!hasAnyData) {
+    if (!ok) {
       const firstError = results.errors[0];
-      audit.add(db, {
-        actionType: 'hardware.scan',
-        targetHost: safeHost,
-        tool: 'multi',
-        command: `Hardware scan on ${safeHost}`,
-        success: false,
+      await audit.add(db, {
+        actionType: 'hardware.scan', targetHost: safeHost, tool: 'multi',
+        command: `Hardware scan on ${safeHost}`, success: false,
         durationMs: Date.now() - scanStartTime,
         errorReason: 'No data collected from any method',
-        initiatedBy: 'admin',
-        initiatedFrom,
-        parameters: {
-          methods: results.methods,
-          errorCount: results.errors.length,
-          errors: results.errors,
-        },
+        initiatedBy: 'admin', initiatedFrom,
+        parameters: { methods: results.methods, errorCount: results.errors.length, errors: results.errors },
       });
       return res.json({
         success: false,
-        error: 'No data could be collected from the target. ' + (firstError?.reason || firstError?.error || 'Target may be offline or unreachable.'),
-        data: results,
-        methods: results.methods,
+        error: 'No data collected. ' + (firstError?.reason || firstError?.error || 'Target may be offline.'),
+        data: results, methods: results.methods,
         rawOutputs: results.rawOutputs || {},
-        errorCount: results.errors.length,
-        errors: results.errors,
+        errorCount: results.errors.length, errors: results.errors,
       });
     }
 
-    // ========================================================================
     // SAVE — merge with previous data to avoid losing fields on partial scans
-    // ========================================================================
     const key = 'hardware:' + safeHost;
     let prevHw = null;
     let finalResult = results;
@@ -2589,7 +2422,6 @@ Write-Output "===SUMMARY_START==="
       if (prev) { try { prevHw = JSON.parse(prev); } catch {} }
       if (prevHw && prevHw.hwVersion >= 2) {
         finalResult = { ...prevHw, ...results };
-        // For each section, keep new data if non-empty, otherwise preserve old
         if (Object.keys(results.system).length > 0 && (results.system.manufacturer || results.system.totalRamMB)) {
           finalResult.system = { ...prevHw.system, ...results.system };
         } else { finalResult.system = prevHw.system; }
@@ -2615,6 +2447,10 @@ Write-Output "===SUMMARY_START==="
         finalResult.soundDevices = results.soundDevices.length > 0 ? results.soundDevices : prevHw.soundDevices || [];
         finalResult.physicalNetworks = results.physicalNetworks.length > 0 ? results.physicalNetworks : prevHw.physicalNetworks || [];
         finalResult.formattedSummary = results.formattedSummary || prevHw.formattedSummary || null;
+        finalResult.uuid = results.uuid || prevHw.uuid || null;
+        finalResult.chassisType = results.chassisType || prevHw.chassisType || null;
+        finalResult.chassisTypeName = results.chassisTypeName || prevHw.chassisTypeName || null;
+        finalResult.formFactor = results.formFactor || prevHw.formFactor || null;
       }
       finalResult.methods = results.methods;
       finalResult.errors = results.errors;
@@ -2622,9 +2458,7 @@ Write-Output "===SUMMARY_START==="
       db.settings.set(key, JSON.stringify(finalResult));
     } catch {}
 
-    // ========================================================================
-    // UPDATE HOST RECORD — persist extracted fields to the hosts DB table
-    // ========================================================================
+    // UPDATE HOST RECORD
     try {
       const hostFields = {};
       if (finalResult.os?.name) hostFields.os = finalResult.os.name;
@@ -2638,7 +2472,6 @@ Write-Output "===SUMMARY_START==="
       if (finalResult.system?.model) hostFields.model = finalResult.system.model;
       if (finalResult.system?.serial) hostFields.serial = finalResult.system.serial;
       if (finalResult.loggedInUser) hostFields.logged_on_user = finalResult.loggedInUser;
-      // Detect changes vs previous scan
       if (prevHw && prevHw.hwVersion >= 2) {
         const toTrack = [
           { field: 'OS', old: prevHw.os?.name, new: finalResult.os?.name },
@@ -2651,11 +2484,7 @@ Write-Output "===SUMMARY_START==="
           { field: 'Model', old: prevHw.system?.model, new: finalResult.system?.model },
           { field: 'Serial', old: prevHw.system?.serial, new: finalResult.system?.serial },
         ];
-        changes = toTrack.filter(t => String(t.old || '') !== String(t.new || '')).map(t => ({
-          field: t.field,
-          oldValue: String(t.old || ''),
-          newValue: String(t.new || ''),
-        }));
+        changes = toTrack.filter(t => String(t.old || '') !== String(t.new || ''));
       }
       if (Object.keys(hostFields).length > 0) {
         const hostId = db.hosts.getIdByHostname(safeHost);
@@ -2667,51 +2496,30 @@ Write-Output "===SUMMARY_START==="
       }
     } catch (e) { /* non-critical */ }
 
-    // ========================================================================
-    // AUDIT LOG — record this hardware scan
-    // ========================================================================
+    // AUDIT LOG
     const scanDuration = Date.now() - scanStartTime;
     const methodSummary = Object.entries(results.methods).map(([k, v]) => `${k}:${v}`).join(', ');
-    audit.add(db, {
-      actionType: 'hardware.scan',
-      targetHost: safeHost,
-      tool: 'pstools (psinfo + powershell)',
-      command: `Hardware scan on ${safeHost}`,
-      success: true,
+    await audit.add(db, {
+      actionType: 'hardware.scan', targetHost: safeHost, tool: 'dmidecode + powershell (psexec)',
+      command: `Hardware scan on ${safeHost}`, success: true,
       durationMs: scanDuration,
       outputSummary: `Methods: ${methodSummary}. Found: ${results.logicalDisks.length} volumes, ${results.disks.length} disks, ${results.memory.length} RAM sticks, ${results.gpu.length} GPU(s)`,
-      initiatedBy: 'admin',
-      initiatedFrom,
-      parameters: {
-        methods: results.methods,
-        errorCount: results.errors.length,
-        errors: results.errors,
-        changes: changes.length > 0 ? changes : undefined,
-      },
+      initiatedBy: 'admin', initiatedFrom,
+      parameters: { methods: results.methods, errorCount: results.errors.length, errors: results.errors, changes: changes.length > 0 ? changes : undefined },
     });
 
     res.json({
-      success: true,
-      data: finalResult,
-      methods: results.methods,
+      success: true, data: finalResult, methods: results.methods,
       rawOutputs: results.rawOutputs || {},
-      errorCount: results.errors.length,
-      errors: results.errors,
-      changes,
+      errorCount: results.errors.length, errors: results.errors, changes,
     });
 
   } catch (e) {
-    // Log the failure
-    audit.add(db, {
-      actionType: 'hardware.scan',
-      targetHost: safeHost,
-      tool: 'multi',
-      command: `Hardware scan on ${safeHost}`,
-      success: false,
-      durationMs: Date.now() - scanStartTime,
-      errorReason: e.message,
-      initiatedBy: 'admin',
-      initiatedFrom,
+    await audit.add(db, {
+      actionType: 'hardware.scan', targetHost: safeHost, tool: 'multi',
+      command: `Hardware scan on ${safeHost}`, success: false,
+      durationMs: Date.now() - scanStartTime, errorReason: e.message,
+      initiatedBy: 'admin', initiatedFrom,
     });
     res.json({ success: false, error: e.message, data: results });
   }
@@ -2849,6 +2657,7 @@ app.post('/api/remote/connect', async (req, res) => {
     if (protocol === 'VNC') {
       // Try common VNC viewer paths
       const candidates = [
+        path.join(__dirname, 'Tools', 'vncviewer.exe'),
         'C:\\Program Files\\RealVNC\\VNC Viewer\\vncviewer.exe',
         'C:\\Program Files\\TightVNC\\tvnviewer.exe',
         'C:\\Program Files\\TigerVNC\\vncviewer.exe',

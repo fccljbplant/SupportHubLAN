@@ -28,7 +28,7 @@ const path = require('path');
 const { logCommand, analyzeError } = require('./logger');
 const { toFqdn, credentialArgs, maskPassword, stripPsExecBanner } = require('./utils');
 
-const PSTOOLS_PATH = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
+const PSTOOLS_PATH = process.env.PSTOOLS_PATH || path.join(__dirname, '..', 'PSTools') + path.sep;
 
 function pstoolsExe(name) {
   return path.join(PSTOOLS_PATH, name);

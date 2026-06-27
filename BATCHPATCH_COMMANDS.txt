@@ -147,45 +147,211 @@ REMOTE EXECUTION MODES
 #   Returns console output of the command
 
 ==============================================================================
-WINDOWS UPDATES
+WINDOWS UPDATES — DETAILED (from BatchPatch internals)
 ==============================================================================
 
-# Online mode: target computers search for updates against Microsoft servers
-# Cached mode: BatchPatch downloads updates to its cache, distributes to targets
-# Offline mode: uses wsusscn2.cab for offline scanning (no internet needed on targets)
+HOW BATCHPATCH HANDLES WINDOWS UPDATES:
+  BatchPatch does NOT use PSWindowsUpdate module. Instead it uses:
+  1. Windows Update Agent (WUA) COM API directly (IUpdateSession, IUpdateSearcher, etc.)
+  2. A Remote Agent (BatchPatchRemoteAgent.exe) deployed to target via PsExec/SMB
+  3. The Remote Agent runs WUA COM calls locally on the target
 
-# Update download happens on the BatchPatch computer (not targets)
-# Saves bandwidth — each update downloaded once, distributed to all targets
+THREE UPDATE MODES:
+  1. Online mode: target searches Microsoft servers for updates directly
+  2. Cached mode: BatchPatch downloads updates to its cache, distributes to targets
+     - Saves bandwidth (each update downloaded once, distributed to all)
+  3. Offline mode: uses wsusscn2.cab (Microsoft offline scan file)
+     - Targets don't need internet access
+     - wsusscn2.cab is downloaded from Microsoft
+
+WUA COM API USED (C++ via BatchPatchRemoteAgent.exe):
+  - CoCreateInstance(IUpdateSession) → Create update session
+  - IUpdateSession::CreateUpdateSearcher() → Search for updates
+  - IUpdateSession::CreateUpdateDownloader() → Download updates
+  - IUpdateSession::CreateUpdateInstaller() → Install updates
+  - IUpdateSearcher::Search() → Execute search
+  - IUpdateSearcher::QueryHistory() → Get update installation history
+  - IUpdateDownloader::Download() → Download updates
+  - IUpdateInstaller::Install() → Install updates
+  - IUpdateInstaller::Uninstall() → Uninstall updates
+  - IUpdateCollection → Collection of updates to process
+
+SEARCH SERVER SELECTION:
+  - Default: uses system default (WSUS or Microsoft Update)
+  - Windows Update: searches Microsoft Windows Update servers
+  - Microsoft Update: searches Microsoft Update (includes other MS products)
+
+SEARCH RESULTS PROPERTIES READ:
+  - Title, KB article IDs, Update ID
+  - IsInstalled, IsDownloaded, IsHidden
+  - EulaAccepted, AcceptEula()
+  - RebootRequired (before and after installation)
+  - Type: SoftwareUpdate, DriverUpdate
+  - MaxDownloadSize, MinDownloadSize
+  - DownloadContent (URLs for caching)
+  - InstallationBehavior (CanRequestUserInput, Impact)
+  - AutoSelect, AutoDownload settings
+  - DeploymentAction: Installation, Uninstallation, Detection
+
+DOWNLOAD PROPERTIES:
+  - DownloadProgress (total bytes, current bytes, per-update bytes)
+  - DownloadPhase
+  - DownloadResultCode: Succeeded, SucceededWithErrors, Failed, Aborted, NotStarted, InProgress
+
+INSTALLATION PROPERTIES:
+  - InstallationProgress
+  - InstallationResultCode: Succeeded, SucceededWithErrors, Failed, Aborted, NotStarted, InProgress
+  - RebootRequired (per update and overall)
+  - HResult (error code for failed installations)
+
+UPDATE UNINSTALL:
+  - Uses WUA COM API IUpdateInstaller::Uninstall()
+  - WARNING: Does NOT work on non-English OS (Windows 10/2016+)
+  - Fallback: create custom command using wusa.exe /uninstall /kb:XXXXXXX /quiet /norestart
+
+UPDATE HISTORY:
+  - IUpdateSearcher::QueryHistory() → returns installed update history
+  - Properties: Result (Succeeded/Failed), Date, Title, KB
+
+KB FILTERING:
+  - BatchPatch can filter updates by KB ID before download/install
+  - Matching: compares update title to text in filter list
+  - If filter list is empty: all available updates are processed
+  - If filter list is populated: only matching updates are processed
+
+PENDING REBOOT DETECTION:
+  - Reads RebootRequired property from WUA installation result
+  - Also checks: RebootRequiredBeforeInstallation (property of update)
+  - States: TRUE, FALSE, MAYBE
+  - Registry key: HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired
+  - Also: HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending
+
+WUAUCLT COMMANDS (legacy, pre-Windows 10):
+  wuauclt /detectnow        — Force check for updates
+  wuauclt /reportnow        — Report update status to WSUS
+  wuauclt /resetauthorization — Reset WSUS authorization cookie
+  wuauclt /ShowInstallationProgress — Show installation UI
+  wuauclt /ScanNow          — Scan for updates now
+
+USOCLIENT COMMANDS (Windows 10+ replacement for wuauclt):
+  USOClient.exe ScanInstallWait — Scan + install + wait
+  USOClient.exe StartScan       — Start scan only
+  USOClient.exe StartDownload   — Download pending updates
+  USOClient.exe StartInstall    — Install downloaded updates
+  USOClient.exe RestartDevice   — Restart device (for pending reboot)
+  USOClient.exe ScanInstallWait — Full scan+download+install cycle
+
+GET-WINDOWSUPDATELOG (Windows 10/2016+):
+  PowerShell: Get-WindowsUpdateLog
+  - Assembles WU activity data from ETW traces into a readable log
+  - Requires access to Microsoft symbol server: http://msdl.microsoft.com/download/symbols
+  - Takes 30 seconds to 2 minutes
+  - Output may sometimes be useless (per BatchPatch docs)
+
+WSUS RECONNECT:
+  - Restarts wuauserv service on target to reconnect to WSUS
+  - net stop wuauserv && net start wuauserv
 
 ==============================================================================
-CREDENTIAL SECURITY NOTES (from BatchPatch docs)
+SOFTWARE DEPLOYMENT — DETAILED
 ==============================================================================
 
-1. Most secure: Integrated Security (no alternate credentials)
-   - Run batchpatch.exe as a user who is admin on target computers
-   - No passwords stored or transmitted
+STANDARD DEPLOYMENT:
+  Supported file types: .msi .msp .msu .exe .reg .vbs .bat .cmd .ps1 .js .wsh .wsf
+  Must determine silent/quiet switch for the installer:
+  - /S, /s, -S, -s, /silent, -silent, /Q, /q, -Q, -q, /quiet, -quiet
+  - Without silent switch: remote process hangs indefinitely
 
-2. Alternate credentials:
-   - Passed via command line (may appear in process logs)
-   - Stored encrypted in .bps/.bpt grid files (AES encryption by default)
-   - Can be obfuscated (weaker — treat as plaintext)
+MSI INSTALL (via msiexec.exe):
+  msiexec.exe /i "package.msi" /qn /norestart          — Silent install
+  msiexec.exe /x "package.msi" /qn                      — Silent uninstall
+  msiexec.exe /a "package.msi"                          — Administrative install
+  msiexec.exe /update "patch.msp" /qn                   — Apply patch
+  msiexec.exe /i "package.msi" TRANSFORMS="transform.mst" /qn — Install with transform
 
-3. Auto-logon registry entries:
-   - WARNING: stores password in PLAIN TEXT in target registry
-   - AutoLogonCount decrements on each reboot
-   - Should be removed after use for security
+MSU INSTALL (via wusa.exe):
+  wusa.exe "update.msu" /quiet /norestart               — Silent install
+  wusa.exe /uninstall /kb:XXXXXXX /quiet /norestart     — Silent uninstall by KB
+
+MSP INSTALL (via msiexec.exe):
+  msiexec.exe /update "patch.msp" /qn /norestart        — Apply MSP patch
+
+MULTI-FILE DEPLOYMENT:
+  - Only .msu, .msi, and .msp allowed for batch update deployment
+  - Multiple files deployed in single action
+
+REGISTRY DEPLOYMENT:
+  reg import "settings.reg"                              — Import registry file
+  reg add "HKLM\..." /v ValueName /t REG_SZ /d "data" /f — Add registry value
+
+SCRIPT DEPLOYMENT:
+  - .vbs, .bat, .cmd, .ps1, .js, .wsh, .wsf supported
+  - PowerShell: powershell.exe -ExecutionPolicy Bypass -File "script.ps1"
+  - CMD: cmd.exe /c "script.bat"
+  - VBScript: cscript.exe "script.vbs"
 
 ==============================================================================
-EXECUTION PATTERN (how BatchPatch runs remote commands)
+ADDITIONAL WMIC COMMANDS
 ==============================================================================
 
-All remote WMIC commands are executed via PsExec:
-  psexec -accepteula \\HOST [-u DOMAIN\user -p password] -s wmic.exe COMMAND
+# Check .NET Framework version
+REG QUERY "HKLM\Software\Microsoft\.NETFramework" /v InstallRoot
 
-This runs WMIC LOCALLY on the target machine via SMB (port 445).
-No DCOM, no WinRM, no ADWS, no RPC endpoint mapper needed.
-Only requires: PsTools + Admin$ share accessible + admin credentials.
+# Get file version
+WMIC PATH CIM_Datafile WHERE "name = 'C:\\Some Folder\\SomeFile.exe'" GET version
 
-The output is plain text (Key=Value pairs or table format).
-WMIC /format:list produces parseable Key=Value output.
-WMIC /format:csv produces CSV output.
+# List user accounts
+WMIC USERACCOUNT list brief
+
+==============================================================================
+LAPS (Local Administrator Password Solution)
+==============================================================================
+
+# BatchPatch has built-in LAPS support:
+# - LAPsADdomain — AD domain for LAPS
+# - LAPsADuser — AD user for LAPS queries
+# - LAPsADpassword — AD password for LAPS
+# - LAPsPowerShellCommand — PowerShell command for LAPS
+# - LAPS16x16 — UI icon
+
+# LAPS password retrieval (PowerShell):
+# Get-ADComputer -Identity HOSTNAME -Properties ms-Mcs-AdmPwd
+
+# LAPS password expiration (PowerShell):
+# Get-ADComputer -Identity HOSTNAME -Properties ms-Mcs-AdmPwdExpirationTime
+
+# LAPS reset (PowerShell):
+# Reset-LapsPassword (Windows 11 22H2+ / Server 2022+)
+# Set-ADComputer -Identity HOSTNAME -Replace @{ms-Mcs-AdmPwdExpirationTime='0'}
+
+==============================================================================
+VARIABLES / PLACEHOLDERS
+==============================================================================
+
+BatchPatch supports these variables in custom commands:
+  $computer or $host     — Target computer name (from Host column)
+  $notes                 — Notes field value
+  $notes2                — Notes2 field value
+  $description           — Description field value
+  $category              — Category field value
+  $location              — Location field value
+
+Example custom command:
+  psexec \\$computer -accepteula -s ipconfig /all
+
+==============================================================================
+USEFUL LINKS (from BatchPatch)
+==============================================================================
+
+Getting Started:    https://batchpatch.com/getting-started-with-batchpatch
+FAQ:                https://batchpatch.com/faq
+Tutorials:          https://batchpatch.com/category/tutorials
+Troubleshooting:    https://batchpatch.com/troubleshooting-common-errors-in-batchpatch
+Authentication:     https://batchpatch.com/batchpatch-authentication-in-domain-and-workgroup-non-domain-environments
+Firewall Config:    https://batchpatch.com/using-batchpatch-with-windows-firewall
+Port Requirements:  https://batchpatch.com/batchpatch-ports
+Software Deploy:    https://batchpatch.com/software-deployment
+MSU/MSI Deploy:     https://batchpatch.com/remotely-install-multiple-msu-files-or-msi-and-msp-files-to-numerous-computers
+Uninstall Fails:    https://batchpatch.com/when-uninstall-individual-update-windows-10-2016-in-batchpatch-fails-to-remove-an-update
+Alternate Creds:    https://batchpatch.com/using-alternate-logon-credentials-in-batchpatch
+WindowsUpdate.log:  https://support.microsoft.com/en-us/kb/3036646

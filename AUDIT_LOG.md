@@ -446,7 +446,28 @@ All 10 PsTools endpoints, all 4 Updates endpoints, Services, Processes, Power, L
 - Issues found: 0 critical formatting issues
 - Issues fixed: import cleanup
 
-## PHASE 9 — Documentation
+## PHASE 11 — Jobs/Queue/Scan/Audit Wiring (2026-06-27)
+
+### Actions Taken:
+1. **Queue runner overhaul**: Variable substitution, execWithFallback for all steps, per-step audit logging
+2. **DB schema**: 12 new job fields, 3 host fields, queue_audit_log collection
+3. **Services endpoints**: CIM DCOM + WMIC + PsService multi-fallback for list/action
+4. **Apps endpoint**: CIM DCOM Win32_Product fallback added
+5. **Frontend fixes**: HostSelector offline filtering, syntax validation, running/history tabs rewrite, dashboard stats
+6. **Job drawer**: Live WebSocket updates, color-coded host boxes, expandable results
+7. **Scan jobs**: Hardware/Apps/Services scans create dashboard-visible jobs
+8. **Status check**: Ping by IP, DB persistence, Fleet Status Check job on startup
+9. **Audit**: Full command output in expandable section, 2000-char truncation
+10. **Host metadata**: Dynamic Sites/Departments/HostTypes in Settings
+11. **AD import**: managedBy → Owner mapping
+12. **Step palette**: Hardware Scan, Apps Scan, Services Scan added
+13. **TagInput**: Outlook-style autocomplete tag component
+14. **Default columns**: Status, Hostname, IP, OS, User, Site, Dept, Owner, Last Seen, Actions
+
+### Files Modified:
+- server.js, db.js, lib/audit.js, lib/wmic.js, supporthublan.html
+
+✅ PHASE 11 COMPLETE
 
 ### README.md Updated:
 - Removed "VSCode-style terminal panel" from feature list

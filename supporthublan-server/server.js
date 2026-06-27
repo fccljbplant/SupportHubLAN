@@ -63,9 +63,10 @@ const crypto = require('crypto');
 // ---- SQLite + AES-256 encrypted credential storage ----
 const db = require('./db');
 
-// ---- Lib modules (wmic, powershell, pstools, logger, audit) ----
+// ---- Lib modules (wmic, powershell, winrm, pstools, logger, audit) ----
 const wmic = require('./lib/wmic');
 const powershell = require('./lib/powershell');
+const winrm = require('./lib/winrm');
 const pstools = require('./lib/pstools');
 const { logCommand, analyzeError, getRecentLogs } = require('./lib/logger');
 const audit = require('./lib/audit');
@@ -82,15 +83,12 @@ if (fs.existsSync(envPath)) {
 const app = express();
 const server = http.createServer(app);
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const PSTOOLS_PATH = process.env.PSTOOLS_PATH || path.join(__dirname, 'PSTools') + path.sep;
+const PSTOOLS_PATH = process.env.PSTOOLS_PATH || 'C:\\PSTools\\';
 const BIND_ADDRESS = process.env.BIND_ADDRESS || '0.0.0.0';
 const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASS = process.env.ADMIN_PASS || '';
 const AUTO_OPEN = (process.env.AUTO_OPEN_BROWSER || 'true').toLowerCase() === 'true';
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS || '*';
-const DEFAULT_DOMAIN = process.env.DEFAULT_DOMAIN || '';
-const DEFAULT_USERNAME = process.env.DEFAULT_USERNAME || '';
-const DEFAULT_PASSWORD = process.env.DEFAULT_PASSWORD || '';
 
 // ---- Middleware ----
 app.use(cors({ origin: ALLOWED_ORIGINS === '*' ? true : ALLOWED_ORIGINS.split(',') }));
@@ -122,7 +120,6 @@ const VENDOR_PATH = path.join(__dirname, '..', 'vendor');
 app.use('/vendor', express.static(VENDOR_PATH, { maxAge: '1d' }));
 
 app.get('/', (req, res) => {
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   if (fs.existsSync(FRONTEND_PATH)) {
     res.sendFile(FRONTEND_PATH);
   } else {
@@ -168,28 +165,7 @@ function buildCredentialBlock(credential) {
   `;
 }
 
-// ---- Helper: Run a PowerShell script on a remote host via PsExec and parse JSON result ----
-async function runRemotePowerShellJson(hostname, script, timeoutMs = 45000, credentialOverride) {
-  const cred = credentialOverride || getGlobalCredentials();
-  const result = await powershell.runRemoteViaPsExec(hostname, script, PSTOOLS_PATH, timeoutMs, cred);
-  if (!result.success) return result;
-  const markerMatch = /<<<JSON>>>([\s\S]*?)<<<END>>>/.exec(result.stdout || '');
-  if (markerMatch) {
-    try { return { ...result, json: JSON.parse(markerMatch[1]) }; }
-    catch (e) { return { ...result, jsonError: e.message, raw: result.stdout }; }
-  }
-  return { ...result, jsonError: 'No JSON markers found in output', raw: result.stdout };
-}
-
-// ---- Helper: PsExec credential args for direct pstools use ----
-function getPsExecCredArgs() {
-  const cred = getGlobalCredentials();
-  if (!cred) return [];
-  const fullUser = cred.domain ? `${cred.domain}\\${cred.username}` : cred.username;
-  return ['-u', fullUser, '-p', cred.password];
-}
-
-// Shared PsTools mapping (used by /api/pstools/execute)
+// Shared PsTools mapping (used by /api/pstools/execute and WebSocket terminal)
 const PSTOOLS_TOOLMAP = {
   psexec: 'psexec.exe', psinfo: 'psinfo.exe', pslist: 'pslist.exe',
   pskill: 'pskill.exe', psservice: 'psservice.exe', psloggedon: 'psloggedon.exe',
@@ -221,6 +197,26 @@ app.get('/api/logs', (req, res) => {
   const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
   const logs = getRecentLogs(limit);
   res.json({ success: true, data: logs, count: logs.length });
+});
+
+// ==========================================================================
+// WINRM TEST — Test if WinRM is available on a remote host
+// ==========================================================================
+app.post('/api/winrm/test', async (req, res) => {
+  const { hostname } = req.body;
+  const safeHost = sanitizeHost(hostname);
+  const result = await winrm.testWinRM(safeHost);
+  res.json({ success: result.available, data: result });
+});
+
+// ==========================================================================
+// WINRM ENABLE — Try to enable WinRM on a remote host via PsExec
+// ==========================================================================
+app.post('/api/winrm/enable', async (req, res) => {
+  const { hostname } = req.body;
+  const safeHost = sanitizeHost(hostname);
+  const result = await winrm.enableWinRM(safeHost, PSTOOLS_PATH);
+  res.json({ success: result.success, data: result });
 });
 
 // Check if PSWindowsUpdate module is available (checked at startup, cached)
@@ -289,17 +285,6 @@ app.get('/api/health', (req, res) => {
 
 // ==========================================================================
 // INVENTORIES — Multi-inventory management (SQLite-backed)
-// JOB ENDPOINTS
-app.get('/api/jobs', (req, res) => {
-  const jobs = [];
-  try { if (db.jobs && db.jobs.list) { const list = db.jobs.list(100); res.json({ success: true, data: list }); return; } } catch (_) {}
-  res.json({ success: true, data: jobs });
-});
-app.get('/api/jobs/:jobId', (req, res) => {
-  try { if (db.jobs && db.jobs.get) { const j = db.jobs.get(req.params.jobId); if (j) return res.json({ success: true, data: j }); } } catch (_) {}
-  res.json({ success: false, error: 'Job not found' });
-});
-
 // Each inventory = one tab in the UI
 // ==========================================================================
 app.get('/api/inventories', (req, res) => {
@@ -531,34 +516,14 @@ app.post('/api/settings/log-retention', (req, res) => {
 // ==========================================================================
 
 // Helper: get global domain credentials (decrypted)
-// Tries primary AD credentials first, then fallback local admin credentials
 function getGlobalCredentials() {
   try {
-    const credDomain = db.settings.get('globalCredDomain', '') || '';
-    const globalDomain = credDomain || DEFAULT_DOMAIN;
-    // Try primary AD/domain credentials
     const username = db.settings.get('globalCredUsername', '') || '';
     const encryptedPassword = db.settings.get('globalCredPassword', '') || '';
-    const domain = db.settings.get('globalCredDomain', '') || globalDomain;
+    const domain = db.settings.get('globalCredDomain', '') || '';
     const password = encryptedPassword ? db.decryptField(encryptedPassword) : '';
     if (username && password) {
-      return { username, password, domain, fullUsername: domain ? domain + '\\' + username : username, source: 'domain' };
-    }
-    // Fall back to local admin credentials
-    const fbUsername = db.settings.get('fallbackCredUsername', '') || '';
-    const fbEncrypted = db.settings.get('fallbackCredPassword', '') || '';
-    const fbDomain = db.settings.get('fallbackCredDomain', '') || globalDomain;
-    const fbPassword = fbEncrypted ? db.decryptField(fbEncrypted) : '';
-    if (fbUsername && fbPassword) {
-      return { username: fbUsername, password: fbPassword, domain: fbDomain, fullUsername: fbDomain ? fbDomain + '\\' + fbUsername : fbUsername, source: 'fallback' };
-    }
-    // Fall back to DEFAULT_USERNAME / DEFAULT_PASSWORD from .env (not persisted to DB)
-    if (DEFAULT_USERNAME && DEFAULT_PASSWORD) {
-      return { username: DEFAULT_USERNAME, password: DEFAULT_PASSWORD, domain: credDomain || DEFAULT_DOMAIN, fullUsername: (credDomain || DEFAULT_DOMAIN) ? (credDomain || DEFAULT_DOMAIN) + '\\' + DEFAULT_USERNAME : DEFAULT_USERNAME, source: 'env-default' };
-    }
-    // No credentials configured, but domain may be set from env — return domain-only object
-    if (globalDomain) {
-      return { username: '', password: '', domain: globalDomain, fullUsername: '', source: 'suffix-only' };
+      return { username, password, domain, fullUsername: domain ? domain + '\\' + username : username };
     }
     return null;
   } catch (e) {
@@ -593,45 +558,32 @@ app.post('/api/settings/domain-credentials', (req, res) => {
 });
 
 // POST /api/settings/domain-credentials/test — test credentials
-// Accepts optional username/password/domain in body. If provided, tests those.
-// Otherwise, tests the saved global credentials.
 app.post('/api/settings/domain-credentials/test', async (req, res) => {
-  const { username: formUsername, password: formPassword, domain: formDomain } = req.body;
-  let creds;
-
-  if (formUsername && formPassword) {
-    // Test the credentials provided in the form
-    creds = {
-      username: formUsername,
-      password: formPassword,
-      domain: formDomain || '',
-      fullUsername: (formDomain ? formDomain + '\\' : '') + formUsername
-    };
-  } else {
-    creds = getGlobalCredentials();
-  }
-
+  const creds = getGlobalCredentials();
   if (!creds) {
     return res.json({ success: false, error: 'No domain credentials configured' });
   }
-
-  // Test using .NET DirectoryContext + Domain.GetDomain (no ADWS/RSAT needed)
-  const safeUser = creds.fullUsername.replace(/'/g, "''");
-  const safePass = creds.password.replace(/'/g, "''");
-  const safeDomain = (creds.domain || '').replace(/'/g, "''");
-  const script = `
-    $ErrorActionPreference = 'Stop'
-    try {
-      $ctx = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain', '${safeDomain}', '${safeUser}', '${safePass}')
-      $domainObj = [System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($ctx)
-      $dc = $domainObj.FindDomainController().Name
-      $nc = $domainObj.GetDirectoryEntry().Properties['defaultNamingContext'][0]
-      $domainObj.Dispose()
-      Write-Output ("OK:${safeUser} verified — DC: " + $dc + ", NC: " + $nc)
-    } catch {
-      Write-Output ("FAIL:" + $_.Exception.Message)
-    }
-  `;
+  // Test: verify credentials by doing an LDAP bind to the domain
+  // Use here-strings (@'...'@) to safely handle passwords with special chars
+  const lines = [
+    '$ErrorActionPreference = "Stop"',
+    'try {',
+    '  $plainPass = @\'',
+    creds.password,
+    '\'@',
+    '  $fullUser = @\'',
+    creds.fullUsername,
+    '\'@',
+    '  # Test by binding to LDAP RootDSE with these credentials',
+    '  $entry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://RootDSE", $fullUser, $plainPass)',
+    '  $nc = $entry.Properties["defaultNamingContext"][0]',
+    '  $entry.Dispose()',
+    '  Write-Output ("OK:" + $fullUser + " verified — domain NC: " + $nc)',
+    '} catch {',
+    '  Write-Output ("FAIL:" + $_.Exception.Message)',
+    '}'
+  ];
+  const script = lines.join('\n');
   const result = await runPowerShell(script, 15000);
   const output = (result.stdout || '').trim();
   if (output.startsWith('OK:')) {
@@ -643,31 +595,13 @@ app.post('/api/settings/domain-credentials/test', async (req, res) => {
   }
 });
 
-// GET /api/settings/fallback-credentials — retrieve fallback local credentials
-app.get('/api/settings/fallback-credentials', (req, res) => {
-  const fbUsername = db.settings.get('fallbackCredUsername', '') || '';
-  const fbEncrypted = db.settings.get('fallbackCredPassword', '') || '';
-  const fbDomain = db.settings.get('fallbackCredDomain', '') || '';
-  const hasFb = !!(fbUsername && fbEncrypted);
-  res.json({ success: true, data: { username: fbUsername, domain: fbDomain, hasPassword: hasFb } });
-});
 
-// POST /api/settings/fallback-credentials — save fallback local admin credentials
-app.post('/api/settings/fallback-credentials', (req, res) => {
-  const { username, password, domain } = req.body;
-  if (!username || !password) {
-    return res.json({ success: false, error: 'Username and password are required' });
-  }
-  try {
-    db.settings.set('fallbackCredUsername', username);
-    db.settings.set('fallbackCredPassword', db.encryptField(password));
-    db.settings.set('fallbackCredDomain', domain || '');
-    res.json({ success: true, message: 'Fallback credentials saved' });
-  } catch (e) {
-    res.json({ success: false, error: 'Failed to save fallback credentials: ' + e.message });
-  }
+// ==========================================================================
+// JOBS — Persistent job history
+// ==========================================================================
+app.get('/api/jobs', (req, res) => {
+  res.json({ success: true, data: db.jobs.list(100) });
 });
-
 
 // ==========================================================================
 // CREDENTIALS (legacy in-memory store — kept for backward compat)
@@ -684,17 +618,6 @@ app.post('/api/credentials/legacy', (req, res) => {
 // Detect domain from local computer — reads domain name + default OU path
 // Uses .NET (no ADWS/RSAT needed)
 app.post('/api/hosts/detect-domain', async (req, res) => {
-  // Prefer the domain from configured global credentials, since that is the
-  // domain we will actually query with AD discovery.
-  const creds = getGlobalCredentials();
-  if (creds && creds.domain) {
-    const domain = creds.domain;
-    const dcParts = domain.split('.').map(p => 'DC=' + p).join(',');
-    const ouPath = 'OU=Computers,' + dcParts;
-    return res.json({ success: true, data: { domain, partOfDomain: true, ouPath, source: 'credentials' } });
-  }
-
-  // Fallback: detect from the local computer
   const script = `
     $ErrorActionPreference = 'SilentlyContinue'
     $cs = Get-CimInstance Win32_ComputerSystem
@@ -703,11 +626,13 @@ app.post('/api/hosts/detect-domain', async (req, res) => {
     $ouPath = ''
     if ($partOfDomain) {
       try {
-        $entry = [System.DirectoryServices.DirectoryEntry]::new('LDAP://RootDSE')
+        # Use .NET to get the computer's DN (no ADWS needed)
+        $entry = [System.DirectoryServices.DirectoryEntry]::new('LDAP://<LDAP://RootDSE>')
         $defaultNC = $entry.Properties['defaultNamingContext'][0]
         $ouPath = 'OU=Computers,' + $defaultNC
         $entry.Dispose()
       } catch {
+        # Fallback: build from domain name
         $dcParts = $domain -split '\\.' | ForEach-Object { 'DC=' + $_ }
         $ouPath = 'OU=Computers,' + ($dcParts -join ',')
       }
@@ -725,127 +650,85 @@ app.post('/api/hosts/detect-domain', async (req, res) => {
 
 // AD Computer Discovery — uses GLOBAL domain credentials from Settings
 // No per-form credentials needed. Domain is auto-detected from global settings.
-// Uses .NET DirectorySearcher with Domain.GetDomain for robust DC discovery.
 app.post('/api/hosts/discover-ad', async (req, res) => {
-  const { ouPath, searchScope, filter, nameAttr, includeIP } = req.body;
+  const { ouPath, searchScope, filter, nameAttr } = req.body;
+
+  // Use global credentials from Settings → Default Domain Credentials
   const creds = getGlobalCredentials();
   if (!creds) {
     return res.json({ success: false, error: 'No domain credentials configured. Go to Settings → General → Default Domain Credentials to set them up.' });
   }
 
-  const fullUser = creds.fullUsername;
+  const safeUser = creds.username.replace(/'/g, "''");
   const safePass = creds.password.replace(/'/g, "''");
   const safeDomain = creds.domain.replace(/'/g, "''");
-  const rawOuPath = (ouPath || '').replace(/'/g, "''").trim();
-  // Strip optional LDAP:// prefix if the user pasted one
-  const safeOuPath = rawOuPath.replace(/^LDAP:\/\//i, '');
-  const safeNameAttr = (nameAttr || 'cn').replace(/'/g, "''");
-  const safeFilter = filter ? `(${filter})` : '(objectCategory=computer)';
-  const scopeStr = searchScope === 'onelevel' ? 'OneLevel' : searchScope === 'base' ? 'Base' : 'Subtree';
-  const resolveIP = includeIP === true ? '$true' : '$false';
+  const fullUser = creds.fullUsername.replace(/'/g, "''");
 
+  // Use .NET DirectorySearcher (LDAP) — does NOT require ADWS or RSAT AD module
   const script = `
     $WarningPreference = 'SilentlyContinue'
     $VerbosePreference = 'SilentlyContinue'
     $ErrorActionPreference = 'Stop'
+    $searchBaseDN = '${(ouPath || '').replace(/'/g, "''")}'
+    $nameAttr = '${(nameAttr || 'cn').replace(/'/g, "''")}'
     try {
-      # Use DirectoryContext to get domain controller robustly
-      $ctx = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain', '${safeDomain}', '${fullUser}', '${safePass}')
-      $domainObj = [System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($ctx)
-      $defaultNC = $domainObj.GetDirectoryEntry().Properties['defaultNamingContext'][0]
-      $dc = $domainObj.FindDomainController().Name
-      $domainObj.Dispose()
-
-      # Build a list of candidate search bases. If the user supplied an OU, try it first,
-      # then fall back to the root domain naming context. Many AD forests use CN=Computers
-      # rather than OU=Computers, so defaulting to the root context is safer.
-      $candidates = @()
-      if ('${safeOuPath}') {
-        $candidates += 'LDAP://' + '${safeOuPath}'
+      # Build LDAP path — use provided OU or auto-detect from domain
+      if ($searchBaseDN) {
+        $ldapPath = 'LDAP://${searchBaseDN}'
+      } else {
+        # Auto-detect: get defaultNamingContext from RootDSE
+        $rootDSE = New-Object System.DirectoryServices.DirectoryEntry('LDAP://RootDSE')
+        $defaultNC = $rootDSE.Properties['defaultNamingContext'][0]
+        $rootDSE.Dispose()
+        $ldapPath = 'LDAP://OU=Computers,' + $defaultNC
+        # If Computers OU doesn't exist, fall back to the whole domain
       }
-      $candidates += 'LDAP://' + $defaultNC
-      # Some legacy / simple domains have a CN=Computers container at the root
-      $candidates += 'LDAP://CN=Computers,' + $defaultNC
+      $entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath, '${fullUser}', '${safePass}')
+      $searcher = New-Object System.DirectoryServices.DirectorySearcher($entry)
+      $searcher.Filter = '(&(objectCategory=computer))'
+      $searcher.PageSize = 1000
+      $searcher.PropertiesToLoad.Add('cn') | Out-Null
+      $searcher.PropertiesToLoad.Add('name') | Out-Null
+      $searcher.PropertiesToLoad.Add('dNSHostName') | Out-Null
+      $searcher.PropertiesToLoad.Add('operatingSystem') | Out-Null
+      $searcher.PropertiesToLoad.Add('lastLogonTimestamp') | Out-Null
 
-      $searchError = $null
       $results = @()
-      foreach ($searchBaseDN in $candidates) {
-        try {
-          # Bind to the resolved DC explicitly to avoid stale DC referrals
-          $targetPath = 'LDAP://' + $dc + '/' + ($searchBaseDN -replace '^LDAP://','')
-          $entry = New-Object System.DirectoryServices.DirectoryEntry($targetPath, '${fullUser}', '${safePass}')
-          $searcher = New-Object System.DirectoryServices.DirectorySearcher($entry)
-          $searcher.Filter = '${safeFilter}'
-          $searcher.PageSize = 1000
-          $searcher.SearchScope = [System.DirectoryServices.SearchScope]::${scopeStr}
-          $searcher.PropertiesToLoad.Add('cn') | Out-Null
-          $searcher.PropertiesToLoad.Add('name') | Out-Null
-          $searcher.PropertiesToLoad.Add('dNSHostName') | Out-Null
-          $searcher.PropertiesToLoad.Add('operatingSystem') | Out-Null
-          $searcher.PropertiesToLoad.Add('lastLogonTimestamp') | Out-Null
-          $searcher.PropertiesToLoad.Add('managedBy') | Out-Null
+      $searchResult = $searcher.FindAll()
+      foreach ($sr in $searchResult) {
+        $name = ''
+        if ($sr.Properties[$nameAttr]) { $name = $sr.Properties[$nameAttr][0] }
+        elseif ($sr.Properties['cn']) { $name = $sr.Properties['cn'][0] }
+        elseif ($sr.Properties['name']) { $name = $sr.Properties['name'][0] }
 
-          $searchResult = $searcher.FindAll()
-          foreach ($sr in $searchResult) {
-            $name = ''
-            if ($sr.Properties['${safeNameAttr}']) { $name = $sr.Properties['${safeNameAttr}'][0] }
-            elseif ($sr.Properties['cn']) { $name = $sr.Properties['cn'][0] }
-            elseif ($sr.Properties['name']) { $name = $sr.Properties['name'][0] }
+        $fqdn = ''
+        if ($sr.Properties['dnshostname']) { $fqdn = $sr.Properties['dnshostname'][0] }
 
-            $fqdn = ''
-            if ($sr.Properties['dnshostname']) { $fqdn = $sr.Properties['dnshostname'][0] }
+        $os = ''
+        if ($sr.Properties['operatingsystem']) { $os = $sr.Properties['operatingsystem'][0] }
 
-            $os = ''
-            if ($sr.Properties['operatingsystem']) { $os = $sr.Properties['operatingsystem'][0] }
-
-            $managedBy = ''
-            if ($sr.Properties['managedby']) {
-              $rawDn = $sr.Properties['managedby'][0]
-              if ($rawDn -match '^CN=([^,]+)') { $managedBy = $matches[1] }
-              else { $managedBy = $rawDn }
-            }
-
-            $results += @{ name = $name; fqdn = $fqdn; ip = ''; os = $os; managedBy = $managedBy }
-          }
-          $searchResult.Dispose()
-          $searcher.Dispose()
-          $entry.Dispose()
-
-          # If we found results, stop trying other candidates
-          if ($results.Count -gt 0) { break }
-        } catch {
-          $searchError = $_.Exception.Message
-          try { $searcher.Dispose() } catch {}
-          try { $entry.Dispose() } catch {}
-        }
+        $results += @{ name = $name; fqdn = $fqdn; ip = ''; os = $os }
       }
-
-      # Optionally resolve IP addresses via DNS (from the server)
-      if (${resolveIP}) {
-        foreach ($r in $results) {
-          try {
-            $resolved = $null
-            $targetName = if ($r.fqdn) { $r.fqdn } else { $r.name }
-            if ($targetName) {
-              $addrs = [System.Net.Dns]::GetHostAddresses($targetName)
-              $resolved = $addrs | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
-              if ($resolved) { $r.ip = $resolved.IPAddressToString }
-            }
-          } catch { $r.ip = '' }
-        }
-      }
+      $searchResult.Dispose()
+      $searcher.Dispose()
+      $entry.Dispose()
 
       if ($results.Count -eq 0) {
-        Write-Output ('<<<JSON>>>[]<<<END>>>')
+        Write-Output '<<<JSON>>>[]<<<END>>>'
       } else {
         $json = $results | ConvertTo-Json -Compress
-        Write-Output ('<<<JSON>>>' + $json + '<<<END>>>')
+        if ($json -is [string]) {
+          Write-Output ('<<<JSON>>>' + $json + '<<<END>>>')
+        } else {
+          Write-Output ('<<<JSON>>>[' + $json + ']<<<END>>>')
+        }
       }
     } catch {
       Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>')
     }
   `;
   const result = await runPowerShell(script, 30000);
+  // Extract JSON from markers (ignores any warnings/noise before/after)
   const markerMatch = /<<<JSON>>>([\s\S]*?)<<<END>>>/.exec(result.stdout || '');
   if (markerMatch) {
     try {
@@ -860,8 +743,22 @@ app.post('/api/hosts/discover-ad', async (req, res) => {
       res.json({ success: false, error: 'JSON parse error after AD query' });
     }
   } else {
+    // No markers found — check for module-not-found error
     const errStr = result.stderr || result.stdout || '';
-    res.json({ success: false, error: errStr.substring(0, 500) || 'AD query failed — ensure credentials are correct and the server is joined to a domain' });
+    const isModuleNotFound = /module.*not.*found|ActiveDirectory.*not.*loaded/i.test(errStr);
+    if (isModuleNotFound) {
+      res.json({
+        success: false,
+        error: 'ActiveDirectory PowerShell module is NOT installed on this server. To install it, run one of these commands as Administrator:\n\n' +
+               'Windows 10/11:\n' +
+               '  Add-WindowsCapability -Online -Name "Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0"\n\n' +
+               'Windows Server:\n' +
+               '  Install-WindowsFeature RSAT-AD-PowerShell\n\n' +
+               'After installation, restart this server.'
+      });
+    } else {
+      res.json({ success: false, error: errStr.substring(0, 500) || 'AD query failed — ensure credentials are correct and the server is joined to a domain' });
+    }
   }
 });
 
@@ -870,19 +767,27 @@ app.post('/api/hosts/discover-ad', async (req, res) => {
 // ==========================================================================
 app.post('/api/hosts/:hostname/info', async (req, res) => {
   const { hostname } = req.params;
+  const { credential } = req.body;
   const safeHost = sanitizeHost(hostname);
+  // Use request credential, or fall back to global domain credentials
+  const cred = credential || getGlobalCredentials();
+  const credBlock = cred ? buildCredentialBlock(cred) : '';
+  const credParam = cred ? '$params.Credential = $cred' : '';
 
   const script = `
-    $ErrorActionPreference = 'Stop'
-    $result = $null
+    ${credBlock}
     try {
-      $os = Get-CimInstance Win32_OperatingSystem
-      $cs = Get-CimInstance Win32_ComputerSystem
-      $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-      $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+      $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
+      ${credParam}
+
+      $os = Get-CimInstance Win32_OperatingSystem @params
+      $cs = Get-CimInstance Win32_ComputerSystem @params
+      $cpu = Get-CimInstance Win32_Processor @params | Select-Object -First 1
+      $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" @params
       $uptime = ((Get-Date) - $os.LastBootUpTime)
+
       $result = @{
-        hostname = $env:COMPUTERNAME
+        hostname = $os.CSName
         osName = $os.Caption
         osVersion = $os.Version
         osBuild = $os.BuildNumber
@@ -894,16 +799,18 @@ app.post('/api/hosts/:hostname/info', async (req, res) => {
         lastBootTime = $os.LastBootUpTime
         onlineStatus = 'online'
       }
+      $result | ConvertTo-Json -Compress
     } catch {
-      $result = @{ hostname = '${safeHost}'; onlineStatus = 'offline'; error = $_.Exception.Message }
+      @{ hostname = '${safeHost}'; onlineStatus = 'offline'; error = $_.Exception.Message } | ConvertTo-Json -Compress
     }
-    Write-Output ('<<<JSON>>>' + ($result | ConvertTo-Json -Compress) + '<<<END>>>')
   `;
-  const result = await runRemotePowerShellJson(safeHost, script, 30000);
-  if (result.json) {
-    sendResult(res, { success: true, data: result.json, stdout: result.stdout });
-  } else {
-    sendResult(res, { success: false, error: result.jsonError || result.stderr || 'Remote query failed' });
+
+  const result = await runPowerShell(script, 30000);
+  try {
+    const data = JSON.parse(result.stdout);
+    sendResult(res, { success: true, data, stdout: result.stdout });
+  } catch (e) {
+    sendResult(res, { success: false, error: 'Failed to parse system query output', stderr: result.stderr || result.stdout });
   }
 });
 
@@ -965,42 +872,6 @@ app.post('/api/scan', async (req, res) => {
     });
   }));
 
-  // Fallback: for alive IPs still without hostname, use Windows full resolver
-  // (includes NetBIOS / LLMNR / DNS / hosts file — not just PTR)
-  const unresolved = enrichedResults.filter(r => r.online && !r.hostname);
-  if (unresolved.length > 0) {
-    try {
-      const ipList = unresolved.map(r => "'" + r.ip + "'").join(',');
-      const psScript = `
-        $ErrorActionPreference = 'SilentlyContinue'
-        $ips = @(${ipList})
-        $results = @()
-        foreach ($ip in $ips) {
-          try {
-            $hostEntry = [System.Net.Dns]::GetHostEntry($ip)
-            $name = if ($hostEntry.HostName) { $hostEntry.HostName } else { '' }
-            $results += @{ ip = $ip; hostname = $name }
-          } catch { $results += @{ ip = $ip; hostname = '' } }
-        }
-        Write-Output ('<<<JSON>>>' + ($results | ConvertTo-Json -Compress) + '<<<END>>>')
-      `;
-      const psResult = await runPowerShell(psScript, 30000);
-      const markerMatch = /<<<JSON>>>([\s\S]*?)<<<END>>>/.exec(psResult.stdout || '');
-      if (markerMatch) {
-        try {
-          const resolved = JSON.parse(markerMatch[1]);
-          if (Array.isArray(resolved)) {
-            const lookup = {};
-            resolved.forEach(item => { if (item.hostname) lookup[item.ip] = item.hostname; });
-            for (const r of enrichedResults) {
-              if (lookup[r.ip]) r.hostname = lookup[r.ip];
-            }
-          }
-        } catch {}
-      }
-    } catch {}
-  }
-
   const online = enrichedResults.filter(r => r.online).length;
   const offline = enrichedResults.length - online;
   broadcastUpdate({
@@ -1034,194 +905,193 @@ app.post('/api/hosts/status-check', async (req, res) => {
   if (!Array.isArray(hostnames) || hostnames.length === 0) {
     return res.json({ success: true, data: JSON.stringify([]) });
   }
-  const hostList = [...new Set(hostnames.map(sanitizeHost).filter(Boolean))].slice(0, 500);
-  const results = await pstools.pingParallel(hostList, 32, 3000);
+  const hostList = hostnames.map(sanitizeHost).filter(Boolean).slice(0, 500);
+  const results = await pstools.pingParallel(hostList, 64, 2000);
   const formatted = results.map(r => ({
-    hostname: r.ip,
+    hostname: r.ip, // r.ip is actually the hostname here
     online: r.online,
     status: r.online ? 'online' : 'offline',
   }));
-  // Persist online_status to DB so status survives refreshes
-  try {
-    if (db && db.hosts) {
-      const allHosts = db.hosts._getAll ? db.hosts._getAll() : [];
-      for (const r of formatted) {
-        const host = allHosts.find(h => h.ip_address === r.hostname || h.hostname === r.hostname);
-        if (host) {
-          db.hosts.update(host.id, {
-            online_status: r.online ? 'online' : 'offline',
-            last_seen: r.online ? new Date().toISOString() : host.last_seen,
-          });
-        }
-      }
-    }
-  } catch (_) {}
   res.json({ success: true, data: JSON.stringify(formatted), results: formatted });
 });
 
 // ==========================================================================
-// BATCH HOST INFO — Pull live data (OS, build, disk, logged-in user) for
-// multiple hosts via PsExec + PowerShell. Used by the Frontend Refresh button.
-// ==========================================================================
-app.post('/api/hosts/batch-info', async (req, res) => {
-  const { hostnames } = req.body;
-  if (!Array.isArray(hostnames) || hostnames.length === 0) {
-    return res.json({ success: true, data: [] });
-  }
-  const hostList = hostnames.map(sanitizeHost).filter(Boolean).slice(0, 100);
-  const cred = getGlobalCredentials();
-
-  // Run in parallel chunks of 8 to avoid overwhelming the network
-  const CHUNK = 8;
-  const results = [];
-  for (let i = 0; i < hostList.length; i += CHUNK) {
-    const chunk = hostList.slice(i, i + CHUNK);
-    const chunkResults = await Promise.all(chunk.map(async (hostname) => {
-      // Single PowerShell script that gets everything we need
-      const script = `
-        $ErrorActionPreference = 'SilentlyContinue'
-        try {
-          $os = Get-CimInstance Win32_OperatingSystem
-          $cs = Get-CimInstance Win32_ComputerSystem
-          $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
-          $user = (Get-CimInstance Win32_ComputerSystem).UserName
-          $result = @{
-            hostname = $env:COMPUTERNAME
-            osName = $os.Caption
-            osVersion = $os.Version
-            osBuild = $os.BuildNumber
-            diskUsedGb = if ($disk) { [math]::Round(($disk.Size - $disk.FreeSpace) / 1GB, 1) } else { 0 }
-            loggedOnUser = if ($user) { $user } else { '' }
-          }
-          Write-Output ('<<<JSON>>>' + ($result | ConvertTo-Json -Compress) + '<<<END>>>')
-        } catch {
-          Write-Output ('<<<JSON>>>{"hostname":"' + $env:COMPUTERNAME + '","error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>')
-        }
-      `;
-      const result = await powershell.runRemoteViaPsExec(hostname, script, PSTOOLS_PATH, 30000, cred);
-      const markerMatch = /<<<JSON>>>([\s\S]*?)<<<END>>>/.exec(result.stdout || '');
-      if (markerMatch) {
-        try { return JSON.parse(markerMatch[1]); }
-        catch (e) { return { hostname, error: 'JSON parse: ' + e.message }; }
-      }
-      return { hostname, error: 'No data', offline: !result.success };
-    }));
-    results.push(...chunkResults);
-  }
-
-  res.json({ success: true, data: results });
-});
-
-// ==========================================================================
-// WINDOWS UPDATES — Real scan/download/install via PSWindowsUpdate on target
-// NOTE: PSWindowsUpdate module must be installed on TARGET PCs (or at least
-// the server if we fall back). The commands run via PsExec + PowerShell on
-// each target, so NO WinRM is required.
+// WINDOWS UPDATES — Real scan/download/install via PSWindowsUpdate module
 // ==========================================================================
 app.post('/api/updates/scan', async (req, res) => {
-  const { hostnames } = req.body;
+  const { hostnames, credential } = req.body;
+  const hostList = hostnames.map(sanitizeHost).join("','");
+  const cred = credential || getGlobalCredentials();
+  const credParam = cred ? '-Credential $cred' : '';
   const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
   const startTime = Date.now();
-  const results = [];
-
-  for (const rawHost of hostnames) {
-    const safeHost = sanitizeHost(rawHost);
-    const script = `
-      $ErrorActionPreference = 'Stop'
-      Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
+  const script = `
+    ${cred ? buildCredentialBlock(cred) : ''}
+    Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
+    $results = @()
+    foreach ($h in @('${hostList}')) {
       try {
-        $updates = Get-WindowsUpdate -ErrorAction Stop
-        $upt = $updates | Select-Object KB, Title, Size, MsrcSeverity, Category
-        $json = $upt | ConvertTo-Json -Compress -Depth 3
-        $critical = ($updates | Where-Object { \$_.MsrcSeverity -eq 'Critical' }).Count
-        $security = ($updates | Where-Object { \$_.MsrcSeverity -eq 'Important' }).Count
-        Write-Output ('<<<JSON>>>{"hostname":"' + $env:COMPUTERNAME + '","status":"scanned","updateCount":' + ($updates.Count) + ',"critical":' + $critical + ',"security":' + $security + ',"updates":' + $json + '}<<<END>>>')
+        $updates = Get-WindowsUpdate -ComputerName $h ${credParam} -ErrorAction Stop
+        $results += @{
+          hostname = $h
+          status = 'scanned'
+          updateCount = $updates.Count
+          critical = ($updates | Where-Object { $_.MsrcSeverity -eq 'Critical' }).Count
+          security = ($updates | Where-Object { $_.MsrcSeverity -eq 'Important' }).Count
+          updates = $updates | Select-Object KB, Title, Size, MsrcSeverity, Category | ConvertTo-Json
+        }
       } catch {
-        Write-Output ('<<<JSON>>>{"hostname":"' + $env:COMPUTERNAME + '","status":"failed","error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>')
+        $results += @{ hostname = $h; status = 'failed'; error = $_.Exception.Message }
       }
-    `;
-    const r = await runRemotePowerShellJson(safeHost, script, 120000);
-    results.push(r.json || { hostname: safeHost, status: 'failed', error: r.stderr || r.jsonError || 'Unknown error' });
-    audit.add(db, { actionType: 'update.scan', targetHost: safeHost, tool: 'psexec+powershell+PSWindowsUpdate', command: `Get-WindowsUpdate on ${safeHost}`, success: r.success, durationMs: Date.now() - startTime, outputSummary: r.json?.status || '', errorReason: r.json?.error || r.stderr, initiatedBy: 'admin', initiatedFrom });
-  }
-  res.json({ success: results.every(r => r.status !== 'failed'), data: JSON.stringify(results), error: results.find(r => r.error)?.error });
+    }
+    $results | ConvertTo-Json -Depth 5 -Compress
+  `;
+  const result = await runPowerShell(script, 120000);
+  // Audit log — Windows Update scan
+  hostnames.forEach(h => {
+    audit.add(db, {
+      actionType: 'update.scan',
+      targetHost: sanitizeHost(h),
+      tool: 'powershell+PSWindowsUpdate',
+      command: `Get-WindowsUpdate on ${h}`,
+      success: result.success,
+      durationMs: Date.now() - startTime,
+      outputSummary: result.stdout ? result.stdout.substring(0, 500) : (result.stderr || '').substring(0, 500),
+      errorReason: result.success ? null : result.stderr,
+      initiatedBy: 'admin',
+      initiatedFrom,
+    });
+  });
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 app.post('/api/updates/download', async (req, res) => {
-  const { hostnames, kbFilter } = req.body;
-  const results = [];
-  for (const rawHost of hostnames) {
-    const safeHost = sanitizeHost(rawHost);
-    const script = `
-      $ErrorActionPreference = 'Stop'
-      Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
+  const { hostnames, credential, kbFilter } = req.body;
+  const hostList = hostnames.map(sanitizeHost).join("','");
+  const credParam = credential ? '-Credential $cred' : '';
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  const startTime = Date.now();
+  const script = `
+    ${credential ? buildCredentialBlock(credential) : ''}
+    Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
+    $results = @()
+    foreach ($h in @('${hostList}')) {
       try {
-        ${kbFilter ? `$updates = Get-WindowsUpdate -KBArticleID '${sanitizeHost(kbFilter)}' -Download -ErrorAction Stop` : 'Get-WindowsUpdate -Download -AcceptAll -ErrorAction Stop'}
-        Write-Output ('<<<JSON>>>{"hostname":"' + $env:COMPUTERNAME + '","status":"downloaded"}<<<END>>>')
+        ${kbFilter ? `$updates = Get-WindowsUpdate -ComputerName $h ${credParam} -KBArticleID '${sanitizeHost(kbFilter)}' -Download -ErrorAction Stop` : `Get-WindowsUpdate -ComputerName $h ${credParam} -Download -AcceptAll -ErrorAction Stop`}
+        $results += @{ hostname = $h; status = 'downloaded' }
       } catch {
-        Write-Output ('<<<JSON>>>{"hostname":"' + $env:COMPUTERNAME + '","status":"failed","error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>')
+        $results += @{ hostname = $h; status = 'failed'; error = $_.Exception.Message }
       }
-    `;
-    const r = await runRemotePowerShellJson(safeHost, script, 300000);
-    results.push(r.json || { hostname: safeHost, status: 'failed', error: r.stderr });
-    audit.add(db, { actionType: 'update.download', targetHost: safeHost, tool: 'psexec+powershell+PSWindowsUpdate', command: `Download updates on ${safeHost}`, success: r.success, durationMs: 0, outputSummary: r.json?.status || '', errorReason: r.json?.error || r.stderr, initiatedBy: 'admin', initiatedFrom: req.ip });
-  }
-  res.json({ success: results.every(r => r.status !== 'failed'), data: JSON.stringify(results), error: results.find(r => r.error)?.error });
+    }
+    $results | ConvertTo-Json -Compress
+  `;
+  const result = await runPowerShell(script, 300000);
+  // Audit log — Windows Update download
+  hostnames.forEach(h => {
+    audit.add(db, {
+      actionType: 'update.download',
+      targetHost: sanitizeHost(h),
+      tool: 'powershell+PSWindowsUpdate',
+      command: `Download updates on ${h}${kbFilter ? ' (KB: ' + kbFilter + ')' : ''}`,
+      success: result.success,
+      durationMs: Date.now() - startTime,
+      outputSummary: result.stdout ? result.stdout.substring(0, 500) : '',
+      errorReason: result.success ? null : result.stderr,
+      initiatedBy: 'admin',
+      initiatedFrom,
+    });
+  });
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 app.post('/api/updates/install', async (req, res) => {
-  const { hostnames, kbFilter, classification, rebootBehavior } = req.body;
-  const results = [];
-  for (const rawHost of hostnames) {
-    const safeHost = sanitizeHost(rawHost);
-    const rebootParam = rebootBehavior === 'always' || rebootBehavior === 'if-required' ? '-AutoReboot' : '';
-    const kbParam = kbFilter ? `-KBArticleID '${sanitizeHost(kbFilter)}'` : '';
-    const catParam = classification ? `-Category '${sanitizeHost(classification)}'` : '';
-    const script = `
-      $ErrorActionPreference = 'Stop'
-      Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
+  const { hostnames, credential, kbFilter, classification, rebootBehavior } = req.body;
+  const hostList = hostnames.map(sanitizeHost).join("','");
+  const credParam = credential ? '-Credential $cred' : '';
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  const startTime = Date.now();
+  const rebootParam = rebootBehavior === 'always' || rebootBehavior === 'if-required' ? '-AutoReboot' : '';
+  const script = `
+    ${credential ? buildCredentialBlock(credential) : ''}
+    Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
+    $results = @()
+    foreach ($h in @('${hostList}')) {
       try {
-        Install-WindowsUpdate ${kbParam} ${catParam} -Install -AcceptAll ${rebootParam} -ErrorAction Stop
-        Write-Output ('<<<JSON>>>{"hostname":"' + $env:COMPUTERNAME + '","status":"installed","rebootRequired":false}<<<END>>>')
+        $params = @{ ComputerName = $h; Install = $true; AcceptAll = $true ${rebootParam ? '; ' + rebootParam : ''} }
+        ${credential ? '$params.Credential = $cred' : ''}
+        ${kbFilter ? "$params.KBArticleID = '${sanitizeHost(kbFilter)}'" : ''}
+        ${classification ? "$params.Category = '${sanitizeHost(classification)}'" : ''}
+        Install-WindowsUpdate @params -ErrorAction Stop
+        $results += @{ hostname = $h; status = 'installed'; rebootRequired = $false }
       } catch {
-        Write-Output ('<<<JSON>>>{"hostname":"' + $env:COMPUTERNAME + '","status":"failed","error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>')
+        $results += @{ hostname = $h; status = 'failed'; error = $_.Exception.Message }
       }
-    `;
-    const r = await runRemotePowerShellJson(safeHost, script, 600000);
-    results.push(r.json || { hostname: safeHost, status: 'failed', error: r.stderr });
-    audit.add(db, { actionType: 'update.install', targetHost: safeHost, tool: 'psexec+powershell+PSWindowsUpdate', command: `Install updates on ${safeHost}`, success: r.success, durationMs: 0, outputSummary: r.json?.status || '', errorReason: r.json?.error || r.stderr, initiatedBy: 'admin', initiatedFrom: req.ip });
-  }
-  res.json({ success: results.every(r => r.status !== 'failed'), data: JSON.stringify(results), error: results.find(r => r.error)?.error });
+    }
+    $results | ConvertTo-Json -Compress
+  `;
+  const result = await runPowerShell(script, 600000);
+  // Audit log — Windows Update install (patch installation)
+  hostnames.forEach(h => {
+    audit.add(db, {
+      actionType: 'update.install',
+      targetHost: sanitizeHost(h),
+      tool: 'powershell+PSWindowsUpdate',
+      command: `Install updates on ${h}${kbFilter ? ' (KB: ' + kbFilter + ')' : ''}${classification ? ' (' + classification + ')' : ''}${rebootBehavior ? ' reboot:' + rebootBehavior : ''}`,
+      success: result.success,
+      durationMs: Date.now() - startTime,
+      outputSummary: result.stdout ? result.stdout.substring(0, 500) : '',
+      errorReason: result.success ? null : result.stderr,
+      initiatedBy: 'admin',
+      initiatedFrom,
+      parameters: { kbFilter, classification, rebootBehavior },
+    });
+  });
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 app.post('/api/updates/history', async (req, res) => {
-  const { hostnames } = req.body;
-  const results = [];
-  for (const rawHost of hostnames) {
-    const safeHost = sanitizeHost(rawHost);
-    const script = `
-      $ErrorActionPreference = 'Stop'
-      Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
+  const { hostnames, credential } = req.body;
+  const hostList = hostnames.map(sanitizeHost).join("','");
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  const startTime = Date.now();
+  const script = `
+    ${credential ? buildCredentialBlock(credential) : ''}
+    Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
+    $results = @()
+    foreach ($h in @('${hostList}')) {
       try {
-        $history = Get-WUHistory -ErrorAction Stop | Select-Object KB, Title, Date, Result
-        $json = $history | ConvertTo-Json -Compress -Depth 3
-        Write-Output ('<<<JSON>>>{"hostname":"' + $env:COMPUTERNAME + '","updates":' + $json + '}<<<END>>>')
+        $history = Get-WUHistory -ComputerName $h ${credential ? '-Credential $cred' : ''} -ErrorAction Stop
+        $results += @{ hostname = $h; updates = $history | Select-Object KB, Title, Date, Result | ConvertTo-Json }
       } catch {
-        Write-Output ('<<<JSON>>>{"hostname":"' + $env:COMPUTERNAME + '","error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>')
+        $results += @{ hostname = $h; error = $_.Exception.Message }
       }
-    `;
-    const r = await runRemotePowerShellJson(safeHost, script, 60000);
-    results.push(r.json || { hostname: safeHost, error: r.stderr });
-    audit.add(db, { actionType: 'update.history', targetHost: safeHost, tool: 'psexec+powershell+PSWindowsUpdate', command: `Get-WUHistory on ${safeHost}`, success: r.success, durationMs: 0, outputSummary: r.json?.updates ? 'OK' : '', errorReason: r.json?.error || r.stderr, initiatedBy: 'admin', initiatedFrom: req.ip });
-  }
-  res.json({ success: results.every(r => !r.error), data: JSON.stringify(results), error: results.find(r => r.error)?.error });
+    }
+    $results | ConvertTo-Json -Depth 4 -Compress
+  `;
+  const result = await runPowerShell(script, 60000);
+  // Audit log — Update history retrieval
+  hostnames.forEach(h => {
+    audit.add(db, {
+      actionType: 'update.history',
+      targetHost: sanitizeHost(h),
+      tool: 'powershell+PSWindowsUpdate',
+      command: `Get-WUHistory on ${h}`,
+      success: result.success,
+      durationMs: Date.now() - startTime,
+      outputSummary: result.stdout ? result.stdout.substring(0, 500) : '',
+      errorReason: result.success ? null : result.stderr,
+      initiatedBy: 'admin',
+      initiatedFrom,
+    });
+  });
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 // ==========================================================================
 // SCRIPTS & COMMANDS — Real remote execution
 // ==========================================================================
 app.post('/api/scripts/execute', async (req, res) => {
-  const { hostnames, script: userScript, language, timeout } = req.body;
+  const { hostnames, script: userScript, credential, language, timeout } = req.body;
   const timeoutSec = timeout || 60;
   const results = [];
   const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
@@ -1230,45 +1100,75 @@ app.post('/api/scripts/execute', async (req, res) => {
   for (const rawHost of hostnames) {
     const safeHost = sanitizeHost(rawHost);
     const hostStartTime = Date.now();
+    let result = null;
 
-    // Use PsExec + PowerShell with global credentials (NO WinRM)
-    const psexecResult = await powershell.runRemoteViaPsExec(safeHost, userScript, PSTOOLS_PATH, timeoutSec * 1000, getGlobalCredentials());
+    // METHOD 1: Try WinRM first (Invoke-Command) — fastest, no PsExec overhead
+    const winrmResult = await powershell.runRemoteViaWinRM(safeHost, userScript, timeoutSec * 1000);
+    if (winrmResult.success) {
+      result = { hostname: safeHost, success: true, output: winrmResult.stdout, method: 'winrm', duration: Date.now() - hostStartTime };
+      results.push(result);
+      // Audit log — per-PC script execution
+      audit.add(db, {
+        actionType: 'script.run',
+        targetHost: safeHost,
+        tool: 'winrm+powershell',
+        command: userScript.substring(0, 500),
+        success: true,
+        durationMs: result.duration,
+        outputSummary: (winrmResult.stdout || '').substring(0, 500),
+        initiatedBy: 'admin',
+        initiatedFrom,
+        parameters: { language, method: 'winrm', scriptLength: userScript.length },
+      });
+      continue;
+    }
+
+    // METHOD 2: Fall back to PsExec + PowerShell (no WinRM needed, uses SMB)
+    const psexecResult = await powershell.runRemoteViaPsExec(safeHost, userScript, PSTOOLS_PATH, timeoutSec * 1000);
     if (psexecResult.success) {
-      results.push({ hostname: safeHost, success: true, output: psexecResult.stdout, method: 'psexec', duration: Date.now() - hostStartTime });
+      result = { hostname: safeHost, success: true, output: psexecResult.stdout, method: 'psexec', duration: Date.now() - hostStartTime };
+      results.push(result);
+      // Audit log — per-PC script execution
       audit.add(db, {
         actionType: 'script.run',
         targetHost: safeHost,
         tool: 'psexec+powershell',
         command: userScript.substring(0, 500),
         success: true,
-        durationMs: Date.now() - hostStartTime,
+        durationMs: result.duration,
         outputSummary: (psexecResult.stdout || '').substring(0, 500),
         initiatedBy: 'admin',
         initiatedFrom,
         parameters: { language, method: 'psexec', scriptLength: userScript.length },
       });
-    } else {
-      results.push({
-        hostname: safeHost, success: false,
-        error: `PsExec failed: ${psexecResult.error || psexecResult.reason || psexecResult.stderr}`,
-        psexecError: psexecResult,
-        duration: Date.now() - hostStartTime,
-      });
-      audit.add(db, {
-        actionType: 'script.run',
-        targetHost: safeHost,
-        tool: 'psexec+powershell',
-        command: userScript.substring(0, 500),
-        success: false,
-        durationMs: Date.now() - hostStartTime,
-        errorReason: psexecResult.error || psexecResult.reason || psexecResult.stderr,
-        requiredService: psexecResult.service || 'Admin$ share',
-        fixSuggestion: psexecResult.fix || 'Ensure PsTools path is correct and Admin$ share is accessible',
-        initiatedBy: 'admin',
-        initiatedFrom,
-        parameters: { language, scriptLength: userScript.length },
-      });
+      continue;
     }
+
+    // Both methods failed — return combined error with reasons
+    result = {
+      hostname: safeHost,
+      success: false,
+      error: `WinRM: ${winrmResult.reason || winrmResult.error} | PsExec: ${psexecResult.reason || psexecResult.error}`,
+      winrmError: winrmResult,
+      psexecError: psexecResult,
+      duration: Date.now() - hostStartTime,
+    };
+    results.push(result);
+    // Audit log — per-PC script failure (with WHY it failed)
+    audit.add(db, {
+      actionType: 'script.run',
+      targetHost: safeHost,
+      tool: 'winrm+psexec',
+      command: userScript.substring(0, 500),
+      success: false,
+      durationMs: result.duration,
+      errorReason: `WinRM: ${winrmResult.reason || winrmResult.error} | PsExec: ${psexecResult.reason || psexecResult.error}`,
+      requiredService: winrmResult.service || psexecResult.service || 'WinRM or Admin$ share',
+      fixSuggestion: winrmResult.fix || psexecResult.fix || 'Enable WinRM on target OR ensure PsTools/Admin$ share is accessible',
+      initiatedBy: 'admin',
+      initiatedFrom,
+      parameters: { language, scriptLength: userScript.length },
+    });
   }
 
   res.json({
@@ -1284,312 +1184,127 @@ app.post('/api/scripts/execute', async (req, res) => {
 // ==========================================================================
 app.post('/api/services/:hostname/list', async (req, res) => {
   const { hostname } = req.params;
-  const { credential: reqCred } = req.body || {};
+  const { credential } = req.body;
   const safeHost = sanitizeHost(hostname);
-  const cred = reqCred && reqCred.username ? { username: reqCred.username, password: reqCred.password, domain: reqCred.domain || '', fullUsername: (reqCred.domain ? reqCred.domain + '\\' : '') + reqCred.username, source: 'request' } : getGlobalCredentials();
-  const fqHost = safeHost.includes('.') ? safeHost : (cred?.domain ? safeHost + '.' + cred.domain : safeHost);
-  const startTime = Date.now();
-
-  // 1st: CIM DCOM — Get-CimInstance Win32_Service (fastest, no SMB, no RPC conflicts)
-  const cimRes = await wmic.runRemoteCim(fqHost, 'Win32_Service', 'Name,DisplayName,State,StartMode,StartName', 60000, cred);
-  if (cimRes.success && cimRes.records && cimRes.records.length > 0) {
-    const services = cimRes.records.map(r => ({
-      Name: (r.Name || '').trim(),
-      DisplayName: (r.DisplayName || '').trim(),
-      State: (r.State || '').trim(),
-      StartMode: (r.StartMode || '').trim(),
-      StartName: (r.StartName || '').trim(),
-    })).sort((a, b) => a.Name.localeCompare(b.Name));
-    audit.add(db, { actionType: 'services.list', targetHost: safeHost, tool: 'cim-dcom', command: `Get-CimInstance Win32_Service on ${safeHost}`, success: true, durationMs: Date.now() - startTime, outputSummary: `Found ${services.length} services`, initiatedBy: 'admin', initiatedFrom: req.ip || 'unknown' });
-    return res.json({ success: true, data: JSON.stringify(services), error: null, method: 'cim-dcom' });
-  }
-
-  // 2nd: WMIC service query via DCOM
-  const wmiRes = await wmic.runRemote(fqHost, 'service', 'name,displayname,state,startmode,startname', 30000, cred);
-  if (wmiRes.success && wmiRes.records && wmiRes.records.length > 0) {
-    const services = wmiRes.records.map(r => ({
-      Name: (r.Name || r.name || '').trim(),
-      DisplayName: (r.DisplayName || r.displayname || '').trim(),
-      State: (r.State || r.state || '').trim(),
-      StartMode: (r.StartMode || r.startmode || '').trim(),
-      StartName: (r.StartName || r.startname || '').trim(),
-    })).filter(s => s.Name).sort((a, b) => a.Name.localeCompare(b.Name));
-    audit.add(db, { actionType: 'services.list', targetHost: safeHost, tool: 'wmic', command: `wmic service on ${safeHost}`, success: true, durationMs: Date.now() - startTime, outputSummary: `Found ${services.length} services`, initiatedBy: 'admin', initiatedFrom: req.ip || 'unknown' });
-    return res.json({ success: true, data: JSON.stringify(services), error: null, method: 'wmic' });
-  }
-
-  // 3rd: psservice.exe query via RPC (clear SMB connections first to avoid credential conflicts)
-  try { require('child_process').execSync('net use * /delete /y', { windowsHide: true, timeout: 5000 }); } catch {}
-  const svcResult = await pstools.runGeneric('psservice', fqHost, ['query'], 30000, cred);
-  if (svcResult.success && svcResult.stdout) {
-    const services = parsePsServiceQuery(svcResult.stdout);
-    if (services.length > 0) {
-      audit.add(db, { actionType: 'services.list', targetHost: safeHost, tool: 'psservice', command: `psservice query on ${safeHost}`, success: true, durationMs: Date.now() - startTime, outputSummary: `Found ${services.length} services`, initiatedBy: 'admin', initiatedFrom: req.ip || 'unknown' });
-      return res.json({ success: true, data: JSON.stringify(services), error: null, method: 'psservice' });
+  const cred = credential || getGlobalCredentials();
+  const script = `
+    ${cred ? buildCredentialBlock(cred) : ''}
+    try {
+      $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
+      ${cred ? '$params.Credential = $cred' : ''}
+      Get-CimInstance Win32_Service @params | Select-Object Name, DisplayName, State, StartMode, StartName | ConvertTo-Json -Compress
+    } catch {
+      @{ error = $_.Exception.Message } | ConvertTo-Json -Compress
     }
-  }
-
-  // 4th: PowerShell Get-Service via PsExec
-  const psScript = `
-    $ErrorActionPreference = 'Stop'
-    $svcs = @(Get-Service | Select-Object Name, DisplayName, Status, StartType | ForEach-Object { @{ Name = $_.Name; DisplayName = $_.DisplayName; State = $_.Status.ToString(); StartMode = $_.StartType.ToString() } })
-    Write-Output ('<<<JSON>>>' + ($svcs | ConvertTo-Json -Compress -Depth 3) + '<<<END>>>')
   `;
-  const psResult = await powershell.runRemoteViaPsExec(safeHost, psScript, PSTOOLS_PATH, 60000, cred);
-  if (psResult.success && psResult.stdout) {
-    const m = /<<<JSON>>>([\s\S]*?)<<<END>>>/.exec(psResult.stdout || '');
-    if (m) {
-      try {
-        const services = JSON.parse(m[1]);
-        if (Array.isArray(services) && services.length > 0) {
-          return res.json({ success: true, data: JSON.stringify(services), error: null, method: 'psexec+powershell' });
-        }
-      } catch (e) { /* parse failed */ }
-    }
-  }
-
-  res.json({ success: false, data: '[]', error: svcResult?.reason || psResult?.stderr || cimRes?.error || wmiRes?.error || 'Failed to list services', method: 'none' });
+  const result = await runPowerShell(script, 30000);
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
-
-// Parse psservice query output: SERVICE_NAME + DISPLAY_NAME + STATE blocks
-function parsePsServiceQuery(raw) {
-  const out = (raw || '').replace(/\r/g, '');
-  const services = [];
-  const blocks = out.split(/SERVICE_NAME:\s*/);
-  for (let i = 1; i < blocks.length; i++) {
-    const block = blocks[i];
-    const nameMatch = block.match(/^(\S+)/);
-    const dispMatch = block.match(/DISPLAY_NAME:\s*(.+)/);
-    const stateMatch = block.match(/STATE\s*:\s*\d+\s+(\w+)/);
-    if (nameMatch) {
-      services.push({
-        Name: nameMatch[1],
-        DisplayName: dispMatch ? dispMatch[1].trim() : nameMatch[1],
-        State: stateMatch ? stateMatch[1] : 'Unknown',
-        StartMode: '',
-        StartName: '',
-      });
-    }
-  }
-  return services;
-}
 
 app.post('/api/services/:hostname/action', async (req, res) => {
   const { hostname } = req.params;
-  const { serviceName, action } = req.body;
+  const { serviceName, action, credential } = req.body;
   const safeHost = sanitizeHost(hostname);
   const safeService = sanitizeHost(serviceName);
-  const cred = getGlobalCredentials();
-  const fqHost = safeHost.includes('.') ? safeHost : (cred?.domain ? safeHost + '.' + cred.domain : safeHost);
-
-  const actionMap = { start: 'Start', stop: 'Stop', restart: 'Restart' };
-  const pwshAction = actionMap[action] || null;
-  if (!pwshAction) return res.json({ success: false, error: `Unknown action: ${action}`, method: 'none' });
-
-  // 1st: CIM DCOM Invoke-CimMethod (fastest, no SMB)
-  try {
-    // Use Invoke-CimMethod on Win32_Service for StartService/StopService
-    const cimMethod = action === 'start' ? 'StartService' : 'StopService';
-    const psScript = [
-      `$sec = ConvertTo-SecureString '${(cred.password || '').replace(/'/g, "''")}' -AsPlainText -Force`,
-      `$cred = New-Object PSCredential('${(cred.domain ? cred.domain + '\\' : '') + cred.username}', $sec)`,
-      `$o = New-CimSessionOption -Protocol Dcom`,
-      `$s = New-CimSession -ComputerName '${fqHost.replace(/'/g, "''")}' -Credential $cred -SessionOption $o`,
-      (action === 'restart'
-        ? `$svc = Get-CimInstance -CimSession $s -ClassName Win32_Service -Filter "Name='${safeService}'" -ErrorAction Stop; if ($svc) { $null = Invoke-CimMethod -CimSession $s -InputObject $svc -MethodName StopService; Start-Sleep -Seconds 2; $null = Invoke-CimMethod -CimSession $s -InputObject $svc -MethodName StartService; Write-Output '<<<JSON>>>{"success":true,"state":"Running"}<<<END>>>' } else { throw 'Service not found' }`
-        : `$svc = Get-CimInstance -CimSession $s -ClassName Win32_Service -Filter "Name='${safeService}'" -ErrorAction Stop; if ($svc) { $null = Invoke-CimMethod -CimSession $s -InputObject $svc -MethodName ${cimMethod}; Write-Output ('<<<JSON>>>{"success":true,"state":"${cimMethod === 'StopService' ? 'Stopped' : 'Running'}"}<<<END>>>') } else { throw 'Service not found' }`
-      ),
-      `Remove-CimSession $s`,
-    ].join('; ');
-
-    const { spawn } = require('child_process');
-    const cimResult = await new Promise((resolve) => {
-      const proc = spawn('powershell.exe', ['-NoProfile', '-Command', psScript], { windowsHide: true, timeout: 30000 });
-      let out = '', err = '';
-      proc.stdout.on('data', d => out += d);
-      proc.stderr.on('data', d => err += d);
-      proc.on('close', code => {
-        const m = /<<<JSON>>>([\s\S]*?)<<<END>>>/.exec(out);
-        if (m) { try { resolve({ success: true, json: JSON.parse(m[1]), stderr: err }); } catch (e) { resolve({ success: false, json: null, stderr: err, error: e.message }); } }
-        else resolve({ success: false, json: null, stderr: err || out, error: `PowerShell exit ${code}` });
-      });
-      setTimeout(() => { try { proc.kill(); } catch {} }, 32000);
-    });
-    if (cimResult.success && cimResult.json?.success) {
-      return res.json({ success: true, data: cimResult.json.state, method: 'cim-dcom' });
-    }
-  } catch (e) { /* fall through to next method */ }
-
-  // 2nd: psservice.exe via RPC (clear SMB connections first)
-  try { require('child_process').execSync('net use * /delete /y', { windowsHide: true, timeout: 5000 }); } catch {}
-  const actionCmd = action === 'restart' ? 'restart' : action;
-  const svcResult = await pstools.runGeneric('psservice', fqHost, [actionCmd, safeService], 20000, cred);
-  if (svcResult.success) {
-    return res.json({ success: true, data: svcResult.stdout, method: 'psservice' });
-  }
-
-  // 3rd: PowerShell Start-Service/Stop-Service/Restart-Service via PsExec
+  const cred = credential || getGlobalCredentials();
+  const credBlock = cred ? buildCredentialBlock(cred) : '';
+  const credParam = cred ? '-Credential $cred' : '';
   const script = `
-    $ErrorActionPreference = 'Stop'
+    ${credBlock}
     try {
       switch ('${action}') {
-        'start'   { Start-Service   -Name '${safeService}' }
-        'stop'    { Stop-Service    -Name '${safeService}' -Force }
-        'restart' { Restart-Service -Name '${safeService}' -Force }
+        'start'   { Start-Service   -ComputerName '${safeHost}' -Name '${safeService}' ${credParam}; $newState = 'Running' }
+        'stop'    { Stop-Service    -ComputerName '${safeHost}' -Name '${safeService}' -Force ${credParam}; $newState = 'Stopped' }
+        'restart' { Restart-Service -ComputerName '${safeHost}' -Name '${safeService}' -Force ${credParam}; $newState = 'Running' }
         default   { throw "Unknown action: ${action}" }
       }
-      Write-Output '<<<JSON>>>{"success":true,"state":"${action === 'stop' ? 'Stopped' : 'Running'}"}<<<END>>>'
+      @{ hostname = '${safeHost}'; service = '${safeService}'; state = $newState; success = $true } | ConvertTo-Json -Compress
     } catch {
-      Write-Output ('<<<JSON>>>{"success":false,"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>')
+      @{ hostname = '${safeHost}'; service = '${safeService}'; success = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
     }
   `;
-  const result = await runRemotePowerShellJson(safeHost, script, 30000);
-  res.json({ success: result.json?.success ?? false, data: result.stdout, error: result.json?.error || result.stderr, method: 'psexec+powershell' });
+  const result = await runPowerShell(script, 30000);
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 app.post('/api/processes/:hostname/list', async (req, res) => {
   const { hostname } = req.params;
+  const { credential } = req.body;
   const safeHost = sanitizeHost(hostname);
-  const cred = getGlobalCredentials();
-  const fqHost = safeHost.includes('.') ? safeHost : (cred?.domain ? safeHost + '.' + cred.domain : safeHost);
-
-  // 1st: pslist.exe over RPC (PsTool, no Admin$ needed)
-  const psListRes = await pstools.runGeneric('pslist', fqHost, [], 30000, cred);
-  if (psListRes.success && psListRes.stdout) {
-    const procs = parsePsList(psListRes.stdout);
-    if (procs.length > 0) {
-      return res.json({ success: true, data: JSON.stringify(procs), method: 'pslist' });
-    }
-  }
-
-  // 2nd: Fall back to PowerShell via PsExec
+  const cred = credential || getGlobalCredentials();
   const script = `
-    $ErrorActionPreference = 'Stop'
+    ${cred ? buildCredentialBlock(cred) : ''}
     try {
-      $ps = Get-Process | Select-Object Id, Name, WorkingSet, TotalProcessorTime, StartTime
-      $result = @($ps) | ForEach-Object {
-        @{ ProcessId = $_.Id; Name = $_.Name; MemMB = [math]::Round($_.WorkingSet / 1MB, 1); CPU = $_.TotalProcessorTime.TotalSeconds; CreationDate = if ($_.StartTime) { $_.StartTime.ToString('o') } else { $null } }
-      }
-      Write-Output ('<<<JSON>>>' + ($result | ConvertTo-Json -Compress -Depth 3) + '<<<END>>>')
+      $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
+      ${cred ? '$params.Credential = $cred' : ''}
+      Get-CimInstance Win32_Process @params | Select-Object ProcessId, Name, @{N='MemMB';E={[math]::Round($_.WorkingSetSize/1MB,1)}}, @{N='CPU';E={$_.UserModeTime/1e7}} | ConvertTo-Json -Compress
     } catch {
-      Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>')
+      @{ error = $_.Exception.Message } | ConvertTo-Json -Compress
     }
   `;
-  const result = await runRemotePowerShellJson(safeHost, script, 30000);
-  if (result.success && result.json) {
-    return res.json({ success: true, data: JSON.stringify(result.json), method: 'psexec+powershell' });
-  }
-  res.json({ success: false, data: '[]', error: result.stderr || psListRes.stderr || 'Failed to list processes', method: 'none' });
+  const result = await runPowerShell(script, 30000);
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
-
-// Parse pslist.exe output into structured process objects
-function parsePsList(raw) {
-  const out = (raw || '').replace(/\r/g, '');
-  const lines = out.split('\n');
-  const procs = [];
-  let inTable = false;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (/^pslist v/i.test(trimmed) || /^Copyright/i.test(trimmed) || /^Sysinternals/i.test(trimmed)) continue;
-    if (/process information for/i.test(trimmed)) continue;
-    if (/^Name\s+Pid\s+Pri/i.test(trimmed)) { inTable = true; continue; }
-    if (!inTable) continue;
-    // Parse: Name Pid Pri Thd Hnd Priv CPU_Time Elapsed_Time
-    const m = trimmed.match(/^(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([\d:.]+)\s+([\d:.]+)/);
-    if (m) {
-      const memKB = parseInt(m[6], 10) || 0;
-      const cpuParts = (m[7] || '0:0:0').split(':');
-      const cpuSec = (parseInt(cpuParts[0]) * 3600) + (parseInt(cpuParts[1]) * 60) + parseFloat(cpuParts[2] || 0);
-      procs.push({
-        ProcessId: parseInt(m[2], 10),
-        Name: m[1],
-        MemMB: Math.round(memKB / 1024 * 10) / 10,
-        CPU: Math.round(cpuSec * 10) / 10,
-        CreationDate: null,
-      });
-    }
-  }
-  return procs;
-}
 
 app.post('/api/processes/:hostname/kill', async (req, res) => {
   const { hostname } = req.params;
-  const { pid, name } = req.body;
+  const { pid, name, credential } = req.body;
   const safeHost = sanitizeHost(hostname);
   const safePid = parseInt(pid, 10);
-  const cred = getGlobalCredentials();
-  const fqHost = safeHost.includes('.') ? safeHost : (cred?.domain ? safeHost + '.' + cred.domain : safeHost);
-
-  if (!safePid && !name) return res.json({ success: false, error: 'PID or process name required' });
-
-  // 1st: pskill.exe over RPC (PsTool, no Admin$ needed)
-  const killTarget = safePid ? String(safePid) : String(sanitizeHost(name));
-  const psKillRes = await pstools.runGeneric('pskill', fqHost, [killTarget], 15000, cred);
-  if (psKillRes.success) {
-    return res.json({ success: true, data: psKillRes.stdout, method: 'pskill' });
-  }
-
-  // 2nd: Fall back to PowerShell via PsExec
+  if (!safePid) return res.json({ success: false, error: 'Invalid PID' });
   const script = `
-    $ErrorActionPreference = 'Stop'
+    ${credential ? buildCredentialBlock(credential) : ''}
     try {
-      Stop-Process -Id ${safePid} -Force
-      Write-Output ('<<<JSON>>>{"hostname":"${safeHost}","pid":${safePid},"killed":true}<<<END>>>')
+      Invoke-Command -ComputerName '${safeHost}' ${credential ? '-Credential $cred' : ''} -ScriptBlock { Stop-Process -Id ${safePid} -Force } -ErrorAction Stop
+      @{ hostname = '${safeHost}'; pid = ${safePid}; killed = $true } | ConvertTo-Json -Compress
     } catch {
-      Write-Output ('<<<JSON>>>{"hostname":"${safeHost}","pid":${safePid},"killed":false,"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>')
+      @{ hostname = '${safeHost}'; pid = ${safePid}; killed = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
     }
   `;
-  const result = await runRemotePowerShellJson(safeHost, script, 15000);
-  res.json({ success: result.json?.killed ?? false, data: result.stdout, error: result.json?.error || result.stderr, method: 'psexec+powershell' });
+  const result = await runPowerShell(script, 15000);
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 // ==========================================================================
 // POWER MANAGEMENT — Restart / Stop / Wake-on-LAN
 // ==========================================================================
 app.post('/api/power/action', async (req, res) => {
-  const { hostname, action } = req.body;
+  const { hostname, action, credential, message, timeout } = req.body;
   const safeHost = sanitizeHost(hostname);
+  const cred = credential || getGlobalCredentials();
+  const credBlock = cred ? buildCredentialBlock(cred) : '';
+  const credParam = cred ? '-Credential $cred' : '';
+  const msgParam = message ? `-Force` : `-Force`;
   const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
   const startTime = Date.now();
-
-  let exeArgs = [];
-  const cred = getGlobalCredentials();
-  const fqHost = safeHost.includes('.') ? safeHost : (cred?.domain ? safeHost + '.' + cred.domain : safeHost);
-  const userArgs = cred ? pstools.credentialArgs(cred, fqHost) : [];
-
-  if (action === 'reboot') {
-    exeArgs = ['\\\\' + fqHost, ...userArgs, '-r', '-t', '5', '-f', '-accepteula'];
-  } else if (action === 'shutdown') {
-    exeArgs = ['\\\\' + fqHost, ...userArgs, '-s', '-t', '5', '-f', '-accepteula'];
-  } else if (action === 'startup') {
-    return res.json({ success: false, error: 'Cannot power on via psshutdown — use Wake-on-LAN /api/power/wol endpoint' });
-  } else {
-    return res.json({ success: false, error: 'Unknown action: ' + action });
-  }
-
-  const result = await new Promise((resolve) => {
-    const proc = spawn(pstoolsExe('psshutdown.exe'), exeArgs, { windowsHide: true, timeout: 20000 });
-    let stdout = '', stderr = '';
-    proc.stdout.on('data', d => stdout += d.toString());
-    proc.stderr.on('data', d => stderr += d.toString());
-    proc.on('close', code => resolve({ success: code === 0, stdout, stderr }));
-    proc.on('error', err => resolve({ success: false, stdout: '', stderr: err.message }));
-    setTimeout(() => { try { proc.kill(); } catch {} }, 22000);
-  });
+  const script = `
+    ${credBlock}
+    try {
+      switch ('${action}') {
+        'reboot'   { Restart-Computer -ComputerName '${safeHost}' ${credParam} ${msgParam} ${message ? `-Comment "${message.replace(/"/g, '`"')}"` : ''} -ErrorAction Stop }
+        'shutdown' { Stop-Computer -ComputerName '${safeHost}' ${credParam} -Force -ErrorAction Stop }
+        'startup'  { throw 'Cannot power on via PowerShell — use Wake-on-LAN /api/power/wol endpoint' }
+        default    { throw "Unknown action: ${action}" }
+      }
+      @{ hostname = '${safeHost}'; action = '${action}'; success = $true } | ConvertTo-Json -Compress
+    } catch {
+      @{ hostname = '${safeHost}'; action = '${action}'; success = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress
+    }
+  `;
+  const result = await runPowerShell(script, 20000);
   // Audit log — power action
   audit.add(db, {
     actionType: 'power.' + action,
-    targetHost: fqHost,
-    tool: 'psshutdown',
-    command: `psshutdown ${action} on ${fqHost}`,
+    targetHost: safeHost,
+    tool: 'powershell',
+    command: `${action} on ${safeHost}${message ? ' (message: ' + message + ')' : ''}`,
     success: result.success,
     durationMs: Date.now() - startTime,
     outputSummary: result.stdout ? result.stdout.substring(0, 500) : '',
     errorReason: result.success ? null : result.stderr,
     initiatedBy: 'admin',
     initiatedFrom,
-    parameters: { action },
+    parameters: { action, message },
   });
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
@@ -1648,18 +1363,32 @@ app.post('/api/laps/retrieve', async (req, res) => {
 
 app.post('/api/laps/rotate', async (req, res) => {
   const { hostnames, credential } = req.body;
-  const cred = credential || getGlobalCredentials();
-  const hostList = hostnames.map(sanitizeHost);
-
-  // Run Reset-LapsPassword on each host locally via PsExec + PowerShell
-  const results = [];
-  for (const h of hostList) {
-    const script = `try { Reset-LapsPassword -ErrorAction Stop; Write-Output '{"rotated":true,"method":"modern"}' } catch { try { Get-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\LAPS" -ErrorAction SilentlyContinue; Write-Output '{"rotated":false,"error":"LAPS not supported on this host"}' } catch { Write-Output '{"rotated":false,"error":"' + ($_.Exception.Message -replace '"','') + '"}' } }`;
-    const r = await runRemotePowerShellJson(h, script, 60000);
-    results.push({ hostname: h, ...(r.json || { rotated: false, error: r.jsonError || r.stderr }) });
-  }
-
-  res.json({ success: true, data: results });
+  const hostList = hostnames.map(sanitizeHost).join("','");
+  // Reset-AdmPwdPassword comes from the LAPS PowerShell module (or AdmPwd.PS legacy)
+  // For modern Windows LAPS (Server 2022+/Win 11+), use Reset-LapsPassword
+  const script = `
+    ${credential ? buildCredentialBlock(credential) : ''}
+    Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+    $results = @()
+    foreach ($h in @('${hostList}')) {
+      try {
+        # Try modern LAPS first (Windows 11 22H2+, Server 2022+)
+        try {
+          Invoke-Command -ComputerName $h ${credential ? '-Credential $cred' : ''} -ScriptBlock { Reset-LapsPassword } -ErrorAction Stop
+          $results += @{ hostname = $h; rotated = $true; method = 'modern' }
+        } catch {
+          # Fall back to legacy LAPS — set the expiration time to now
+          Set-ADComputer -Identity $h -Replace @{'ms-Mcs-AdmPwdExpirationTime' = '0'} -ErrorAction Stop
+          $results += @{ hostname = $h; rotated = $true; method = 'legacy' }
+        }
+      } catch {
+        $results += @{ hostname = $h; rotated = $false; error = $_.Exception.Message }
+      }
+    }
+    $results | ConvertTo-Json -Depth 4 -Compress
+  `;
+  const result = await runPowerShell(script, 60000);
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 // ==========================================================================
@@ -1667,459 +1396,138 @@ app.post('/api/laps/rotate', async (req, res) => {
 // ==========================================================================
 app.post('/api/deploy/package', async (req, res) => {
   const { hostnames, packagePath, arguments: args, credential, rebootBehavior } = req.body;
-  const cred = credential || getGlobalCredentials();
-  const hostList = hostnames.map(sanitizeHost);
-  const packageFile = (packagePath || '').split(/[\\/]/).pop();
-  const safeArgs = (args || '').replace(/"/g, '\\"');
-  const safePackagePath = (packagePath || '').replace(/'/g, "''");
-
-  const results = [];
-  for (const h of hostList) {
-    try {
-      // Copy package to remote host via SMB admin share (server→target UNC)
-      const copyScript = `Copy-Item '${safePackagePath}' "\\\\${h}\\C$\\Temp\\${packageFile}" -Force -ErrorAction Stop`;
-      const copyResult = await runPowerShell(copyScript, 60000);
-      if (!copyResult.success) {
-        results.push({ hostname: h, success: false, error: copyResult.stderr || 'Failed to copy package' });
-        continue;
+  const hostList = hostnames.map(sanitizeHost).join("','");
+  const safePath = (packagePath || '').replace(/"/g, '`"').replace(/'/g, "''");
+  const safeArgs = (args || '').replace(/"/g, '`"').replace(/'/g, "''");
+  const script = `
+    ${credential ? buildCredentialBlock(credential) : ''}
+    $results = @()
+    foreach ($h in @('${hostList}')) {
+      try {
+        # Copy package to remote host
+        $remotePath = "\\\\$h\\C$\\Temp\\$(Split-Path '${safePath}' -Leaf)"
+        Copy-Item '${safePath}' $remotePath -Force -ErrorAction Stop
+        # Execute remotely
+        $cmd = "& \\"C:\\Temp\\$(Split-Path '${safePath}' -Leaf)\\" ${safeArgs}"
+        $output = Invoke-Command -ComputerName $h ${credential ? '-Credential $cred' : ''} -ScriptBlock { param($c) Invoke-Expression $c } -ArgumentList $cmd -ErrorAction Stop
+        $results += @{ hostname = $h; success = $true; output = ($output | Out-String) }
+        ${rebootBehavior === 'always' ? `Restart-Computer -ComputerName $h ${credential ? '-Credential $cred' : ''} -Force` : ''}
+      } catch {
+        $results += @{ hostname = $h; success = $false; error = $_.Exception.Message }
       }
-
-      // Execute remotely via PsExec
-      const execCmd = `"C:\\Temp\\${packageFile}" ${safeArgs}`;
-      const execR = await pstools.runPsExec(h, 'cmd.exe', ['/c', execCmd], 120000, cred);
-      const output = { hostname: h, success: execR.success, output: execR.stdout };
-      results.push(output);
-
-      // Reboot if configured
-      if (rebootBehavior === 'always' && execR.success) {
-        const rebootR = await pstools.runGeneric('psshutdown', h, ['-r', '-t', '10', '-f'], 15000, cred);
-        output.rebooted = rebootR.success;
-      }
-    } catch (e) {
-      results.push({ hostname: h, success: false, error: e.message });
     }
-  }
-
-  res.json({ success: true, data: results });
-});
-
-// Alias: /api/deployments/run → /api/deploy/package (frontend compatibility)
-app.post('/api/deployments/run', async (req, res) => { req.url = '/api/deploy/package'; app.handle(req, res); });
-
-// Job registry for cancel/pause/resume
-const jobRegistry = new Map();
-
-app.post('/api/jobs/:jobId/cancel', (req, res) => {
-  const job = jobRegistry.get(req.params.jobId);
-  if (job) {
-    job.cancelled = true;
-    broadcastUpdate({ type: 'job-cancelled', jobId: req.params.jobId });
-    try { if (db.jobs && db.jobs.upsert) { const j = db.jobs.get(req.params.jobId); if (j) { db.jobs.upsert({ id: req.params.jobId, status: 'cancelled' }); } } } catch (_) {}
-    res.json({ success: true, status: 'cancelled' });
-  } else {
-    // Even if not found in registry, persist cancelled status
-    try { if (db.jobs && db.jobs.upsert) { db.jobs.upsert({ id: req.params.jobId, status: 'cancelled' }); } } catch (_) {}
-    broadcastUpdate({ type: 'job-cancelled', jobId: req.params.jobId });
-    res.json({ success: true, status: 'cancelled', note: 'Job not in active registry, status persisted' });
-  }
-});
-
-app.post('/api/jobs/:jobId/pause', (req, res) => {
-  const job = jobRegistry.get(req.params.jobId);
-  if (job) {
-    job.paused = true;
-    broadcastUpdate({ type: 'job-paused', jobId: req.params.jobId });
-    try { if (db.jobs && db.jobs.upsert) { db.jobs.upsert({ id: req.params.jobId, status: 'paused' }); } } catch (_) {}
-    res.json({ success: true, status: 'paused' });
-  } else {
-    res.json({ success: false, error: 'Job not found or already completed' });
-  }
-});
-
-app.post('/api/jobs/:jobId/resume', (req, res) => {
-  const job = jobRegistry.get(req.params.jobId);
-  if (job) {
-    job.paused = false;
-    broadcastUpdate({ type: 'job-resumed', jobId: req.params.jobId });
-    try { if (db.jobs && db.jobs.upsert) { db.jobs.upsert({ id: req.params.jobId, status: 'running' }); } } catch (_) {}
-    res.json({ success: true, status: 'running' });
-  } else {
-    res.json({ success: false, error: 'Job not found or already completed' });
-  }
-});
-
-// DELETE job
-app.delete('/api/jobs/:jobId', (req, res) => {
-  try { if (db.jobs && db.jobs.get) { const j = db.jobs.get(req.params.jobId); if (j) { db.jobs.delete(req.params.jobId); return res.json({ success: true }); } } } catch (_) {}
-  res.json({ success: false, error: 'Job not found' });
-});
-
-// RERUN-FAILED — re-run a completed/cancelled job only for hosts that failed
-app.post('/api/jobs/:jobId/rerun-failed', async (req, res) => {
-  try {
-    const j = db.jobs ? db.jobs.get(req.params.jobId) : null;
-    if (!j) return res.json({ success: false, error: 'Job not found' });
-    const failedHosts = [];
-    const allHostnames = j.hostnames || [];
-    const prevProgress = j.perHostProgress || {};
-    for (const h of allHostnames) {
-      const p = prevProgress[h];
-      if (!p || p.status === 'failed' || p.status === 'unreachable') failedHosts.push(h);
-    }
-    if (failedHosts.length === 0) return res.json({ success: true, data: { note: 'No failed hosts to rerun' } });
-    const steps = req.body.steps || j.steps || [];
-    const queueName = req.body.queueName || (j.name ? j.name + ' (rerun)' : 'Rerun');
-    // Delegate to /api/queues/execute — reuse the endpoint internally
-    req.body.steps = steps;
-    req.body.hostnames = failedHosts;
-    req.body.queueName = queueName;
-    req.body.errorHandling = 'continue';
-    // Forward body and let /api/queues/execute handle the rest
-    // Cannot directly call the handler, so respond with the info and let frontend resubmit
-    return res.json({ success: true, data: { failedHosts, steps, queueName, note: 'Frontend should call executeQueue with these params' } });
-  } catch (e) { res.json({ success: false, error: e.message }); }
+    $results | ConvertTo-Json -Depth 4 -Compress
+  `;
+  const result = await runPowerShell(script, 300000);
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 // ==========================================================================
+// JOB QUEUE EXECUTION — Real sequential step execution + WebSocket progress
+// ==========================================================================
 app.post('/api/queues/execute', async (req, res) => {
-  const { steps, hostnames, credential: reqCred, errorHandling: eh, queueName } = req.body;
+  const { steps, hostnames, credential, errorHandling, queueName } = req.body;
   const jobId = 'job-' + Date.now();
+  const credBlock = credential ? buildCredentialBlock(credential) : '';
+  const credParam = credential ? '-Credential $cred' : '';
 
-  // Use provided credential or fall back to global
-  const cred = reqCred && reqCred.username ? { username: reqCred.username, password: reqCred.password, domain: reqCred.domain || '', fullUsername: (reqCred.domain ? reqCred.domain + '\\' : '') + reqCred.username } : getGlobalCredentials();
-  const errorHandling = eh || 'continue';
-
-  // Register for pause/cancel control
-  const jobCtx = { cancelled: false, paused: false, completed: false };
-  jobRegistry.set(jobId, jobCtx);
-  setTimeout(() => jobRegistry.delete(jobId), 3600000);
-
-  // Helper: classify error as unreachable vs failed
-  const classifyError = (msg) => {
-    const m = (msg || '').toLowerCase();
-    const patterns = ['network path not found','rpc server is unavailable','access is denied','could not resolve','host unreachable','no such host','connection refused','timed out','error 53','error 5','error 1722','unknown host','network name cannot be found','the handle is invalid','couldn\'t access','cannot connect'];
-    return patterns.some(p => m.includes(p)) ? 'unreachable' : 'failed';
-  };
-
-  // Get fallback credential for auto-retry on access denied
-  let fallbackCred = null;
-  try {
-    const fbUser = db.settings.get('fallbackCredUsername', '') || '';
-    const fbEnc = db.settings.get('fallbackCredPassword', '') || '';
-    const fbPass = fbEnc ? db.decryptField(fbEnc) : '';
-    if (fbUser && fbPass) fallbackCred = { username: fbUser, password: fbPass, domain: db.settings.get('fallbackCredDomain', '') || '' };
-  } catch (_) {}
-
-  // Variable substitution helper
-  const substituteVars = (str, host) => {
-    let s = String(str || '');
-    s = s.replace(/\{HOST_IP\}/g, host.ip || host.hostname);
-    s = s.replace(/\{HOST_NAME\}/g, host.hostname);
-    s = s.replace(/\{USER\}/g, cred.username || '');
-    s = s.replace(/\{PASS\}/g, cred.password || '');
-    s = s.replace(/\{QUEUE_ID\}/g, jobId);
-    s = s.replace(/\{JOB_NAME\}/g, queueName || 'Untitled Queue');
-    s = s.replace(/\{TIMESTAMP\}/g, new Date().toISOString());
-    return s;
-  };
-
-  // Resolve host metadata for tracking
-  const hostMeta = {};
-  for (const hn of hostnames) {
-    const host = db.hosts ? db.hosts.getByHostname(null, hn) || {} : {};
-    hostMeta[hn] = {
-      host_id: host.id || null,
-      host_name: hn,
-      host_ip: host.ip_address || hn,
-    };
-  }
-
+  // Respond immediately with job ID
   res.json({ success: true, data: { jobId, status: 'running', stepCount: steps.length, hostCount: hostnames.length, queueName: queueName || 'Untitled Queue' } });
 
+  // Execute async + broadcast progress
   (async () => {
-    const perHostProgress = {};
-    const jobLogs = [];
-    let stepStartTime = Date.now();
-    const totalSteps = steps.length * hostnames.length;
-    const totalHosts = hostnames.length;
+    let totalSteps = steps.length * hostnames.length;
     let completed = 0;
-    let completedHosts = 0, failedHosts = 0, skippedHosts = 0;
-
-    hostnames.forEach(h => {
-      perHostProgress[h] = {
-        host_id: hostMeta[h].host_id, host_name: h, host_ip: hostMeta[h].host_ip,
-        step: '', status: 'pending', started_at: null, completed_at: null,
-        exit_code: null, output: '', error: '', current_step: 0, total_steps: steps.length,
-      };
-    });
-
-    const calcProgress = () => ({
-      overall: hostnames.length ? Math.round(((completedHosts + failedHosts + skippedHosts) / totalHosts) * 100) : 0,
-    });
-
-    // Save job to DB
-    try { if (db.jobs && db.jobs.upsert) { db.jobs.upsert({ id: jobId, name: queueName || 'Untitled Queue', status: 'running', progress: 0, step: 'Starting…', started_at: new Date().toISOString(), completed_at: null, hostnames, steps, perHostProgress, totalSteps, total_hosts: totalHosts, logs: [], error_handling: errorHandling }); } } catch (_) {}
-
-    // Audit: queue started
-    audit.add(db, { actionType: 'queue.execute', targetHost: hostnames.join(','), targetType: 'Queue', tool: 'queue', command: `Queue "${queueName}" — ${steps.length} steps on ${totalHosts} hosts`, success: true, durationMs: 0, outputSummary: `Started`, initiatedBy: 'admin', initiatedFrom: req.ip || 'unknown', parameters: { jobId, queueName, stepCount: steps.length, hostCount: totalHosts } });
-
-    broadcastUpdate({ type: 'queue-start', jobId, queueName: queueName || 'Untitled Queue', total: totalSteps, completed: 0, totalHosts });
+    broadcastUpdate({ type: 'queue-start', jobId, queueName: queueName || 'Untitled Queue', total: totalSteps, completed: 0 });
 
     for (let si = 0; si < steps.length; si++) {
       const step = steps[si];
       for (let hi = 0; hi < hostnames.length; hi++) {
-        while (jobCtx.paused) { await new Promise(r => setTimeout(r, 500)); }
-        if (jobCtx.cancelled) {
-          jobCtx.completed = true;
-          try { if (db.jobs && db.jobs.upsert) { db.jobs.upsert({ id: jobId, name: queueName || 'Untitled Queue', status: 'cancelled', progress: completed, step: 'Cancelled', completed_at: new Date().toISOString(), hostnames, steps, perHostProgress, logs: jobLogs, totalSteps, total_hosts: totalHosts, completed_hosts: completedHosts, failed_hosts: failedHosts, skipped_hosts: skippedHosts, overall_progress_percent: calcProgress().overall }); } } catch (_) {}
-          jobRegistry.delete(jobId);
-          broadcastUpdate({ type: 'queue-aborted', jobId, reason: 'Cancelled by user' });
-          return;
-        }
-
         const hostname = sanitizeHost(hostnames[hi]);
-        const meta = hostMeta[hostnames[hi]] || { host_name: hostname, host_ip: hostname };
         let stepResult = { success: false, output: '', error: '' };
-        stepStartTime = Date.now();
-
-        // Track host step start
-        perHostProgress[hostname].started_at = perHostProgress[hostname].started_at || new Date().toISOString();
-        perHostProgress[hostname].current_step = si + 1;
-        perHostProgress[hostname].step = step.type;
-
-        const currentHostProgress = Math.round(((si + 1) / steps.length) * 100);
-        const progressCalc = calcProgress();
-        broadcastUpdate({
-          type: 'queue-progress', jobId, step: step.type, stepIndex: si, totalSteps: steps.length,
-          hostname, hostIndex: hi, totalHosts, completed, total: totalSteps,
-          status: 'running', currentHostProgress,
-          overallProgress: progressCalc.overall,
-          completedHosts, failedHosts, skippedHosts, totalHosts,
-        });
+        const progressMsg = { type: 'queue-progress', jobId, step: step.type, stepIndex: si, totalSteps: steps.length, hostname, hostIndex: hi, totalHosts: hostnames.length, completed, total: totalSteps, status: 'running' };
+        broadcastUpdate(progressMsg);
 
         try {
           let script = '';
-          let commandExecuted = '';
-          const hostCtx = { hostname, ip: meta.host_ip, host_id: meta.host_id };
-
-          // Substitute variables in step config
-          const substConfig = (key) => step.config && step.config[key] ? substituteVars(step.config[key], hostCtx) : '';
-
-          // Helper: execute a step and auto-retry with fallback credential on failure
-          const execWithFallback = async (execFn, errorMsg) => {
-            const result = await execFn(cred);
-            if (!result.success && fallbackCred && /access denied|logon failure|unknown user|bad password/i.test(result.error || result.reason || '')) {
-              const retry = await execFn(fallbackCred);
-              if (retry.success) return { ...retry, retried: true };
-            }
-            return result;
-          };
-
           switch (step.type) {
             case 'check-updates':
-              script = `try { Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue; $u = Get-WindowsUpdate -ErrorAction Stop; Write-Output ('<<<JSON>>>' + ($u | Select-Object KB,Title | ConvertTo-Json -Compress) + '<<<END>>>') } catch { Write-Output ('<<<JSON>>>[]<<<END>>>') }`;
-              commandExecuted = `psexec \\\\${hostname} powershell Get-WindowsUpdate`;
-              const cu = await runRemotePowerShellJson(hostname, script, 120000, cred);
-              stepResult = { success: cu.success, output: JSON.stringify(cu.json || []), error: cu.jsonError || cu.stderr };
+              script = `Import-Module PSWindowsUpdate; Get-WindowsUpdate -ComputerName '${hostname}' ${credParam} | ConvertTo-Json -Compress`;
               break;
             case 'download-updates':
-              script = `try { Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue; Get-WindowsUpdate -Download -AcceptAll -ErrorAction Stop; Write-Output '<<<JSON>>>{"status":"downloaded"}<<<END>>>' } catch { Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>') }`;
-              commandExecuted = `psexec \\\\${hostname} powershell Get-WindowsUpdate -Download`;
-              const du = await runRemotePowerShellJson(hostname, script, 300000, cred);
-              stepResult = { success: du.success, output: du.json?.status || '', error: du.json?.error || du.stderr };
+              script = `Import-Module PSWindowsUpdate; Get-WindowsUpdate -ComputerName '${hostname}' ${credParam} -Download -AcceptAll | ConvertTo-Json -Compress`;
               break;
-            case 'install-all': case 'install-updates':
-              script = `try { Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue; Install-WindowsUpdate -Install -AcceptAll -AutoReboot -ErrorAction Stop; Write-Output '<<<JSON>>>{"status":"installed"}<<<END>>>' } catch { Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>') }`;
-              commandExecuted = `psexec \\\\${hostname} powershell Install-WindowsUpdate`;
-              const iu = await runRemotePowerShellJson(hostname, script, 600000, cred);
-              stepResult = { success: iu.success, output: iu.json?.status || '', error: iu.json?.error || iu.stderr };
+            case 'install-all':
+            case 'install-updates':
+              script = `Import-Module PSWindowsUpdate; Install-WindowsUpdate -ComputerName '${hostname}' ${credParam} -AcceptAll -AutoReboot | ConvertTo-Json -Compress`;
               break;
             case 'reboot':
-              commandExecuted = `psshutdown \\\\${hostname} -r -t 5 -f`;
-              stepResult = await execWithFallback(c => pstools.runGeneric('psshutdown', hostname, ['-r', '-t', '5', '-f'], 20000, c));
+              script = `Restart-Computer -ComputerName '${hostname}' ${credParam} -Force; @{ hostname='${hostname}'; rebooted=$true } | ConvertTo-Json -Compress`;
               break;
             case 'shutdown':
-              commandExecuted = `psshutdown \\\\${hostname} -s -t 5 -f`;
-              stepResult = await execWithFallback(c => pstools.runGeneric('psshutdown', hostname, ['-s', '-t', '5', '-f'], 20000, c));
+              script = `Stop-Computer -ComputerName '${hostname}' ${credParam} -Force; @{ hostname='${hostname}'; stopped=$true } | ConvertTo-Json -Compress`;
               break;
             case 'wait-for-online':
-              script = `for ($i=0; $i -lt 60; $i++) { if (Test-Connection -ComputerName '${hostname}' -Count 1 -Quiet) { Write-Output '<<<JSON>>>{"online":true}<<<END>>>'; exit 0 }; Start-Sleep -Seconds 5 }; Write-Output '<<<JSON>>>{"online":false,"error":"Timed out after 5 min"}<<<END>>>'`;
-              commandExecuted = `psexec \\\\${hostname} powershell wait-for-online`;
-              const wo = await runRemotePowerShellJson(hostname, script, 310000, cred);
-              stepResult = { success: wo.json?.online || false, output: JSON.stringify(wo.json || {}), error: wo.json?.error || wo.stderr };
+              script = `for ($i=0; $i -lt 60; $i++) { if (Test-Connection -ComputerName '${hostname}' -Count 1 -Quiet) { break }; Start-Sleep -Seconds 5 }; @{ hostname='${hostname}'; online=$true } | ConvertTo-Json -Compress`;
               break;
             case 'run-command':
               if (step.config?.code) {
-                const code = substituteVars(step.config.code, hostCtx);
-                commandExecuted = `psexec \\\\${hostname} powershell ${code.slice(0, 100)}`;
-                stepResult = await execWithFallback(c => powershell.runRemoteViaPsExec(hostname, code, PSTOOLS_PATH, 300000, c));
-              } else { stepResult = { success: false, error: 'No command code configured' }; }
+                script = `Invoke-Command -ComputerName '${hostname}' ${credParam} -ScriptBlock { ${step.config.code} } | Out-String`;
+              }
               break;
-            case 'start-service': case 'stop-service': case 'restart-service': case 'check-service':
+            case 'start-service':
               if (step.config?.serviceName) {
-                const svcName = substituteVars(step.config.serviceName, hostCtx);
-                const action = step.type === 'stop-service' ? 'Stop' : step.type === 'restart-service' ? 'Restart' : step.type === 'check-service' ? 'Get' : 'Start';
-                script = step.type === 'check-service'
-                  ? `try { $s = Get-Service -Name '${svcName}' -ErrorAction Stop; Write-Output ('<<<JSON>>>{"name":"' + $s.Name + '","status":"' + $s.Status + '"}<<<END>>>') } catch { Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>') }`
-                  : `try { ${action}-Service -Name '${svcName}' ${step.type === 'stop-service' || step.type === 'restart-service' ? '-Force ' : ''}-ErrorAction Stop; Write-Output '<<<JSON>>>{"state":"${action === 'Stop' ? 'Stopped' : 'Running'}"}<<<END>>>' } catch { Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>') }`;
-                commandExecuted = `psexec \\\\${hostname} powershell ${action}-Service ${svcName}`;
-                const svcResult = await runRemotePowerShellJson(hostname, script, 30000, cred);
-                stepResult = { success: step.type === 'check-service' ? (svcResult.success && !!svcResult.json?.status) : svcResult.success, output: JSON.stringify(svcResult.json || {}), error: svcResult.json?.error || svcResult.stderr };
-              } else { stepResult = { success: false, error: 'No service name configured' }; }
+                script = `Start-Service -ComputerName '${hostname}' -Name '${sanitizeHost(step.config.serviceName)}' ${credParam}; @{ hostname='${hostname}'; service='${sanitizeHost(step.config.serviceName)}'; state='Running' } | ConvertTo-Json -Compress`;
+              }
+              break;
+            case 'stop-service':
+              if (step.config?.serviceName) {
+                script = `Stop-Service -ComputerName '${hostname}' -Name '${sanitizeHost(step.config.serviceName)}' -Force ${credParam}; @{ hostname='${hostname}'; service='${sanitizeHost(step.config.serviceName)}'; state='Stopped' } | ConvertTo-Json -Compress`;
+              }
+              break;
+            case 'restart-service':
+              if (step.config?.serviceName) {
+                script = `Restart-Service -ComputerName '${hostname}' -Name '${sanitizeHost(step.config.serviceName)}' -Force ${credParam}; @{ hostname='${hostname}'; service='${sanitizeHost(step.config.serviceName)}'; state='Running' } | ConvertTo-Json -Compress`;
+              }
               break;
             case 'psexec-run':
               if (step.config?.command) {
-                const cmd = substituteVars(step.config.command, hostCtx);
-                commandExecuted = `psexec \\\\${hostname} cmd /c ${cmd}`;
-                stepResult = await execWithFallback(c => pstools.runPsExec(hostname, 'cmd.exe', ['/c', cmd], 60000, c));
-              } else { stepResult = { success: false, error: 'No CMD command configured' }; }
+                script = `& '${PSTOOLS_PATH}psexec.exe' \\\\${hostname} -accepteula ${step.config.command}`;
+              }
               break;
             case 'wait-minutes':
-              commandExecuted = `wait ${step.config?.minutes || 1} min`;
               await new Promise(r => setTimeout(r, (step.config?.minutes || 1) * 60000));
               stepResult = { success: true, output: `Waited ${step.config?.minutes || 1} minute(s)` };
               break;
-            case 'hardware-scan':
-              try {
-                const fqHost3 = hostname.includes('.') ? hostname : (cred?.domain ? hostname + '.' + cred.domain : hostname);
-                commandExecuted = `hardware-scan on ${hostname}`;
-                const { results: hwResults3, ok: hwOk3 } = await scanHardware(hostname, fqHost3, cred);
-                stepResult = { success: hwOk3, output: JSON.stringify(hwResults3, null, 2), error: hwOk3 ? null : ('No hardware data: ' + (hwResults3.errors?.[0]?.reason || 'unknown')) };
-              } catch (e) {
-                stepResult = { success: false, output: '', error: 'scanHardware threw: ' + e.message };
-              }
-              break;
-            case 'apps-list':
-              commandExecuted = `apps-list on ${hostname}`;
-              const [appPsInfo, appWmic] = await Promise.all([
-                pstools.runPsInfo(hostname, ['-d','-s'], 30000, cred),
-                wmic.runRemoteViaPsExec(hostname, 'product', 'Name,Version,Vendor', PSTOOLS_PATH, 60000, cred)
-              ]);
-              stepResult = { success: appPsInfo.success || appWmic.success, output: appWmic.records ? JSON.stringify(appWmic.records) : appPsInfo.stdout, error: appWmic.error || appPsInfo.stderr };
-              break;
-            case 'services-list':
-              script = `try { $svcs = Get-Service | Select-Object Name,DisplayName,Status,StartType | ConvertTo-Json -Compress; Write-Output ('<<<JSON>>>' + $svcs + '<<<END>>>') } catch { Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '"}<<<END>>>') }`;
-              commandExecuted = `psexec \\\\${hostname} powershell Get-Service`;
-              const svcList = await runRemotePowerShellJson(hostname, script, 60000, cred);
-              stepResult = { success: svcList.success && !svcList.json?.error, output: JSON.stringify(svcList.json || {}), error: svcList.json?.error || svcList.stderr };
-              break;
-            case 'psinof': case 'psinfo':
-              commandExecuted = `psinfo \\\\${hostname} -d -h -s -c`;
-              stepResult = await execWithFallback(c => pstools.runPsInfo(hostname, ['-d','-h','-s','-c'], 30000, c));
-              break;
-            case 'pslist':
-              commandExecuted = `pslist \\\\${hostname} -t`;
-              stepResult = await execWithFallback(c => pstools.runGeneric('pslist', hostname, ['-t'], 30000, c));
-              break;
-            case 'psloggedon':
-              commandExecuted = `psloggedon \\\\${hostname}`;
-              stepResult = await execWithFallback(c => pstools.runPsLoggedOn(hostname, 15000, c));
-              break;
             default:
-              commandExecuted = `unknown: ${step.type}`;
               stepResult = { success: false, error: `Unknown step type: ${step.type}` };
           }
-
-          completed++;
-          const durationMs = Date.now() - stepStartTime;
-          const stepStatus = stepResult.success ? 'success'
-            : (stepResult.error && /access denied/i.test(stepResult.error) ? 'failed'
-            : classifyError(stepResult.error));
-          const isUnreachable = stepStatus === 'unreachable';
-
-          perHostProgress[hostname] = {
-            ...perHostProgress[hostname],
-            step: step.type, status: stepStatus,
-            completed_at: new Date().toISOString(),
-            exit_code: stepResult.success ? 0 : -1,
-            output: stepResult.output?.slice(0, 2000) || '',
-            error: stepResult.error?.slice(0, 500) || '',
-          };
-
-          // Queue audit log entry
-          try { if (db.queue_audit && db.queue_audit.add) {
-            db.queue_audit.add({
-              queue_id: jobId, queue_name: queueName || 'Untitled Queue',
-              job_id: jobId, job_name: queueName || '',
-              host_id: meta.host_id, host_name: hostname, host_ip: meta.host_ip,
-              step_number: si + 1, step_label: step.label || step.type,
-              command_executed: commandExecuted || '',
-              started_at: new Date(stepStartTime).toISOString(),
-              completed_at: new Date().toISOString(),
-              duration_seconds: Math.round(durationMs / 1000),
-              exit_code: stepResult.success ? 0 : -1,
-              stdout: stepResult.output?.slice(0, 2000) || '',
-              stderr: stepResult.error?.slice(0, 500) || '',
-              status: stepResult.success ? 'success' : stepStatus,
-              triggered_by: 'manual',
-            });
-          } } catch (_) {}
-
-          // Standard audit log — includes full command + output
-          audit.add(db, {
-            actionType: `queue.step.${step.type}`,
-            targetHost: hostname, targetType: 'Queue',
-            tool: step.type, command: commandExecuted || step.label || step.type,
-            success: stepResult.success, durationMs,
-            outputSummary: stepResult.success
-              ? `OK — ${stepResult.output?.slice(0, 200) || ''}`
-              : (stepResult.error?.slice(0, 200) || 'Failed'),
-            fullOutput: stepResult.output || stepResult.error || '',
-            errorReason: stepResult.error?.slice(0, 300),
-            initiatedBy: 'admin', initiatedFrom: req.ip || 'unknown',
-            parameters: { jobId, queueName: queueName || '', stepNumber: si + 1, stepType: step.type },
-          });
-
-          // Track host completion
-          if (stepResult.success && si === steps.length - 1) completedHosts++;
-          else if (!stepResult.success && si === steps.length - 1) {
-            if (isUnreachable) skippedHosts++;
-            else failedHosts++;
+          if (script) {
+            const r = await runPowerShell(script, 300000);
+            stepResult = { success: r.success, output: r.stdout, error: r.stderr };
           }
-
-          jobLogs.push({
-            time: new Date().toISOString(), type: 'step', hostname,
-            step: step.type, command: commandExecuted || step.label || step.type,
-            success: stepResult.success, error: stepResult.error?.slice(0, 200),
-            output: stepResult.output?.slice(0, 500), hostStatus: stepStatus,
-            durationMs,
-          });
-
-          const pc = calcProgress();
-          // Save progress to DB periodically
-          try { if (db.jobs && db.jobs.upsert) { db.jobs.upsert({ id: jobId, step: `${step.label || step.type} on ${hostname}`, progress: completed, perHostProgress, overall_progress_percent: pc.overall, completed_hosts: completedHosts, failed_hosts: failedHosts, skipped_hosts: skippedHosts, current_host_progress_percent: steps.length ? Math.round(((si + 1) / steps.length) * 100) : 0, logs: jobLogs }); } } catch (_) {}
-
-          broadcastUpdate({
-            type: 'queue-step-complete',
-            jobId, step: step.type, stepIndex: si, hostname, hostIndex: hi,
-            completed, total: totalSteps, success: stepResult.success,
-            output: stepResult.output?.slice(0, 1000), error: stepResult.error,
-            status: stepStatus,
-            overallProgress: pc.overall, currentHostProgress: steps.length ? Math.round(((si + 1) / steps.length) * 100) : 0,
-            completedHosts, failedHosts, skippedHosts, totalHosts,
-            durationMs, commandExecuted,
-          });
         } catch (e) {
           stepResult = { success: false, error: e.message };
-          completed++;
-          perHostProgress[hostname] = { ...perHostProgress[hostname], step: step.type, status: 'failed', completed_at: new Date().toISOString(), exit_code: -1, error: e.message?.slice(0, 500) || '' };
-          jobLogs.push({ time: new Date().toISOString(), type: 'step', hostname, step: step.type, command: step.label || step.type, success: false, error: e.message?.slice(0, 200), hostStatus: 'failed' });
-          const pc = calcProgress();
-          broadcastUpdate({ type: 'queue-step-complete', jobId, step: step.type, stepIndex: si, hostname, hostIndex: hi, completed, total: totalSteps, success: false, output: '', error: e.message, status: 'failed', overallProgress: pc.overall, completedHosts, failedHosts: failedHosts + 1, skippedHosts, totalHosts });
+        }
+
+        completed++;
+        broadcastUpdate({
+          type: 'queue-step-complete',
+          jobId, step: step.type, stepIndex: si, hostname, hostIndex: hi,
+          completed, total: totalSteps,
+          success: stepResult.success,
+          output: stepResult.output?.slice(0, 5000),
+          error: stepResult.error,
+          status: stepResult.success ? 'success' : 'failed'
+        });
+
+        if (!stepResult.success && errorHandling === 'stop') {
+          broadcastUpdate({ type: 'queue-aborted', jobId, reason: 'Step failed and errorHandling=stop', step, hostname, completed, total: totalSteps });
+          return;
         }
       }
     }
-
-    // Persist completion
-    const finalProgress = calcProgress();
-    try { if (db.jobs && db.jobs.upsert) { db.jobs.upsert({ id: jobId, name: queueName || 'Untitled Queue', status: 'completed', progress: completed, step: completed >= totalSteps ? 'Done' : 'Partial', started_at: new Date().toISOString(), completed_at: new Date().toISOString(), hostnames, steps, perHostProgress, logs: jobLogs, totalSteps, total_hosts: totalHosts, completed_hosts: completedHosts, failed_hosts: failedHosts, skipped_hosts: skippedHosts, overall_progress_percent: finalProgress.overall }); } } catch (_) {}
-
-    // Audit: queue completed
-    audit.add(db, { actionType: 'queue.complete', targetHost: hostnames.join(','), targetType: 'Queue', tool: 'queue', command: `Queue "${queueName}" — ${totalHosts} hosts`, success: true, durationMs: Date.now() - stepStartTime, outputSummary: `Completed: ${completedHosts}, Failed: ${failedHosts}, Skipped: ${skippedHosts}`, initiatedBy: 'admin', initiatedFrom: req.ip || 'unknown', parameters: { jobId, queueName, completedHosts, failedHosts, skippedHosts, totalHosts } });
-
-    jobCtx.completed = true;
-    jobRegistry.delete(jobId);
-    broadcastUpdate({ type: 'queue-complete', jobId, completed, total: totalSteps, status: 'completed', completedHosts, failedHosts, skippedHosts, totalHosts, overallProgress: 100 });
+    broadcastUpdate({ type: 'queue-complete', jobId, completed, total: totalSteps, status: 'completed' });
   })();
 });
 
@@ -2132,160 +1540,81 @@ function pstoolsExe(name) {
 
 app.post('/api/pstools/execute', async (req, res) => {
   const { tool, hostname, args, credential } = req.body;
+  const toolMap = PSTOOLS_TOOLMAP;
+  const exe = toolMap[tool] || 'psexec.exe';
   const safeHost = sanitizeHost(hostname);
-  const cred = credential || getGlobalCredentials();
-  const extraArgs = (args || '').split(/\s+/).filter(Boolean);
-  const result = await pstools.runGeneric(tool, safeHost, extraArgs, 60000, cred);
+  const target = `\\\\${safeHost}`;
+  const fullCmd = `"${pstoolsExe(exe)}" ${target} -accepteula ${args || ''}`;
+  const result = await runPowerShell(fullCmd, 60000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 // ==========================================================================
-// INSTALLED APPS — Uses PsInfo (primary, RPC) then PowerShell via PsExec
+// INSTALLED APPS — Uses PsExec + reg query (NO PowerShell) to list all
+// installed software from the Windows registry Uninstall keys.
 // ==========================================================================
 app.post('/api/hosts/:hostname/apps', async (req, res) => {
   const safeHost = sanitizeHost(req.params.hostname);
-  const { credential: reqCred } = req.body || {};
-  const cred = reqCred && reqCred.username ? { username: reqCred.username, password: reqCred.password, domain: reqCred.domain || '', fullUsername: (reqCred.domain ? reqCred.domain + '\\' : '') + reqCred.username, source: 'request' } : getGlobalCredentials();
   const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
   const startTime = Date.now();
-  const fqHost = safeHost.includes('.') ? safeHost : (cred?.domain ? safeHost + '.' + cred.domain : safeHost);
 
   try {
-    const methodAttempts = [];
+    // Query 3 registry locations in parallel via PsExec
+    const [reg64Res, reg32Res, regUserRes] = await Promise.all([
+      pstools.runPsExec(safeHost, 'reg.exe', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall', '/s'], 30000),
+      pstools.runPsExec(safeHost, 'reg.exe', ['query', 'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall', '/s'], 30000),
+      pstools.runPsExec(safeHost, 'reg.exe', ['query', 'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall', '/s'], 30000),
+    ]);
 
-    // 1st: PsInfo -s -c (installed software via RPC, no Admin$ required)
-    const psInfoRes = await pstools.runPsInfo(fqHost, ['-s', '-c'], 30000, cred);
-    if (psInfoRes.success && psInfoRes.stdout) {
-      const apps = parsePsInfoSoftware(psInfoRes.stdout);
-      if (apps.length > 0) {
-        audit.add(db, { actionType: 'apps.list', targetHost: safeHost, tool: 'psinfo', command: `psinfo -s -c on ${safeHost}`, success: true, durationMs: Date.now() - startTime, outputSummary: `Found ${apps.length} apps`, initiatedBy: 'admin', initiatedFrom });
-        return res.json({ success: true, apps, count: apps.length, method: 'psinfo' });
-      } else {
-        methodAttempts.push({ name: 'psinfo', success: false, reason: 'No apps found' });
-      }
-    } else {
-      methodAttempts.push({ name: 'psinfo', success: false, reason: psInfoRes.stderr || psInfoRes.error || 'Command failed' });
-    }
+    // Parse each registry output
+    const apps64 = parseRegUninstall(reg64Res.stdout);
+    const apps32 = parseRegUninstall(reg32Res.stdout);
+    const appsUser = parseRegUninstall(regUserRes.stdout);
 
-    // 2nd: reg query /s via PsExec (avoids PowerShell stdout truncation)
-    // Queries both 64-bit and 32-bit uninstall keys
-    const regHives = [
-      'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
-      'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
-    ];
-    let allApps = [];
-    const seenKeys = new Set();
-    for (const hive of regHives) {
-      // Use cmd.exe /c to ensure reg output goes to stdout (direct reg.exe routes to stderr via PsExec)
-      const regRes = await pstools.runPsExec(fqHost, 'cmd.exe', ['/c', 'reg', 'query', hive, '/s'], 45000, cred);
-      if (regRes.success && regRes.stdout) {
-        const parsed = parseRegUninstall(regRes.stdout);
-        for (const app of parsed) {
-          const key = (app.name || '').toLowerCase();
-          if (app.name && !seenKeys.has(key)) {
-            seenKeys.add(key);
-            allApps.push({ name: app.name, version: app.version || '', publisher: app.publisher || '' });
-          }
-        }
-      }
-      // Log reg attempts for debugging
-      if (!regRes.success || !regRes.stdout) {
-        methodAttempts.push({ name: `reg-${hive.split('\\').pop()}`, success: false, reason: regRes.stderr || regRes.error || 'No output' });
-      }
-    }
-    if (allApps.length > 0) {
-      allApps.sort((a, b) => a.name.localeCompare(b.name));
-      audit.add(db, { actionType: 'apps.list', targetHost: safeHost, tool: 'psexec+reg', command: `reg query /s Uninstall on ${safeHost}`, success: true, durationMs: Date.now() - startTime, outputSummary: `Found ${allApps.length} apps`, initiatedBy: 'admin', initiatedFrom });
-      return res.json({ success: true, apps: allApps, count: allApps.length, method: 'psexec+reg' });
-    } else {
-      methodAttempts.push({ name: 'psexec+reg', success: false, reason: 'No uninstall registry entries found' });
-    }
+    // Merge, dedupe, sort
+    const allApps = [...apps64, ...apps32, ...appsUser];
+    const seen = new Set();
+    const deduped = allApps.filter(a => {
+      const key = (a.name + '|' + (a.version || '')).toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
 
-    // 3rd: wmic DCOM fallback
-    const wmiRes = await wmic.runRemote(fqHost, 'product', 'name,version,vendor', 30000, cred);
-    if (wmiRes.success && wmiRes.records && wmiRes.records.length > 0) {
-      const apps = wmiRes.records.map(r => ({
-        name: (r.Name || r.name || '').trim(),
-        version: (r.Version || r.version || '').trim(),
-        publisher: (r.Vendor || r.vendor || '').trim(),
-      })).filter(a => a.name).sort((a, b) => a.name.localeCompare(b.name));
-      audit.add(db, { actionType: 'apps.list', targetHost: safeHost, tool: 'wmic', command: `wmic product on ${safeHost}`, success: true, durationMs: Date.now() - startTime, outputSummary: `Found ${apps.length} apps`, initiatedBy: 'admin', initiatedFrom });
-      return res.json({ success: true, apps, count: apps.length, method: 'wmic' });
-    } else {
-      methodAttempts.push({ name: 'wmic', success: false, reason: wmiRes.stderr || wmiRes.error || 'Invalid Global Switch or command failed' });
-    }
+    // Audit log
+    audit.add(db, {
+      actionType: 'apps.list',
+      targetHost: safeHost,
+      tool: 'psexec+reg',
+      command: `reg query Uninstall keys on ${safeHost}`,
+      success: true,
+      durationMs: Date.now() - startTime,
+      outputSummary: `Found ${deduped.length} apps (${apps64.length} 64-bit, ${apps32.length} 32-bit, ${appsUser.length} user)`,
+      initiatedBy: 'admin',
+      initiatedFrom,
+    });
 
-    // 4th: WinAudit via PsExec -c (comprehensive software inventory, works when reg keys are inaccessible)
-    const waLocalPath = path.join(__dirname, 'Tools', 'WinAudit_3_4_6.exe');
-    if (fs.existsSync(waLocalPath)) {
-      const hostTag = safeHost.replace(/[^a-zA-Z0-9_-]/g, '_');
-      const waOutPath = `C:\\Windows\\Temp\\shl_winaudit_${hostTag}.csv`;
-      // -c copies the local exe to the remote; /r=w = software only; /f=CSV = CSV format; /o=... = output file
-      const waGen = await pstools.runPsExec(fqHost, '-c', [waLocalPath, '/r=w', '/o=' + waOutPath, '/f=CSV', '/silent'], 120000, cred);
-      if (waGen.success) {
-        const waRead = await pstools.runPsExec(fqHost, 'cmd.exe', ['/c', 'type', waOutPath], 30000, cred);
-        pstools.runPsExec(fqHost, 'cmd.exe', ['/c', 'del', '/f', '/q', waOutPath], 15000, cred).catch(() => {});
-        if (waRead.success && waRead.stdout) {
-          const apps = parseWinAuditCsv(waRead.stdout);
-          if (apps.length > 0) {
-            audit.add(db, { actionType: 'apps.list', targetHost: safeHost, tool: 'winaudit', command: `WinAudit on ${safeHost}`, success: true, durationMs: Date.now() - startTime, outputSummary: `Found ${apps.length} apps`, initiatedBy: 'admin', initiatedFrom });
-            return res.json({ success: true, apps, count: apps.length, method: 'winaudit' });
-          } else {
-            methodAttempts.push({ name: 'winaudit', success: false, reason: 'CSV parsed but no apps found' });
-          }
-        } else {
-          methodAttempts.push({ name: 'winaudit', success: false, reason: waRead.stderr || waRead.error || 'Failed to read CSV' });
-        }
-      } else {
-        methodAttempts.push({ name: 'winaudit', success: false, reason: waGen.stderr || waGen.error || 'Failed to generate WinAudit report' });
-        pstools.runPsExec(fqHost, 'cmd.exe', ['/c', 'del', '/f', '/q', waOutPath], 15000, cred).catch(() => {});
-      }
-    } else {
-      methodAttempts.push({ name: 'winaudit', success: false, reason: 'WinAudit executable not found on server' });
-    }
-
-    // 5th: PowerShell CIM over DCOM (Get-CimInstance Win32_Product, no WinRM required)
-    const cimRes = await wmic.runRemoteCim(fqHost, 'Win32_Product', 'Name,Version,Vendor', 60000, cred);
-    if (cimRes.success && cimRes.records && cimRes.records.length > 0) {
-      const apps = cimRes.records.map(r => ({
-        name: (r.Name || r.name || '').trim(),
-        version: (r.Version || r.version || '').trim(),
-        publisher: (r.Vendor || r.vendor || '').trim(),
-      })).filter(a => a.name).sort((a, b) => a.name.localeCompare(b.name));
-      audit.add(db, { actionType: 'apps.list', targetHost: safeHost, tool: 'cim-dcom', command: `Get-CimInstance Win32_Product on ${safeHost}`, success: true, durationMs: Date.now() - startTime, outputSummary: `Found ${apps.length} apps`, initiatedBy: 'admin', initiatedFrom });
-      return res.json({ success: true, apps, count: apps.length, method: 'cim-dcom' });
-    } else {
-      methodAttempts.push({ name: 'cim-dcom', success: false, reason: cimRes.stderr || cimRes.error || 'CIM query failed' });
-    }
-
-    res.json({ success: false, apps: [], error: 'All methods failed — ' + methodAttempts.map(a => a.name).join(', ') + ' inaccessible', method: 'none', attempts: methodAttempts });
+    res.json({
+      success: true,
+      apps: deduped,
+      count: deduped.length,
+      sources: { '64bit': apps64.length, '32bit': apps32.length, 'user': appsUser.length },
+    });
   } catch (e) {
-    audit.add(db, { actionType: 'apps.list', targetHost: safeHost, tool: 'multi', command: `List apps on ${safeHost}`, success: false, durationMs: Date.now() - startTime, errorReason: e.message, initiatedBy: 'admin', initiatedFrom });
-    res.json({ success: false, apps: [], error: e.message });
+    audit.add(db, {
+      actionType: 'apps.list',
+      targetHost: safeHost,
+      tool: 'psexec+reg',
+      command: `reg query Uninstall keys on ${safeHost}`,
+      success: false,
+      durationMs: Date.now() - startTime,
+      errorReason: e.message,
+      initiatedBy: 'admin',
+      initiatedFrom,
+    });
+    res.json({ success: false, error: e.message, apps: [] });
   }
 });
-
-// Parse PsInfo -s -c output: comma-separated line, apps come after system info fields
-function parsePsInfoSoftware(raw) {
-  const out = (raw || '').trim();
-  if (!out) return [];
-  // PsInfo -s -c outputs a single line: hostname,uptime,os,type,ver,sp,build,,owner,ie,sysroot,cpus,speed,cpuType,ram,video,APP1,APP2,...
-  // Fixed fields before apps: hostname(1), uptime(2), os(3), type(4), ver(5), sp(6), build(7), empty(8), owner(9), ie(10), sysroot(11), cpus(12), speed(13), cpuType(14), ram(15), video(16)
-  const parts = out.split(',');
-  // First 16 fields are system info, rest are apps
-  const appTokens = parts.slice(16);
-  const apps = [];
-  const seen = new Set();
-  for (const token of appTokens) {
-    const name = token.trim();
-    if (!name || name === 'n/a' || /^KB\d+/i.test(name)) continue;
-    const key = name.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    apps.push({ name });
-  }
-  return apps.sort((a, b) => a.name.localeCompare(b.name));
-}
 
 // Helper: parse reg query /s output into app objects
 function parseRegUninstall(raw) {
@@ -2310,134 +1639,20 @@ function parseRegUninstall(raw) {
       else if (key === 'DisplayVersion') { current.version = value; }
       else if (key === 'Publisher') { current.publisher = value; }
       else if (key === 'InstallDate') { current.installDate = value; }
-      else if (key === 'UninstallString') { current.uninstallString = value; }
-      else if (key === 'QuietUninstallString') { current.quietUninstallString = value; }
     }
   }
   if (hasName && current.name) apps.push(current);
   return apps;
 }
 
-// Helper: parse WinAudit CSV software report output into app objects
-function parseWinAuditCsv(raw) {
-  const out = (raw || '').replace(/\r/g, '');
-  const lines = out.split('\n').filter(l => l.trim());
-  const apps = [];
-  let nameIdx = -1, versionIdx = -1, publisherIdx = -1;
-  let headerFound = false;
-
-  for (const line of lines) {
-    const cols = csvSplit(line);
-    if (!headerFound) {
-      // Find header row by looking for "Name" column
-      nameIdx = cols.findIndex(c => c.replace(/^"|"$/g, '').trim() === 'Name');
-      if (nameIdx >= 0) {
-        versionIdx = cols.findIndex(c => c.replace(/^"|"$/g, '').trim() === 'Version');
-        publisherIdx = cols.findIndex(c => c.replace(/^"|"$/g, '').trim() === 'Publisher');
-        headerFound = true;
-      }
-      continue;
-    }
-    const name = cols[nameIdx] ? cols[nameIdx].replace(/^"|"$/g, '').trim() : '';
-    if (!name || name.startsWith('"') && name.endsWith('"') && name.length === 2) continue;
-    const version = cols[versionIdx] ? cols[versionIdx].replace(/^"|"$/g, '').trim() : '';
-    const publisher = cols[publisherIdx] ? cols[publisherIdx].replace(/^"|"$/g, '').trim() : '';
-    apps.push({ name, version, publisher });
-  }
-  return apps.sort((a, b) => a.name.localeCompare(b.name));
-}
-
-// Simple CSV line splitter (handles quoted fields with commas)
-function csvSplit(line) {
-  const result = [];
-  let current = '';
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === '"') {
-      inQuotes = !inQuotes;
-      current += ch;
-    } else if (ch === ',' && !inQuotes) {
-      result.push(current);
-      current = '';
-    } else {
-      current += ch;
-    }
-  }
-  result.push(current);
-  return result;
-}
-
-// ==========================================================================
-// UNINSTALL APP — Find uninstall string and execute it via PsExec
-// ==========================================================================
-app.post('/api/hosts/:hostname/apps/uninstall', async (req, res) => {
-  const safeHost = sanitizeHost(req.params.hostname);
-  const { appName } = req.body;
-  if (!appName) return res.json({ success: false, error: 'appName is required' });
-  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
-  const startTime = Date.now();
-  const fqHost = safeHost.includes('.') ? safeHost : (getGlobalCredentials()?.domain ? safeHost + '.' + getGlobalCredentials().domain : safeHost);
-
-  try {
-    // 1. Query registry to find the uninstall key for this app
-    const hives = [
-      'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
-      'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
-    ];
-    let uninstallCmd = null;
-    let foundKey = '';
-
-    for (const hive of hives) {
-      const regRes = await pstools.runPsExec(fqHost, 'reg.exe', ['query', hive, '/s'], 30000, getGlobalCredentials());
-      if (!regRes.success || !regRes.stdout) continue;
-      const apps = parseRegUninstall(regRes.stdout);
-      const match = apps.find(a => a.name && a.name.toLowerCase() === appName.toLowerCase());
-      if (match) {
-        uninstallCmd = match.quietUninstallString || match.uninstallString;
-        if (uninstallCmd) { foundKey = hive; break; }
-      }
-    }
-
-    if (!uninstallCmd) {
-      // 2. Fallback: try wmic product uninstall
-      const productRes = await wmic.runRemote(fqHost, 'product', 'name,IdentifyingNumber', 30000, getGlobalCredentials());
-      if (productRes.success && productRes.records) {
-        const match = productRes.records.find(r => (r.Name || r.name || '').toLowerCase() === appName.toLowerCase());
-        if (match) {
-          const guid = match.IdentifyingNumber || match.identifyingNumber || '';
-          if (guid) {
-            uninstallCmd = `msiexec.exe /x ${guid} /quiet /norestart`;
-            foundKey = 'wmic';
-          }
-        }
-      }
-      if (!uninstallCmd) {
-        return res.json({ success: false, error: `Could not find uninstall information for "${appName}"` });
-      }
-    }
-
-    // 3. Execute the uninstall command via PsExec
-    const cmdResult = await pstools.runPsExec(fqHost, 'cmd.exe', ['/c', uninstallCmd], 60000, getGlobalCredentials());
-
-    audit.add(db, { actionType: 'apps.uninstall', targetHost: safeHost, tool: 'psexec', command: `Uninstall "${appName}" via ${foundKey}`, success: cmdResult.success, durationMs: Date.now() - startTime, outputSummary: cmdResult.success ? 'Uninstall initiated' : cmdResult.stderr || 'Uninstall failed', initiatedBy: 'admin', initiatedFrom });
-    res.json({ success: cmdResult.success, message: cmdResult.success ? `Uninstall initiated for "${appName}"` : (cmdResult.stderr || 'Uninstall command failed'), output: cmdResult.stdout || '' });
-  } catch (e) {
-    audit.add(db, { actionType: 'apps.uninstall', targetHost: safeHost, tool: 'psexec', command: `Uninstall "${appName}"`, success: false, durationMs: Date.now() - startTime, errorReason: e.message, initiatedBy: 'admin', initiatedFrom });
-    res.json({ success: false, error: e.message });
-  }
-});
-
 // ==========================================================================
 // HARDWARE AUDIT — Multi-method scan with PRIORITY ORDER:
-//   1st: PsTools  (psinfo + psloggedon)        — PRIMARY, works without WinRM
-//   2nd: PowerShell (via PsExec)                — extra data (motherboard, BIOS, RAM)
-//   2b: systeminfo.exe over RPC                 — bypasses UAC/Admin$ (NO SMB needed)
-//   2c: wmic /node:HOST over DCOM/RPC           — fills gaps: RAM sticks, disks, GPU
-//   3rd: WinRM    (Invoke-Command)              — extra data if WinRM is available
-//   4th: wmic     (via PsExec)                  — fallback for any remaining gaps
+//   1st: PsTools  (psinfo + psloggedon)  — PRIMARY, works without WinRM
+//   2nd: PowerShell (via PsExec)          — extra data (motherboard, BIOS, RAM details)
+//   3rd: WinRM    (Invoke-Command)        — extra data if WinRM is available
+//   4th: wmic     (via PsExec)            — fallback for any remaining gaps
 //
-// PsTools provides (PRIMARY):
+// PsTools provides (PRIMARY — don't change this working code):
 //   - System: manufacturer, model, type, total RAM, domain
 //   - OS: name, version, build, install date, registered user/org
 //   - Processor: name, speed, count
@@ -2451,375 +1666,399 @@ app.post('/api/hosts/:hostname/apps/uninstall', async (req, res) => {
 //   - Motherboard: manufacturer, product, version, serial
 //   - BIOS: manufacturer, version, serial, release date
 //   - CPU: cores, threads, socket
-//   - RAM sticks: capacity, speed, manufacturer, part number
+//   - RAM sticks: capacity, speed, manufacturer, part number (per-stick)
 //   - Physical disks: model, size, interface, serial number
 //   - GPU: VRAM, driver version
 //
-// systeminfo.exe fills these GAPS (2b priority, RPC-based — no Admin$):
-//   - System: manufacturer, model, type, domain, RAM
-//   - OS: name, version, install date, registered user/org
-//   - BIOS: version, release date, manufacturer
-//   - Processor: name, speed
-//   - Hotfixes: KB numbers
-//   - Network: IP, DHCP gateway
+// WinRM fills these GAPS (3rd priority, if WinRM available):
+//   - Network adapters: IP, MAC, DHCP, gateway, DNS
 //
-// wmic DCOM fills these GAPS (2c priority, DCOM/RPC — no Admin$):
-//   - Motherboard: manufacturer, product, version, serial
-//   - Individual RAM sticks: capacity, speed, manufacturer, part number
-//   - Physical disks: model, size, interface, serial number
-//   - Logical volumes: drive letters, size, free, filesystem
-//   - GPU: name, adapter, VRAM, driver version
-//   - Network: MAC addresses, full adapter details
+// wmic fills these GAPS (4th priority, last resort):
+//   - Any data the above methods couldn't retrieve
 //
 // All commands are logged with error reasons (which service failed, how to fix)
 // ==========================================================================
-
-// ==========================================================================
-// Shared hardware scan — used by both POST endpoint and queue step
-// ==========================================================================
-async function scanHardware(safeHost, fqHost, hwCred) {
+app.post('/api/hosts/:hostname/hardware', async (req, res) => {
+  const safeHost = sanitizeHost(req.params.hostname);
   const results = {
     hostname: safeHost,
     scannedAt: new Date().toISOString(),
-    hwVersion: 4,
     system: {}, motherboard: {}, bios: {}, processor: null,
     memory: [], disks: [], logicalDisks: [], network: [], gpu: [],
-    os: {}, hotfixes: [], software: [], loggedInUser: null, userProfilePath: null,
-    osDisplayVersion: null, osUBR: null, opticalDrives: [], soundDevices: [],
-    physicalNetworks: [], formattedSummary: null,
-    methods: {},
-    errors: [],
+    os: {}, hotfixes: [], software: [], loggedInUser: null,
+    methods: {},  // Track which method provided each section
+    errors: [],   // Collect error reasons for failed commands
   };
 
-  // PRIORITY 1: WinAudit — standalone EXE, works on ALL Windows versions
-  // Copies to target via PsExec -c, runs locally, produces CSV we read back
-  const winAuditPath = path.join(__dirname, 'Tools', 'WinAudit_3_4_6.exe');
-  if (fs.existsSync(winAuditPath)) {
-    try {
-      const waRemoteCsv = `C:\\Windows\\Temp\\shl_audit_${safeHost}.csv`;
-      const waExe = path.join(PSTOOLS_PATH, 'psexec.exe');
-      const credArgs = require('./lib/utils').credentialArgs || ((c, h) => c ? ['-u', (c.domain ? c.domain + '\\' : '') + c.username, '-p', c.password] : []);
+  // Log the audit entry — who initiated, from where, when
+  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
+  const scanStartTime = Date.now();
 
-      // Step 1: Run WinAudit on target
-      const waRunArgs = ['-accepteula', '\\\\' + fqHost,
-        ...credArgs(hwCred, fqHost),
-        '-s', '-h', '-c', winAuditPath,
-        '/r=a', `/o:${waRemoteCsv}`, '/f=CSV'];
+  try {
+    // ========================================================================
+    // PRIORITY 1: PsTools (PsInfo + PsLoggedOn) — PRIMARY, don't break this
+    // ========================================================================
+    const [psinfoRes, loggedOnRes] = await Promise.all([
+      pstools.runPsInfo(safeHost, ['-d', '-h', '-s', '-c']),
+      pstools.runPsLoggedOn(safeHost),
+    ]);
 
-      const waRunResult = await new Promise((resolve) => {
-        const proc = require('child_process').spawn(waExe, waRunArgs, { windowsHide: true, timeout: 120000 });
-        let out = ''; proc.stdout.on('data', d => out += d.toString());
-        proc.stderr.on('data', d => out += d.toString());
-        proc.on('close', code => resolve({ success: code === 0, stdout: out }));
-        proc.on('error', err => resolve({ success: false, stdout: err.message }));
-        setTimeout(() => { try { proc.kill(); } catch {} }, 125000);
-      });
+    // Parse PsInfo output (it's a single comma-delimited line with -c flag)
+    if (psinfoRes.success && psinfoRes.stdout) {
+      results.methods.psinfo = 'success';
+      const tokens = psinfoRes.stdout.split(/[\n,]/).map(t => t.trim()).filter(Boolean);
 
-      if (waRunResult.success) {
-        results.methods.winaudit = 'success';
+      // Known product types — used to detect if kernel version spanned 2 tokens
+      const knownProductTypes = ['Professional', 'Server', 'Enterprise', 'Education', 'Home', 'Workstation', 'Standard', 'Datacenter', 'Essentials'];
 
-        // Step 2: Read CSV back via PsExec
-        const waReadResult = await pstools.runPsExec(fqHost, 'cmd.exe', ['/c', `type ${waRemoteCsv}`], 30000, hwCred);
+      let i = 0;
+      const sys = {};
+      sys.hostname = tokens[i++] || '';
+      sys.uptime = tokens[i++] || '';
 
-        if (waReadResult.success && waReadResult.stdout) {
-          const csvLines = waReadResult.stdout.split('\n').filter(l => l.trim());
-          if (csvLines.length >= 2) {
-            const headers = csvLines[0].split(',').map(h => h.trim().toLowerCase());
-            const data = csvLines[1].split(',').map(d => d.trim());
+      // Kernel version may span 2 tokens if it contains a comma
+      let kernelVersion = tokens[i++] || '';
+      if (i < tokens.length) {
+        const nextToken = tokens[i] || '';
+        const isProductType = knownProductTypes.some(pt => nextToken.toLowerCase() === pt.toLowerCase());
+        if (!isProductType && nextToken !== '') kernelVersion += ', ' + tokens[i++];
+      }
+      sys.kernelVersion = kernelVersion;
 
-            const get = (name) => {
-              const idx = headers.indexOf(name.toLowerCase());
-              return idx >= 0 ? data[idx] || null : null;
-            };
+      sys.productType = tokens[i++] || '';
+      sys.productVersion = tokens[i++] || '';
+      sys.servicePack = tokens[i++] || '';
+      sys.kernelBuild = tokens[i++] || '';
+      sys.registeredOrg = tokens[i++] || '';
+      sys.registeredOwner = tokens[i++] || '';
+      sys.ieVersion = tokens[i++] || '';
+      sys.systemRoot = tokens[i++] || '';
+      sys.processors = tokens[i++] || '';
+      sys.processorSpeed = tokens[i++] || '';
+      sys.processorType = tokens[i++] || '';
+      sys.physicalMemory = tokens[i++] || '';
+      sys.videoDriver = tokens[i++] || '';
 
-            const osName = get('os name') || get('os');
-            if (osName) { results.os.name = osName; results.os.version = get('os version') || ''; results.os.build = get('os build') || ''; }
-            const manufacturer = get('manufacturer') || get('system manufacturer');
-            if (manufacturer) { results.system.manufacturer = manufacturer; results.system.model = get('model') || get('system model') || ''; }
-            const serial = get('serial number') || get('system serial number');
-            if (serial) results.system.serial = serial;
-            const uuid = get('uuid');
-            if (uuid) results.uuid = uuid;
-            const chassis = get('chassis') || get('chassis type');
-            if (chassis) { results.chassisType = chassis; results.chassisTypeName = chassis; }
-            const biosVendor = get('bios vendor') || get('bios manufacturer');
-            if (biosVendor) results.bios = { vendor: biosVendor, version: get('bios version') || '' };
-            const cpuName = get('processor') || get('cpu');
-            if (cpuName) results.processor = { name: cpuName, cores: parseInt(get('cores')) || 0, threads: parseInt(get('threads')) || 0, socket: get('socket') || '' };
-            const totalRam = get('total physical memory') || get('total ram') || get('ram');
-            if (totalRam) { const mb = parseInt(totalRam) || Math.round(parseFloat(totalRam) * 1024); if (mb > 0) results.system.totalRamMB = mb; }
-            const loggedIn = get('logged on user') || get('current user');
-            if (loggedIn) results.loggedInUser = loggedIn;
-            const ipAddr = get('ip address') || get('ip');
-            if (ipAddr && results.network.length === 0) results.network = [{ description: 'WinAudit', ipAddress: ipAddr, macAddress: '', defaultGateway: '', dhcpEnabled: false }];
+      // Parse system info from PsInfo
+      const ramMatch = /(\d+)\s*(MB|GB|TB)/i.exec(sys.physicalMemory || '');
+      let totalRamMB = 0;
+      if (ramMatch) {
+        const n = parseInt(ramMatch[1], 10);
+        const u = ramMatch[2].toUpperCase();
+        totalRamMB = u === 'GB' ? n * 1024 : u === 'TB' ? n * 1024 * 1024 : n;
+      }
 
-            results.rawOutputs = results.rawOutputs || {};
-            results.rawOutputs.winaudit = waReadResult.stdout.substring(0, 5000);
+      const speedMatch = /([\d.]+)\s*GHz/i.exec(sys.processorSpeed || '');
+      const maxSpeedMHz = speedMatch ? Math.round(parseFloat(speedMatch[1]) * 1000) : 0;
+
+      let cpuManufacturer = '';
+      if (/Intel/i.test(sys.processorType)) cpuManufacturer = 'Intel';
+      else if (/AMD|Advanced Micro/i.test(sys.processorType)) cpuManufacturer = 'AMD';
+
+      results.system = {
+        manufacturer: '',  // PsInfo doesn't provide this
+        model: '',         // PsInfo doesn't provide this
+        serial: '',        // PsInfo doesn't provide this
+        systemType: '',
+        domain: '',
+        totalRamMB,
+      };
+
+      results.processor = sys.processorType ? {
+        name: sys.processorType,
+        manufacturer: cpuManufacturer,
+        cores: 0,   // PsInfo doesn't provide core count — filled by PowerShell/wmic below
+        threads: parseInt(sys.processors || '0', 10),
+        maxSpeedMHz,
+        currentSpeedMHz: maxSpeedMHz,
+        socket: '',
+        socketCount: 1,
+      } : null;
+
+      results.os = {
+        name: sys.kernelVersion || '',
+        version: sys.productVersion || '',
+        build: sys.kernelBuild || '',
+        architecture: '',
+        installDate: '',
+        lastBoot: '',
+        serial: '',
+        registeredOrg: sys.registeredOrg || '',
+        registeredUser: sys.registeredOwner || '',
+      };
+
+      // Parse disk volumes from PsInfo tokens
+      const logicalDisks = [];
+      while (i < tokens.length && /^[A-Z]:$/i.test(tokens[i])) {
+        const drive = tokens[i++];
+        const type = tokens[i++] || '';
+        const format = tokens[i++] || '';
+        const label = tokens[i++] || '';
+        const size = tokens[i++] || '';
+        const free = tokens[i++] || '';
+        i++; // skip free%
+        const sizeMatch = /([\d.]+)\s*(GB|MB|TB)/i.exec(size);
+        const freeMatch = /([\d.]+)\s*(GB|MB|TB)/i.exec(free);
+        let sizeGB = 0, freeGB = 0;
+        if (sizeMatch) { const n = parseFloat(sizeMatch[1]); const u = sizeMatch[2].toUpperCase(); sizeGB = u === 'TB' ? n * 1024 : n; }
+        if (freeMatch) { const n = parseFloat(freeMatch[1]); const u = freeMatch[2].toUpperCase(); freeGB = u === 'TB' ? n * 1024 : n; }
+        logicalDisks.push({ drive, sizeGB: Math.round(sizeGB * 100) / 100, freeGB: Math.round(freeGB * 100) / 100, fileSystem: format, volumeName: label });
+      }
+      results.logicalDisks = logicalDisks;
+
+      // Parse GPU from PsInfo
+      if (sys.videoDriver) {
+        results.gpu = sys.videoDriver.split(/[,;]/).map(s => s.trim()).filter(Boolean).map(name => ({
+          name, manufacturer: '', ramMB: 0, driverVersion: '', driverDate: '',
+        }));
+      }
+
+      // Parse hotfixes and software from remaining tokens
+      let foundSoftware = false;
+      for (; i < tokens.length; i++) {
+        const token = tokens[i].trim();
+        if (!token) continue;
+        const kbMatch = token.match(/KB\d+/i);
+        if (kbMatch && !foundSoftware) {
+          results.hotfixes.push(kbMatch[0].toUpperCase());
+        } else if (!foundSoftware && /^n\/a/i.test(token)) {
+          continue;
+        } else {
+          foundSoftware = true;
+          if (!results.hotfixes.includes(token)) {
+            results.software.push({ name: token });
           }
         }
-
-        // Step 3: Cleanup temp file
-        pstools.runPsExec(fqHost, 'cmd.exe', ['/c', `del ${waRemoteCsv}`], 10000, hwCred).catch(() => {});
-      } else {
-        results.methods.winaudit = 'failed';
-        results.errors.push({ priority: 1, method: 'WinAudit', reason: waRunResult.stdout?.substring(0, 200) || 'Unknown error' });
       }
-    } catch (e) {
-      results.methods.winaudit = 'failed';
-      results.errors.push({ priority: 1, method: 'WinAudit', reason: e.message });
+    } else if (psinfoRes.reason) {
+      results.methods.psinfo = 'failed';
+      results.errors.push({ priority: 1, method: 'PsInfo', ...psinfoRes });
     }
-  }
 
-  // PRIORITY 2: PsExec + PowerShell (remote OS, GPU, disks, network)
-  // Three scripts to fit PsExec's ~700-byte stdout pipe buffer.
-  // Script A: critical (OS, system, UUID, chassis, BIOS, CPU)
-  // Script B: hardware (motherboard, memory, disks, GPU)
-  // Script C: peripherals (net, volumes, DVD, audio, phy nets)
-
-  const _kv = {};
-  function _parsePs(stdout) {
-    if (!stdout) return;
-    for (const raw of stdout.split('\n')) {
-      const line = raw.trim();
-      if (!line || !line.includes('=')) continue;
-      const eqIdx = line.indexOf('=');
-      const key = line.substring(0, eqIdx).trim();
-      const val = line.substring(eqIdx + 1).trim();
-      if (!_kv[key]) { _kv[key] = val; }
-      else if (Array.isArray(_kv[key])) { _kv[key].push(val); }
-      else { _kv[key] = [_kv[key], val]; }
-    }
-  }
-  function _gA(k) { if (!_kv[k]) return []; const v = _kv[k]; return Array.isArray(v) ? v : [v]; }
-  function _p1(k) { const a = _gA(k); return a.length > 0 ? a[0].split('|').map(s => s.trim()) : []; }
-
-  const psA = `$o=@()
-$cs=Get-CimInstance Win32_ComputerSystem;if($cs){$o+=('SYS='+$cs.Manufacturer+'|'+$cs.Model)}
-$os=Get-CimInstance Win32_OperatingSystem;if($os){$dtStr='';$dt=$os.InstallDate;if($dt){try{$dtStr=$dt.ToShortDateString()}catch{$dtStr=''+$dt}};$o+=('OS='+$os.Caption+'|'+$os.OSArchitecture+'|'+$os.Version+'|'+$os.SerialNumber+'|'+$os.BuildNumber+'|'+$dtStr+'|'+$os.RegisteredUser+'|'+$os.RegisteredOrganization)}
-$csp=Get-CimInstance Win32_ComputerSystemProduct;if($csp){$o+=('CSP='+$csp.UUID)}
-$enc=Get-CimInstance Win32_SystemEnclosure;if($enc){$o+=('ENC='+$enc.ChassisTypes[0])}
-$reg=try{Get-ItemProperty "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"}catch{$null};if($reg){$o+=('REG='+$reg.DisplayVersion+'|'+$reg.CurrentBuild+'|'+$reg.UBR)}
-$bios=Get-CimInstance Win32_BIOS;if($bios){$o+=('BIOS='+$bios.Manufacturer+'|'+$bios.SMBIOSBIOSVersion+'|'+$bios.ReleaseDate)}
-$cpu=Get-CimInstance Win32_Processor;if($cpu){$o+=('CPU='+$cpu.Name.Trim()+'|'+$cpu.Manufacturer+'|'+$cpu.NumberOfCores+'|'+$cpu.NumberOfLogicalProcessors)}
-Write-Output ($o -join "\`n")`;
-
-  const psB = `$o=@()
-$u=$env:USERNAME;$o+=('USER='+$u)
-$up=$env:USERPROFILE;$up=$up -replace '\\|','-';if($up){$o+=('UP='+$up)}
-$mb=Get-CimInstance Win32_BaseBoard;if($mb){$o+=('MB='+$mb.Manufacturer+'|'+$mb.Product+'|'+$mb.Version+'|'+$mb.SerialNumber)}
-$mem=@(Get-CimInstance Win32_PhysicalMemory);foreach($m in $mem){$o+=('MEM='+[math]::Round($m.Capacity/1GB,1)+'|'+$m.Manufacturer+'|'+$m.PartNumber+'|'+$m.Speed+'|'+$m.DeviceLocator)}
-$dsk=@(Get-CimInstance Win32_DiskDrive);foreach($d in $dsk){$sn=$d.SerialNumber;$sn="$sn".Trim();$o+=('DISK='+$d.Index+'|'+$d.Model+'|'+[math]::Round($d.Size/1GB,0)+'|'+$d.InterfaceType+'|'+$sn)}
-$gpu=@(Get-CimInstance Win32_VideoController);foreach($g in $gpu){$o+=('GPU='+$g.Name+'|'+$g.AdapterCompatibility+'|'+[math]::Round($g.AdapterRAM/1MB,0)+'|'+$g.DriverVersion)}
-Write-Output ($o -join "\`n")`;
-
-  const psC = `$o=@()
-$net=@(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True");foreach($n in $net){$ips=($n.IPAddress-join',');$gw=($n.DefaultIPGateway-join',');$o+=('NET='+$n.Description+'|'+$ips+'|'+$n.MACAddress+'|'+$gw+'|'+$n.DHCPEnabled)}
-$vol=@(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3");foreach($v in $vol){$o+=('VOL='+$v.DeviceID+'|'+$v.FileSystem+'|'+$v.VolumeName+'|'+[math]::Round($v.Size/1GB,1)+'|'+[math]::Round($v.FreeSpace/1GB,1))}
-$dvd=@(Get-CimInstance Win32_CDROMDrive);if($dvd.Count -gt 0){foreach($d in $dvd){$o+=('DVD='+$d.Drive+'|'+$d.Name)}}else{$o+=('DVD=None')}
-$audio=@(Get-CimInstance Win32_SoundDevice);foreach($a in $audio){$an=""+$a.Name;$an=$an -replace '\\|','-';$o+=('AUD='+$an)}
-$pnet=@(Get-CimInstance Win32_NetworkAdapter -Filter "PhysicalAdapter=True");foreach($p in $pnet){$pn=""+$p.Name;$pn=$pn -replace '\\|','-';$pm=""+$p.MACAddress;$pm=$pm -replace '\\|','-';$o+=('PHYNET='+$pn+'|'+$pm)}
-Write-Output ($o -join "\`n")`;
-
-  const [psRA, psRB, psRC] = await Promise.all([
-    powershell.runRemoteViaPsExec(fqHost, psA, PSTOOLS_PATH, 45000, hwCred),
-    powershell.runRemoteViaPsExec(fqHost, psB, PSTOOLS_PATH, 45000, hwCred),
-    powershell.runRemoteViaPsExec(fqHost, psC, PSTOOLS_PATH, 45000, hwCred),
-  ]);
-
-  if (psRA.success || psRB.success || psRC.success) {
-    results.methods.powershell = 'success';
-    results.rawOutputs = results.rawOutputs || {};
-    results.rawOutputs.powershell = ('' + (psRA.stdout || '') + '\n---B---\n' + (psRB.stdout || '') + '\n---C---\n' + (psRC.stdout || '')).substring(0, 3000);
-    try {
-      _parsePs(psRA.stdout);
-      _parsePs(psRB.stdout);
-      _parsePs(psRC.stdout);
-
-      if (_kv.USER) results.loggedInUser = _kv.USER;
-      const osp = _p1('OS');
-      if (osp[0]) results.os.name = osp[0];
-      if (osp[1]) results.os.architecture = osp[1];
-      if (osp[2]) results.os.version = osp[2];
-      if (osp[3]) results.os.serial = osp[3];
-      if (osp[4]) results.os.build = osp[4];
-      if (osp[5]) results.os.installDate = osp[5];
-      if (osp[6]) results.os.registeredUser = osp[6];
-      if (osp[7] !== undefined) results.os.registeredOrg = osp[7];
-      const sys = _p1('SYS');
-      if (sys[0]) results.system.manufacturer = sys[0];
-      if (sys[1]) results.system.model = sys[1];
-      if (sys[2]) results.system.domain = sys[2];
-      if (sys[3]) results.system.systemType = sys[3];
-      if (_kv.CSP) results.uuid = _kv.CSP;
-      const enc = _p1('ENC');
-      if (enc[0]) {
-        const chassisTypes = ['Other','Unknown','Desktop','Low Profile Desktop','Pizza Box','Mini Tower','Tower','Portable','Laptop','Notebook','Hand Held','Docking Station','All-in-One','Sub Notebook','Space-saving','Lunch Box','Main System Chassis','Expandable Chassis','Rack Mount Chassis','Sealed-case PC','Multi-system','Compact PCI','Advanced TCA','Blade','Blade Enclosure','Tablet','Convertible','Detachable','IoT Gateway','Embedded PC','Mini PC','Stick PC'];
-        const ctNum = parseInt(enc[0]);
-        results.chassisType = enc[0];
-        results.chassisTypeName = (ctNum > 0 && ctNum <= chassisTypes.length) ? chassisTypes[ctNum - 1] : enc[0];
-      }
-      const mbp = _p1('MB');
-      if (mbp[0] || mbp[1]) { results.motherboard = { manufacturer: mbp[0] || '', product: mbp[1] || '', version: mbp[2] || '', serial: mbp[3] || '' }; }
-      const b = _p1('BIOS');
-      if (b[0] || b[1]) { results.bios = { vendor: b[0] || '', manufacturer: b[0] || '', version: b[1] || '', releaseDate: b[2] || '', serial: '' }; }
-      const cp = _p1('CPU');
-      if (cp[0]) { results.processor = { name: cp[0], manufacturer: cp[1] || '', cores: parseInt(cp[2]) || 0, threads: parseInt(cp[3]) || 0, maxSpeedMHz: 0, currentSpeedMHz: 0, socket: '', socketCount: 1, serial: '' }; }
-      const pwMem = _gA('MEM').map(m => { const p = m.split('|').map(s => s.trim()); return { capacityGB: parseFloat(p[0]) || 0, manufacturer: p[1] || '', partNumber: p[2] || '', speed: parseInt(p[3]) || 0, deviceLocator: p[4] || '' }; });
-      if (pwMem.length > 0) results.memory = pwMem;
-      const pwDisks = _gA('DISK').map(d => { const p = d.split('|').map(s => s.trim()); return { index: parseInt(p[0]) || 0, model: p[1] || '', sizeGB: parseFloat(p[2]) || 0, interfaceType: p[3] || '', serialNumber: p[4] || '', partitions: 0 }; });
-      if (pwDisks.length > 0) results.disks = pwDisks;
-      const pwGpu = _gA('GPU').map(g => { const p = g.split('|').map(s => s.trim()); return { name: p[0] || '', manufacturer: p[1] || '', ramMB: parseInt(p[2]) || 0, driverVersion: p[3] || '', driverDate: '' }; });
-      if (pwGpu.length > 0) results.gpu = pwGpu;
-      const pwNet = _gA('NET').map(n => { const p = n.split('|').map(s => s.trim()); return { description: p[0] || '', ipAddress: p[1] || '', macAddress: p[2] || '', defaultGateway: p[3] || '', dhcpEnabled: (p[4] || '') === 'True', dnsServers: '' }; });
-      if (pwNet.length > 0) results.network = pwNet;
-      const pwVol = _gA('VOL').map(v => { const p = v.split('|').map(s => s.trim()); return { drive: p[0] || '', fileSystem: p[1] || '', volumeName: p[2] || '', sizeGB: parseFloat(p[3]) || 0, freeGB: parseFloat(p[4]) || 0 }; });
-      if (pwVol.length > 0) results.logicalDisks = pwVol;
-      const upPath = _p1('UP');
-      if (upPath[0]) results.userProfilePath = upPath[0];
-      const reg = _p1('REG');
-      if (reg[0]) results.osDisplayVersion = reg[0];
-      if (reg[1] && !results.os.build) results.os.build = reg[1];
-      if (reg[2]) results.osUBR = reg[2];
-      const pwDvd = _gA('DVD').filter(d => d !== 'None').map(d => { const p = d.split('|').map(s => s.trim()); return { drive: p[0] || '', name: p[1] || '' }; });
-      if (pwDvd.length > 0) results.opticalDrives = pwDvd;
-      const pwAudio = _gA('AUD').filter(Boolean);
-      if (pwAudio.length > 0) results.soundDevices = pwAudio;
-      const pwPhy = _gA('PHYNET').map(p => { const parts = p.split('|').map(s => s.trim()); return { name: parts[0] || '', macAddress: parts[1] || '' }; });
-      if (pwPhy.length > 0) results.physicalNetworks = pwPhy;
-      if (results.memory.length > 0) { const stickTotalGB = results.memory.reduce((s, m) => s + (m.capacityGB || 0), 0); if (stickTotalGB > 0) results.system.totalRamMB = stickTotalGB * 1024; }
-    } catch (e) {
-      results.errors.push({ priority: 2, method: 'PowerShell', reason: 'Parse error: ' + e.message });
-    }
-  } else {
-    results.methods.powershell = 'failed';
-    const allReasons = [psRA, psRB, psRC].filter(r => r.reason).map(r => r.reason).join('; ');
-    results.errors.push({ priority: 2, method: 'PowerShell', reason: allReasons || 'No output from PowerShell script' });
-  }
-
-  // FALLBACK: wmic (runs on remote via PsExec, no CIM/WinRM needed)
-  // Only runs for fields that are still empty after PowerShell
-  const wmicMissing = [];
-  if (!results.os?.name) wmicMissing.push('OS');
-  if (!results.system?.manufacturer && !results.system?.model) wmicMissing.push('CS');
-  if (!results.bios?.vendor) wmicMissing.push('BIOS');
-  if (!results.motherboard?.manufacturer) wmicMissing.push('BASEBOARD');
-  if (!results.processor?.name) wmicMissing.push('CPU');
-
-  const wmicQueries = {
-    OS: { args: ['OS', 'get', 'Caption,Version,BuildNumber,SerialNumber,InstallDate,RegisteredUser,Organization', '/format:csv'], parser: (lines) => {
-      for (const l of lines) { if (l.includes(',')) { const p = l.split(','); if (p.length >= 2) { results.os.name = results.os.name || p[1]?.trim(); results.os.version = results.os.version || p[2]?.trim(); results.os.build = results.os.build || p[3]?.trim(); results.os.serial = results.os.serial || p[4]?.trim(); if (p[5]) results.os.installDate = p[5].trim(); if (p[6]) results.os.registeredUser = p[6].trim(); if (p[7]) results.os.registeredOrg = p[7].trim(); } } } return results.os.name ? true : false; } },
-    CS: { args: ['COMPUTERSYSTEM', 'get', 'Manufacturer,Model,SystemType', '/format:csv'], parser: (lines) => {
-      for (const l of lines) { if (l.includes(',')) { const p = l.split(','); if (p.length >= 2) { results.system.manufacturer = results.system.manufacturer || p[1]?.trim(); results.system.model = results.system.model || p[2]?.trim(); results.system.systemType = results.system.systemType || p[3]?.trim(); } } } return results.system.manufacturer ? true : false; } },
-    BIOS: { args: ['BIOS', 'get', 'Manufacturer,SMBIOSBIOSVersion,ReleaseDate,SerialNumber', '/format:csv'], parser: (lines) => {
-      for (const l of lines) { if (l.includes(',')) { const p = l.split(','); if (p.length >= 2) { results.bios.vendor = results.bios.vendor || p[1]?.trim(); results.bios.manufacturer = results.bios.manufacturer || p[1]?.trim(); results.bios.version = results.bios.version || p[2]?.trim(); results.bios.releaseDate = results.bios.releaseDate || p[3]?.trim(); results.bios.serial = results.bios.serial || p[4]?.trim(); } } } return results.bios.vendor ? true : false; } },
-    BASEBOARD: { args: ['BASEBOARD', 'get', 'Manufacturer,Product,Version,SerialNumber', '/format:csv'], parser: (lines) => {
-      for (const l of lines) { if (l.includes(',')) { const p = l.split(','); if (p.length >= 2) { results.motherboard.manufacturer = results.motherboard.manufacturer || p[1]?.trim(); results.motherboard.product = results.motherboard.product || p[2]?.trim(); results.motherboard.version = results.motherboard.version || p[3]?.trim(); results.motherboard.serial = results.motherboard.serial || p[4]?.trim(); } } } return results.motherboard.manufacturer ? true : false; } },
-    CPU: { args: ['CPU', 'get', 'Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed', '/format:csv'], parser: (lines) => {
-      for (const l of lines) { if (l.includes(',')) { const p = l.split(','); if (p.length >= 2) { if (!results.processor?.name) results.processor = { name: p[1]?.trim() || '', manufacturer: p[2]?.trim() || '', cores: parseInt(p[3]) || 0, threads: parseInt(p[4]) || 0, maxSpeedMHz: parseInt(p[5]) || 0, currentSpeedMHz: parseInt(p[5]) || 0, socket: '', socketCount: 1, serial: '' }; } } } return results.processor?.name ? true : false; } },
-  };
-
-  for (const key of wmicMissing) {
-    const q = wmicQueries[key];
-    if (!q) continue;
-    try {
-      const res = await pstools.runPsExec(fqHost, 'wmic.exe', q.args, 20000, hwCred);
-      if (res.success && res.stdout) {
-        const lines = res.stdout.split('\n').map(l => l.trim()).filter(Boolean);
-        const ok = q.parser(lines);
-        if (ok) {
-          if (!results.methods.wmic) results.methods.wmic = [];
-          if (Array.isArray(results.methods.wmic)) results.methods.wmic.push(key);
-        }
-      }
-    } catch (e) {
-      results.errors.push({ priority: 2, method: `wmic(${key})`, reason: e.message });
-    }
-  }
-
-  // PRIORITY 3: psloggedon
-  if (!results.loggedInUser) {
-    const loggedOnRes = await pstools.runPsLoggedOn(fqHost, 15000, hwCred);
+    // Parse logged-on user from PsLoggedOn
     if (loggedOnRes.success && loggedOnRes.stdout) {
       results.methods.psloggedon = 'success';
       const userMatch = loggedOnRes.stdout.match(/([A-Za-z0-9._-]+\\[A-Za-z0-9._-]+)/);
       if (userMatch) results.loggedInUser = userMatch[1];
     } else if (loggedOnRes.reason) {
       results.methods.psloggedon = 'failed';
-      results.errors.push({ priority: 3, method: 'PsLoggedOn', ...loggedOnRes });
-    }
-  }
-
-  const hasAnyData = results.system?.manufacturer || results.system?.model || results.system?.totalRamMB ||
-    results.motherboard?.manufacturer || results.motherboard?.product ||
-    results.bios?.manufacturer || results.bios?.version ||
-    results.processor?.name ||
-    results.memory.length > 0 || results.disks.length > 0 || results.logicalDisks.length > 0 ||
-    results.network.length > 0 || results.gpu.length > 0 ||
-    results.os?.name ||
-    results.hotfixes.length > 0 || results.software.length > 0 ||
-    results.loggedInUser;
-
-  return { results, ok: hasAnyData };
-}
-
-// ==========================================================================
-// HARDWARE AUDIT — Multi-method scan with PRIORITY ORDER:
-//   1st: PowerShell (via PsExec)                      — remote OS, GPU, disks, network
-//   2nd: psloggedon (via PsLoggedOn)                  — logged-in user
-//
-// All commands are logged with error reasons (which service failed, how to fix)
-// ==========================================================================
-app.post('/api/hosts/:hostname/hardware', async (req, res) => {
-  const safeHost = sanitizeHost(req.params.hostname);
-  const hwCred = getGlobalCredentials();
-  const fqHost = safeHost.includes('.') ? safeHost : (hwCred?.domain ? safeHost + '.' + hwCred.domain : safeHost);
-  const scanStartTime = Date.now();
-  const initiatedFrom = req.ip || req.connection.remoteAddress || 'unknown';
-  let results = null;
-
-  try {
-    const r = await scanHardware(safeHost, fqHost, hwCred);
-    results = r.results;
-    const ok = r.ok;
-
-    if (!ok) {
-      const firstError = results.errors[0];
-      await audit.add(db, {
-        actionType: 'hardware.scan', targetHost: safeHost, tool: 'multi',
-        command: `Hardware scan on ${safeHost}`, success: false,
-        durationMs: Date.now() - scanStartTime,
-        errorReason: 'No data collected from any method',
-        initiatedBy: 'admin', initiatedFrom,
-        parameters: { methods: results.methods, errorCount: results.errors.length, errors: results.errors },
-      });
-      return res.json({
-        success: false,
-        error: 'No data collected. ' + (firstError?.reason || firstError?.error || 'Target may be offline.'),
-        data: results, methods: results.methods,
-        rawOutputs: results.rawOutputs || {},
-        errorCount: results.errors.length, errors: results.errors,
-      });
+      results.errors.push({ priority: 1, method: 'PsLoggedOn', ...loggedOnRes });
     }
 
+    // ========================================================================
+    // PRIORITY 2: WMIC via PsExec (BatchPatch-style) — fills gaps PsInfo can't
+    // ========================================================================
+    // Uses the EXACT same approach as BatchPatch: psexec \\HOST wmic PATH Win32_* GET
+    // Runs WMIC locally on the target via PsExec/SMB — no DCOM, no WinRM, no ADWS
+    // Uses global domain credentials via PsExec's -u -p flags
+    // ========================================================================
+    const globalCreds = getGlobalCredentials();
+    const [csWmic, bbWmic, biosWmic, cpuWmic, memWmic, diskWmic, gpuWmic, osWmic] = await Promise.all([
+      pstools.runPsExec(safeHost, 'wmic.exe', ['PATH', 'Win32_ComputerSystem', 'GET', 'Manufacturer,Model,SerialNumber,SystemType,Domain,TotalPhysicalMemory', '/format:list'], 20000, globalCreds),
+      pstools.runPsExec(safeHost, 'wmic.exe', ['PATH', 'Win32_BaseBoard', 'GET', 'Manufacturer,Product,Version,SerialNumber', '/format:list'], 20000, globalCreds),
+      pstools.runPsExec(safeHost, 'wmic.exe', ['PATH', 'Win32_BIOS', 'GET', 'Manufacturer,SMBIOSBIOSVersion,SerialNumber,ReleaseDate', '/format:list'], 20000, globalCreds),
+      pstools.runPsExec(safeHost, 'wmic.exe', ['CPU', 'GET', 'Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,SocketDesignation', '/format:list'], 20000, globalCreds),
+      pstools.runPsExec(safeHost, 'wmic.exe', ['PATH', 'Win32_PhysicalMemory', 'GET', 'Capacity,Manufacturer,PartNumber,Speed,DeviceLocator', '/format:list'], 20000, globalCreds),
+      pstools.runPsExec(safeHost, 'wmic.exe', ['PATH', 'Win32_DiskDrive', 'GET', 'Model,Size,InterfaceType,SerialNumber,Partitions', '/format:list'], 20000, globalCreds),
+      pstools.runPsExec(safeHost, 'wmic.exe', ['PATH', 'Win32_VideoController', 'GET', 'Name,AdapterCompatibility,AdapterRAM,DriverVersion', '/format:list'], 20000, globalCreds),
+      pstools.runPsExec(safeHost, 'wmic.exe', ['OS', 'GET', 'Caption,OSArchitecture,InstallDate,LastBootUpTime,SerialNumber', '/format:list'], 20000, globalCreds),
+    ]);
+
+    if (csWmic.success || bbWmic.success || cpuWmic.success) {
+      results.methods.wmic = 'success';
+
+      // Parse ComputerSystem (manufacturer, model, serial, type, domain, RAM)
+      if (csWmic.success && csWmic.stdout) {
+        const csRecords = wmic.parseListOutput(csWmic.stdout);
+        if (csRecords.length > 0) {
+          const cs = csRecords[0];
+          if (cs.Manufacturer) results.system.manufacturer = cs.Manufacturer;
+          if (cs.Model) results.system.model = cs.Model;
+          if (cs.SerialNumber) results.system.serial = cs.SerialNumber;
+          if (cs.SystemType) results.system.systemType = cs.SystemType;
+          if (cs.Domain) results.system.domain = cs.Domain;
+          if (cs.TotalPhysicalMemory) results.system.totalRamMB = Math.round(parseInt(cs.TotalPhysicalMemory) / (1024 * 1024));
+        }
+      }
+
+      // Parse BaseBoard (motherboard)
+      if (bbWmic.success && bbWmic.stdout) {
+        const bbRecords = wmic.parseListOutput(bbWmic.stdout);
+        if (bbRecords.length > 0) {
+          const bb = bbRecords[0];
+          results.motherboard = {
+            manufacturer: bb.Manufacturer || '',
+            product: bb.Product || '',
+            version: bb.Version || '',
+            serial: bb.SerialNumber || '',
+          };
+        }
+      }
+
+      // Parse BIOS
+      if (biosWmic.success && biosWmic.stdout) {
+        const biosRecords = wmic.parseListOutput(biosWmic.stdout);
+        if (biosRecords.length > 0) {
+          const bios = biosRecords[0];
+          results.bios = {
+            manufacturer: bios.Manufacturer || '',
+            version: bios.SMBIOSBIOSVersion || '',
+            serial: bios.SerialNumber || '',
+            releaseDate: bios.ReleaseDate || '',
+          };
+        }
+      }
+
+      // Parse CPU (cores, threads, socket — PsInfo only has name+speed)
+      if (cpuWmic.success && cpuWmic.stdout) {
+        const cpuRecords = wmic.parseListOutput(cpuWmic.stdout);
+        if (cpuRecords.length > 0 && results.processor) {
+          const cpus = cpuRecords;
+          results.processor.cores = cpus.reduce((s, c) => s + parseInt(c.NumberOfCores || '0', 10), 0);
+          results.processor.threads = cpus.reduce((s, c) => s + parseInt(c.NumberOfLogicalProcessors || '0', 10), 0);
+          results.processor.socket = cpus[0].SocketDesignation || '';
+          results.processor.socketCount = cpus.length;
+          if (cpus[0].MaxClockSpeed) results.processor.maxSpeedMHz = parseInt(cpus[0].MaxClockSpeed, 10);
+        }
+      }
+
+      // Parse Physical Memory (RAM sticks)
+      if (memWmic.success && memWmic.stdout) {
+        const memRecords = wmic.parseListOutput(memWmic.stdout);
+        results.memory = memRecords.filter(m => m.Capacity).map(m => ({
+          capacityGB: Math.round(parseInt(m.Capacity) / (1024 * 1024 * 1024) * 10) / 10,
+          manufacturer: m.Manufacturer || '',
+          partNumber: m.PartNumber || '',
+          speed: parseInt(m.Speed || '0', 10),
+          deviceLocator: m.DeviceLocator || '',
+        }));
+      }
+
+      // Parse Physical Disks
+      if (diskWmic.success && diskWmic.stdout) {
+        const diskRecords = wmic.parseListOutput(diskWmic.stdout);
+        results.disks = diskRecords.filter(d => d.Model).map((d, i) => ({
+          model: d.Model || '',
+          sizeGB: Math.round(parseInt(d.Size || '0', 10) / (1024 * 1024 * 1024) * 10) / 10,
+          interface: d.InterfaceType || '',
+          serialNumber: d.SerialNumber || '',
+          partitions: parseInt(d.Partitions || '0', 10),
+        }));
+      }
+
+      // Parse GPU
+      if (gpuWmic.success && gpuWmic.stdout) {
+        const gpuRecords = wmic.parseListOutput(gpuWmic.stdout);
+        const gpus = gpuRecords.filter(g => g.Name);
+        if (gpus.length > 0) {
+          results.gpu = gpus.map(g => ({
+            name: g.Name || '',
+            manufacturer: g.AdapterCompatibility || '',
+            ramMB: Math.round(parseInt(g.AdapterRAM || '0', 10) / (1024 * 1024)),
+            driverVersion: g.DriverVersion || '',
+            driverDate: '',
+          }));
+        }
+      }
+
+      // Parse OS details
+      if (osWmic.success && osWmic.stdout) {
+        const osRecords = wmic.parseListOutput(osWmic.stdout);
+        if (osRecords.length > 0) {
+          const osInfo = osRecords[0];
+          if (osInfo.Caption) results.os.name = osInfo.Caption;
+          if (osInfo.OSArchitecture) results.os.architecture = osInfo.OSArchitecture;
+          if (osInfo.InstallDate) results.os.installDate = osInfo.InstallDate;
+          if (osInfo.LastBootUpTime) results.os.lastBoot = osInfo.LastBootUpTime;
+          if (osInfo.SerialNumber) results.os.serial = osInfo.SerialNumber;
+        }
+      }
+    } else {
+      results.methods.wmic = 'failed';
+      const failedCmd = csWmic.reason || bbWmic.reason || cpuWmic.reason;
+      if (failedCmd) results.errors.push({ priority: 2, method: 'WMIC via PsExec', ...failedCmd });
+    }
+
+    // ========================================================================
+    // PRIORITY 3: WinRM — fills network adapters gap (if WinRM available)
+    // ========================================================================
+    // PsInfo and PowerShell-via-PsExec don't provide network adapter details.
+    // WinRM (Invoke-Command) can get this if WinRM is configured on the target.
+    // ========================================================================
+    const winrmScript = `
+      Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=true" |
+        Select-Object Description,IPAddress,MACAddress,DHCPEnabled,DefaultIPGateway,DNSServerSearchOrder |
+        ConvertTo-Json -Depth 2 -Compress
+    `;
+    const winrmResult = await winrm.runRemote(safeHost, winrmScript, 15000);
+
+    if (winrmResult.success && winrmResult.stdout) {
+      results.methods.winrm = 'success';
+      try {
+        let jsonStr = winrmResult.stdout;
+        const marker = jsonStr.indexOf('<<<JSON>>>');
+        if (marker >= 0) {
+          jsonStr = jsonStr.substring(marker + 9);
+          const endMarker = jsonStr.indexOf('<<<END>>>');
+          if (endMarker >= 0) jsonStr = jsonStr.substring(0, endMarker);
+        }
+        const netData = JSON.parse(jsonStr);
+        const netArr = Array.isArray(netData) ? netData : [netData];
+        results.network = netArr.filter(n => n.IPAddress).map(n => ({
+          description: n.Description || '',
+          ipAddress: Array.isArray(n.IPAddress) ? n.IPAddress.join(', ') : n.IPAddress,
+          macAddress: n.MACAddress || '',
+          dhcpEnabled: n.DHCPEnabled || false,
+          defaultGateway: Array.isArray(n.DefaultIPGateway) ? n.DefaultIPGateway.join(', ') : n.DefaultIPGateway,
+          dnsServers: Array.isArray(n.DNSServerSearchOrder) ? n.DNSServerSearchOrder.join(', ') : n.DNSServerSearchOrder,
+        }));
+      } catch (e) {
+        results.errors.push({ priority: 3, method: 'WinRM', reason: 'JSON parse failed: ' + e.message });
+      }
+    } else if (winrmResult.reason) {
+      results.methods.winrm = 'failed';
+      results.errors.push({ priority: 3, method: 'WinRM', ...winrmResult });
+    }
+
+    // ========================================================================
+    // PRIORITY 4: wmic — last-resort fallback for any remaining gaps
+    // ========================================================================
+    // If network adapters are still empty (WinRM failed), try wmic via PsExec.
+    // Also fills any other gaps the previous methods couldn't provide.
+    // ========================================================================
+    if (results.network.length === 0) {
+      const wmicNetResult = await wmic.runRemoteViaPsExec(safeHost, 'nicconfig', 'Description,IPAddress,MACAddress,DHCPEnabled,DefaultIPGateway,DNSServerSearchOrder', PSTOOLS_PATH, 20000);
+      if (wmicNetResult.success && wmicNetResult.records.length > 0) {
+        results.methods.wmic = 'success';
+        results.network = wmicNetResult.records.filter(n => n.IPAddress).map(n => ({
+          description: n.Description || '',
+          ipAddress: n.IPAddress ? n.IPAddress.replace(/[{}]/g, '') : '',
+          macAddress: n.MACAddress || '',
+          dhcpEnabled: n.DHCPEnabled === 'TRUE',
+          defaultGateway: n.DefaultIPGateway ? n.DefaultIPGateway.replace(/[{}]/g, '') : '',
+          dnsServers: n.DNSServerSearchOrder ? n.DNSServerSearchOrder.replace(/[{}]/g, '') : '',
+        }));
+      } else if (wmicNetResult.reason) {
+        results.methods.wmic = 'failed';
+        results.errors.push({ priority: 4, method: 'wmic (nicconfig)', ...wmicNetResult });
+      }
+    }
+
+    // ========================================================================
     // SAVE — merge with previous data to avoid losing fields on partial scans
+    // ========================================================================
     const key = 'hardware:' + safeHost;
-    let prevHw = null;
-    let finalResult = results;
-    let changes = [];
     try {
       const prev = db.settings.get(key, null);
+      let prevHw = null;
       if (prev) { try { prevHw = JSON.parse(prev); } catch {} }
-      if (prevHw && prevHw.hwVersion >= 2) {
+      let finalResult = results;
+      if (prevHw) {
         finalResult = { ...prevHw, ...results };
-        if (Object.keys(results.system).length > 0 && (results.system.manufacturer || results.system.totalRamMB)) {
-          finalResult.system = { ...prevHw.system, ...results.system };
-        } else { finalResult.system = prevHw.system; }
-        if (Object.keys(results.motherboard).length > 0) {
-          finalResult.motherboard = { ...prevHw.motherboard, ...results.motherboard };
-        } else { finalResult.motherboard = prevHw.motherboard; }
-        if (Object.keys(results.bios).length > 0) {
-          finalResult.bios = { ...prevHw.bios, ...results.bios };
-        } else { finalResult.bios = prevHw.bios; }
+        // For each section, keep new data if non-empty, otherwise preserve old
+        finalResult.system = Object.keys(results.system).length > 0 && (results.system.manufacturer || results.system.totalRamMB) ? { ...prevHw.system, ...results.system } : prevHw.system;
+        finalResult.motherboard = Object.keys(results.motherboard).length > 0 ? { ...prevHw.motherboard, ...results.motherboard } : prevHw.motherboard;
+        finalResult.bios = Object.keys(results.bios).length > 0 ? { ...prevHw.bios, ...results.bios } : prevHw.bios;
         finalResult.processor = results.processor || prevHw.processor;
         finalResult.memory = results.memory.length > 0 ? results.memory : prevHw.memory || [];
         finalResult.disks = results.disks.length > 0 ? results.disks : prevHw.disks || [];
@@ -2829,86 +2068,52 @@ app.post('/api/hosts/:hostname/hardware', async (req, res) => {
         finalResult.os = Object.keys(results.os).length > 0 ? { ...prevHw.os, ...results.os } : prevHw.os;
         finalResult.hotfixes = results.hotfixes.length > 0 ? results.hotfixes : prevHw.hotfixes || [];
         finalResult.software = results.software.length > 0 ? results.software : prevHw.software || [];
-        finalResult.userProfilePath = results.userProfilePath || prevHw.userProfilePath || null;
-        finalResult.osDisplayVersion = results.osDisplayVersion || prevHw.osDisplayVersion || null;
-        finalResult.osUBR = results.osUBR || prevHw.osUBR || null;
-        finalResult.opticalDrives = results.opticalDrives.length > 0 ? results.opticalDrives : prevHw.opticalDrives || [];
-        finalResult.soundDevices = results.soundDevices.length > 0 ? results.soundDevices : prevHw.soundDevices || [];
-        finalResult.physicalNetworks = results.physicalNetworks.length > 0 ? results.physicalNetworks : prevHw.physicalNetworks || [];
-        finalResult.formattedSummary = results.formattedSummary || prevHw.formattedSummary || null;
-        finalResult.uuid = results.uuid || prevHw.uuid || null;
-        finalResult.chassisType = results.chassisType || prevHw.chassisType || null;
-        finalResult.chassisTypeName = results.chassisTypeName || prevHw.chassisTypeName || null;
-        finalResult.formFactor = results.formFactor || prevHw.formFactor || null;
       }
-      finalResult.methods = results.methods;
-      finalResult.errors = results.errors;
-      finalResult.rawOutputs = results.rawOutputs;
       db.settings.set(key, JSON.stringify(finalResult));
     } catch {}
 
-    // UPDATE HOST RECORD
-    try {
-      const hostFields = {};
-      if (finalResult.os?.name) hostFields.os = finalResult.os.name;
-      if (finalResult.os?.version) hostFields.os_version = finalResult.os.version;
-      if (finalResult.os?.build) hostFields.build = String(finalResult.os.build);
-      if (finalResult.processor?.name) hostFields.cpu = finalResult.processor.name;
-      if (finalResult.system?.totalRamMB) hostFields.ram = finalResult.system.totalRamMB;
-      if (finalResult.network?.[0]?.ipAddress) hostFields.ip_address = finalResult.network[0].ipAddress;
-      if (finalResult.network?.[0]?.macAddress) hostFields.mac_address = finalResult.network[0].macAddress;
-      if (finalResult.system?.manufacturer) hostFields.manufacturer = finalResult.system.manufacturer;
-      if (finalResult.system?.model) hostFields.model = finalResult.system.model;
-      if (finalResult.system?.serial) hostFields.serial = finalResult.system.serial;
-      if (finalResult.loggedInUser) hostFields.logged_on_user = finalResult.loggedInUser;
-      if (prevHw && prevHw.hwVersion >= 2) {
-        const toTrack = [
-          { field: 'OS', old: prevHw.os?.name, new: finalResult.os?.name },
-          { field: 'OS Build', old: prevHw.os?.build, new: finalResult.os?.build },
-          { field: 'CPU', old: prevHw.processor?.name, new: finalResult.processor?.name },
-          { field: 'RAM (MB)', old: prevHw.system?.totalRamMB, new: finalResult.system?.totalRamMB },
-          { field: 'IP Address', old: prevHw.network?.[0]?.ipAddress, new: finalResult.network?.[0]?.ipAddress },
-          { field: 'MAC Address', old: prevHw.network?.[0]?.macAddress, new: finalResult.network?.[0]?.macAddress },
-          { field: 'Manufacturer', old: prevHw.system?.manufacturer, new: finalResult.system?.manufacturer },
-          { field: 'Model', old: prevHw.system?.model, new: finalResult.system?.model },
-          { field: 'Serial', old: prevHw.system?.serial, new: finalResult.system?.serial },
-        ];
-        changes = toTrack.filter(t => String(t.old || '') !== String(t.new || ''));
-      }
-      if (Object.keys(hostFields).length > 0) {
-        const hostId = db.hosts.getIdByHostname(safeHost);
-        if (hostId) {
-          hostFields.online_status = 'online';
-          hostFields.last_seen = new Date().toISOString();
-          db.hosts.update(hostId, hostFields);
-        }
-      }
-    } catch (e) { /* non-critical */ }
-
-    // AUDIT LOG
+    // ========================================================================
+    // AUDIT LOG — record this hardware scan
+    // ========================================================================
     const scanDuration = Date.now() - scanStartTime;
     const methodSummary = Object.entries(results.methods).map(([k, v]) => `${k}:${v}`).join(', ');
-    await audit.add(db, {
-      actionType: 'hardware.scan', targetHost: safeHost,       tool: 'powershell (psexec)',
-      command: `Hardware scan on ${safeHost}`, success: true,
+    audit.add(db, {
+      actionType: 'hardware.scan',
+      targetHost: safeHost,
+      tool: 'multi (psinfo+powershell+winrm+wmic)',
+      command: `Hardware scan on ${safeHost}`,
+      success: true,
       durationMs: scanDuration,
       outputSummary: `Methods: ${methodSummary}. Found: ${results.logicalDisks.length} volumes, ${results.disks.length} disks, ${results.memory.length} RAM sticks, ${results.gpu.length} GPU(s)`,
-      initiatedBy: 'admin', initiatedFrom,
-      parameters: { methods: results.methods, errorCount: results.errors.length, errors: results.errors, changes: changes.length > 0 ? changes : undefined },
+      initiatedBy: 'admin',
+      initiatedFrom,
+      parameters: {
+        methods: results.methods,
+        errorCount: results.errors.length,
+        errors: results.errors,
+      },
     });
 
     res.json({
-      success: true, data: finalResult, methods: results.methods,
-      rawOutputs: results.rawOutputs || {},
-      errorCount: results.errors.length, errors: results.errors, changes,
+      success: true,
+      data: results,
+      methods: results.methods,
+      errorCount: results.errors.length,
+      errors: results.errors,
     });
 
   } catch (e) {
-    await audit.add(db, {
-      actionType: 'hardware.scan', targetHost: safeHost, tool: 'multi',
-      command: `Hardware scan on ${safeHost}`, success: false,
-      durationMs: Date.now() - scanStartTime, errorReason: e.message,
-      initiatedBy: 'admin', initiatedFrom,
+    // Log the failure
+    audit.add(db, {
+      actionType: 'hardware.scan',
+      targetHost: safeHost,
+      tool: 'multi',
+      command: `Hardware scan on ${safeHost}`,
+      success: false,
+      durationMs: Date.now() - scanStartTime,
+      errorReason: e.message,
+      initiatedBy: 'admin',
+      initiatedFrom,
     });
     res.json({ success: false, error: e.message, data: results });
   }
@@ -2930,21 +2135,19 @@ app.get('/api/hosts/:hostname/hardware', (req, res) => {
   }
 });
 
-// ==========================================================================
-// PSTOOLS SPECIFIC ENDPOINTS — Each wrapped with global credential support
-// for a professional PsTools-first experience.
-// ==========================================================================
 app.post('/api/pstools/psinfo', async (req, res) => {
   const { hostname } = req.body;
   const safeHost = sanitizeHost(hostname);
-  const result = await pstools.runPsInfo(safeHost, ['-d', '-h', '-s', '-c'], 30000, getGlobalCredentials());
+  const cmd = `"${pstoolsExe('psinfo.exe')}" \\\\${safeHost} -accepteula`;
+  const result = await runPowerShell(cmd, 30000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 app.post('/api/pstools/pslist', async (req, res) => {
   const { hostname } = req.body;
   const safeHost = sanitizeHost(hostname);
-  const result = await pstools.runGeneric('pslist', safeHost, [], 30000, getGlobalCredentials());
+  const cmd = `"${pstoolsExe('pslist.exe')}" \\\\${safeHost} -accepteula`;
+  const result = await runPowerShell(cmd, 30000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
@@ -2952,7 +2155,8 @@ app.post('/api/pstools/pskill', async (req, res) => {
   const { hostname, target } = req.body;
   const safeHost = sanitizeHost(hostname);
   const safeTarget = sanitizeHost(target);
-  const result = await pstools.runGeneric('pskill', safeHost, [safeTarget], 15000, getGlobalCredentials());
+  const cmd = `"${pstoolsExe('pskill.exe')}" \\\\${safeHost} ${safeTarget} -accepteula`;
+  const result = await runPowerShell(cmd, 15000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
@@ -2961,15 +2165,16 @@ app.post('/api/pstools/psservice', async (req, res) => {
   const safeHost = sanitizeHost(hostname);
   const safeService = serviceName ? sanitizeHost(serviceName) : '';
   const actionCmd = action && serviceName ? `${action} "${safeService}"` : 'query';
-  const extraArgs = actionCmd.split(/\s+/);
-  const result = await pstools.runGeneric('psservice', safeHost, extraArgs, 30000, getGlobalCredentials());
+  const cmd = `"${pstoolsExe('psservice.exe')}" \\\\${safeHost} ${actionCmd} -accepteula`;
+  const result = await runPowerShell(cmd, 30000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 app.post('/api/pstools/psloggedon', async (req, res) => {
   const { hostname } = req.body;
   const safeHost = sanitizeHost(hostname);
-  const result = await pstools.runPsLoggedOn(safeHost, 15000, getGlobalCredentials());
+  const cmd = `"${pstoolsExe('psloggedon.exe')}" \\\\${safeHost} -accepteula`;
+  const result = await runPowerShell(cmd, 15000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
@@ -2977,23 +2182,25 @@ app.post('/api/pstools/psshutdown', async (req, res) => {
   const { hostname, action, timeout, message } = req.body;
   const safeHost = sanitizeHost(hostname);
   const actionFlag = action === 'shutdown' ? '-s' : action === 'abort' ? '-a' : '-r';
-  const extraArgs = [actionFlag, '-t', String(timeout || 5), '-f'];
-  if (message) extraArgs.push('-m', message.replace(/"/g, ''));
-  const result = await pstools.runGeneric('psshutdown', safeHost, extraArgs, 15000, getGlobalCredentials());
+  const safeMsg = message ? message.replace(/"/g, '`"') : '';
+  const cmd = `"${pstoolsExe('psshutdown.exe')}" \\\\${safeHost} ${actionFlag} -t ${timeout || 5} -c -accepteula ${message ? `-m "${safeMsg}"` : ''}`;
+  const result = await runPowerShell(cmd, 15000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 app.post('/api/pstools/psfile', async (req, res) => {
   const { hostname } = req.body;
   const safeHost = sanitizeHost(hostname);
-  const result = await pstools.runGeneric('psfile', safeHost, [], 15000, getGlobalCredentials());
+  const cmd = `"${pstoolsExe('psfile.exe')}" \\\\${safeHost} -accepteula`;
+  const result = await runPowerShell(cmd, 15000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 app.post('/api/pstools/psgetsid', async (req, res) => {
   const { hostname } = req.body;
   const safeHost = sanitizeHost(hostname);
-  const result = await pstools.runGeneric('psgetsid', safeHost, [], 15000, getGlobalCredentials());
+  const cmd = `"${pstoolsExe('psgetsid.exe')}" \\\\${safeHost} -accepteula`;
+  const result = await runPowerShell(cmd, 15000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
@@ -3001,8 +2208,9 @@ app.post('/api/pstools/pssuspend', async (req, res) => {
   const { hostname, target, action } = req.body;
   const safeHost = sanitizeHost(hostname);
   const safeTarget = sanitizeHost(target);
-  const extraArgs = action === 'resume' ? ['-r', safeTarget] : [safeTarget];
-  const result = await pstools.runGeneric('pssuspend', safeHost, extraArgs, 15000, getGlobalCredentials());
+  const actionFlag = action === 'resume' ? '-r' : '';
+  const cmd = `"${pstoolsExe('pssuspend.exe')}" ${actionFlag} \\\\${safeHost} ${safeTarget} -accepteula`;
+  const result = await runPowerShell(cmd, 15000);
   res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
@@ -3011,28 +2219,33 @@ app.post('/api/pstools/pssuspend', async (req, res) => {
 // ==========================================================================
 app.post('/api/hosts/:hostname/eventlog', async (req, res) => {
   const { hostname } = req.params;
-  const { logName = 'System', maxEvents = 50, severity } = req.body;
+  const { logName = 'System', maxEvents = 50, severity, credential } = req.body;
   const safeHost = sanitizeHost(hostname);
   const safeLog = String(logName).replace(/[^a-zA-Z0-9]/g, '');
   const safeMax = Math.min(parseInt(maxEvents, 10) || 50, 500);
+  const credBlock = credential ? buildCredentialBlock(credential) : '';
+
+  // Severity filter: All, Error, Warning, Information
   let levelFilter = '';
   if (severity === 'Error') levelFilter = '-Level 2';
   else if (severity === 'Warning') levelFilter = '-Level 3';
   else if (severity === 'Information') levelFilter = '-Level 4';
 
   const script = `
-    $ErrorActionPreference = 'SilentlyContinue'
+    ${credBlock}
     try {
-      $events = Get-WinEvent -FilterHashtable @{ LogName = '${safeLog}'; StartTime = (Get-Date).AddDays(-7) } ${levelFilter} -MaxEvents ${safeMax} -ErrorAction SilentlyContinue
+      $params = @{ ComputerName = '${safeHost}'; ErrorAction = 'Stop' }
+      ${credential ? '$params.Credential = $cred' : ''}
+      $events = Get-WinEvent -FilterHashtable @{ LogName = '${safeLog}'; StartTime = (Get-Date).AddDays(-7) } ${levelFilter} -MaxEvents ${safeMax} @params -ErrorAction SilentlyContinue
       if (-not $events) { $events = @() }
-      $results = $events | Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message
-      Write-Output ('<<<JSON>>>' + ($results | ConvertTo-Json -Depth 3 -Compress) + '<<<END>>>')
+      $results = $events | Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message | ConvertTo-Json -Depth 3 -Compress
+      $results
     } catch {
-      Write-Output ('<<<JSON>>>{"error":"' + ($_.Exception.Message -replace '"','') + '","events":[]}<<<END>>>')
+      @{ error = $_.Exception.Message; events = @() } | ConvertTo-Json -Compress
     }
   `;
-  const result = await runRemotePowerShellJson(safeHost, script, 30000);
-  res.json({ success: result.success, data: JSON.stringify(result.json?.error ? [] : result.json), error: result.json?.error || result.stderr });
+  const result = await runPowerShell(script, 30000);
+  res.json({ success: result.success, data: result.stdout, error: result.stderr });
 });
 
 // ==========================================================================
@@ -3046,7 +2259,6 @@ app.post('/api/remote/connect', async (req, res) => {
     if (protocol === 'VNC') {
       // Try common VNC viewer paths
       const candidates = [
-        path.join(__dirname, 'Tools', 'vncviewer.exe'),
         'C:\\Program Files\\RealVNC\\VNC Viewer\\vncviewer.exe',
         'C:\\Program Files\\TightVNC\\tvnviewer.exe',
         'C:\\Program Files\\TigerVNC\\vncviewer.exe',
@@ -3074,130 +2286,6 @@ app.post('/api/remote/connect', async (req, res) => {
 });
 
 // ==========================================================================
-// DNS RESOLVE — Resolve hostname to IP or IP to hostname
-// Uses Node.js DNS first, then falls back to Windows full resolver
-// (includes NetBIOS / LLMNR / DNS / hosts file — not just PTR)
-// ==========================================================================
-app.post('/api/dns/resolve', async (req, res) => {
-  const { hostname, ip } = req.body;
-  const dns = require('dns');
-  dns.setServers([]); // use system defaults
-
-  if (hostname) {
-    try {
-      const addresses = await new Promise((resolve, reject) => {
-        dns.resolve4(hostname, (err, addrs) => {
-          if (err) return reject(err);
-          resolve(addrs);
-        });
-      });
-      res.json({ success: true, data: { hostname, ips: addresses, ip: addresses[0] || '' } });
-    } catch (e) {
-      // Windows fallback for forward lookup
-      try {
-        const ps = await runPowerShell(`
-          $ErrorActionPreference = 'SilentlyContinue'
-          try { $h = [System.Net.Dns]::GetHostEntry('${hostname}'); Write-Output $h.AddressList[0].IPAddressToString } catch {}
-        `, 5000);
-        if (ps.stdout && ps.stdout.trim()) {
-          res.json({ success: true, data: { hostname, ips: [ps.stdout.trim()], ip: ps.stdout.trim() } });
-        } else {
-          res.json({ success: false, error: 'DNS resolve failed for ' + hostname + ': ' + e.message });
-        }
-      } catch {
-        res.json({ success: false, error: 'DNS resolve failed for ' + hostname + ': ' + e.message });
-      }
-    }
-  } else if (ip) {
-    try {
-      const hostnames = await new Promise((resolve, reject) => {
-        dns.reverse(ip, (err, names) => {
-          if (err) return reject(err);
-          resolve(names);
-        });
-      });
-      res.json({ success: true, data: { ip, hostnames, hostname: hostnames[0] || '' } });
-    } catch (e) {
-      // Windows fallback for reverse lookup (includes NetBIOS/LLMNR)
-      try {
-        const ps = await runPowerShell(`
-          $ErrorActionPreference = 'SilentlyContinue'
-          try { $h = [System.Net.Dns]::GetHostEntry('${ip}'); Write-Output $h.HostName } catch {}
-        `, 5000);
-        if (ps.stdout && ps.stdout.trim()) {
-          res.json({ success: true, data: { ip, hostnames: [ps.stdout.trim()], hostname: ps.stdout.trim() } });
-        } else {
-          res.json({ success: false, error: 'Reverse DNS failed for ' + ip + ': ' + e.message });
-        }
-      } catch {
-        res.json({ success: false, error: 'Reverse DNS failed for ' + ip + ': ' + e.message });
-      }
-    }
-  } else {
-    res.json({ success: false, error: 'Provide hostname or ip' });
-  }
-});
-
-// Bulk DNS resolve — resolve a list of hostnames and/or IPs in parallel
-// Uses Node.js DNS first, then falls back to Windows full resolver for failures
-app.post('/api/dns/bulk-resolve', async (req, res) => {
-  const { items } = req.body;
-  if (!Array.isArray(items)) return res.json({ success: false, error: 'items array required' });
-  const dns = require('dns');
-  const results = await Promise.all(items.map(item => new Promise(resolveItem => {
-    if (item.hostname && !item.ip) {
-      dns.resolve4(item.hostname, (err, addrs) => {
-        if (err) resolveItem({ ...item, ip: '', resolveError: err.code || 'FAILED' });
-        else resolveItem({ ...item, ip: addrs[0] || '', ips: addrs });
-      });
-    } else if (item.ip && !item.hostname) {
-      dns.reverse(item.ip, (err, names) => {
-        if (err) resolveItem({ ...item, hostname: '', resolveError: err.code || 'FAILED' });
-        else resolveItem({ ...item, hostname: names[0] || '' });
-      });
-    } else {
-      resolveItem(item);
-    }
-  })));
-
-  // Windows fallback for reverse lookups that failed (no PTR records)
-  const failedReverse = results.filter(r => r.ip && !r.hostname && r.resolveError);
-  if (failedReverse.length > 0) {
-    try {
-      const ipList = failedReverse.map(r => "'" + r.ip + "'").join(',');
-      const psScript = `
-        $ErrorActionPreference = 'SilentlyContinue'
-        $ips = @(${ipList})
-        $out = @()
-        foreach ($ip in $ips) {
-          try {
-            $h = [System.Net.Dns]::GetHostEntry($ip)
-            $out += @{ ip = $ip; hostname = if ($h.HostName) { $h.HostName } else { '' } }
-          } catch { $out += @{ ip = $ip; hostname = '' } }
-        }
-        Write-Output ('<<<JSON>>>' + ($out | ConvertTo-Json -Compress) + '<<<END>>>')
-      `;
-      const psResult = await runPowerShell(psScript, 30000);
-      const markerMatch = /<<<JSON>>>([\s\S]*?)<<<END>>>/.exec(psResult.stdout || '');
-      if (markerMatch) {
-        try {
-          const resolved = JSON.parse(markerMatch[1]);
-          if (Array.isArray(resolved)) {
-            const lookup = {};
-            resolved.forEach(item => { if (item.hostname) lookup[item.ip] = item.hostname; });
-            results.forEach(r => {
-              if (lookup[r.ip] && !r.hostname) { r.hostname = lookup[r.ip]; delete r.resolveError; }
-            });
-          }
-        } catch {}
-      }
-    } catch {}
-  }
-
-  res.json({ success: true, data: results });
-});
-
-// ==========================================================================
 // WEBSOCKET — Real-time job progress updates
 // ==========================================================================
 const wss = new WebSocketServer({ server, path: '/ws' });
@@ -3212,12 +2300,80 @@ wss.on('connection', (ws) => {
         ws._subscribedJobs = ws._subscribedJobs || new Set();
         ws._subscribedJobs.add(data.jobId);
       }
+      // ---- Terminal command execution (VSCode-style bottom panel) ----
+      // User types a PsTools command in the bottom terminal; it arrives here.
+      // We spawn the process and stream stdout/stderr back via the same WS.
+      if (data.type === 'terminal-run') {
+        const { command, host, sessionId } = data;
+        if (!command) {
+          ws.send(JSON.stringify({ type: 'terminal-error', sessionId, error: 'No command provided' }));
+          return;
+        }
+        // Parse the command: "psexec \\pc-01 cmd" → run psexec.exe with args
+        // Also support shorthand: "psinfo pc-01" → expand to "psinfo.exe \\pc-01 -accepteula"
+        const trimmed = String(command).trim();
+        let exe, args;
+        const parts = trimmed.split(/\s+/);
+        const cmd = parts[0].toLowerCase();
+        const toolMap = PSTOOLS_TOOLMAP;
+        if (toolMap[cmd]) {
+          exe = path.join(PSTOOLS_PATH, toolMap[cmd]);
+          // Add -accepteula if not already in args
+          args = parts.slice(1);
+          if (!args.includes('-accepteula')) args.push('-accepteula');
+        } else if (cmd === 'ping' || cmd === 'ping.exe') {
+          exe = 'ping.exe';
+          args = parts.slice(1);
+        } else if (cmd === 'powershell' || cmd === 'ps') {
+          exe = 'powershell.exe';
+          args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', parts.slice(1).join(' ')];
+        } else {
+          // Generic — try to run as-is
+          exe = parts[0];
+          args = parts.slice(1);
+        }
 
+        ws.send(JSON.stringify({ type: 'terminal-output', sessionId, line: `\x1b[36m$ ${trimmed}\x1b[0m\r\n`, stream: 'command' }));
+        const proc = spawn(exe, args, { windowsHide: false, shell: false });
+        ws._terminalProcs = ws._terminalProcs || new Map();
+        ws._terminalProcs.set(sessionId, proc);
+
+        proc.stdout.on('data', (d) => {
+          ws.send(JSON.stringify({ type: 'terminal-output', sessionId, line: d.toString(), stream: 'stdout' }));
+        });
+        proc.stderr.on('data', (d) => {
+          ws.send(JSON.stringify({ type: 'terminal-output', sessionId, line: d.toString(), stream: 'stderr' }));
+        });
+        proc.on('close', (code) => {
+          ws.send(JSON.stringify({ type: 'terminal-output', sessionId, line: `\r\n\x1b[33m[Process exited with code ${code}]\x1b[0m\r\n`, stream: 'exit' }));
+          ws.send(JSON.stringify({ type: 'terminal-complete', sessionId, exitCode: code }));
+          if (ws._terminalProcs) ws._terminalProcs.delete(sessionId);
+          audit.add(db, { actionType: 'terminal.run', targetHost: hostname || 'local', tool: 'terminal', command: trimmed, success: code === 0, outputSummary: `exit=${code}`, initiatedBy: 'admin', initiatedFrom: ws._socket?.remoteAddress || 'unknown' });
+        });
+        proc.on('error', (err) => {
+          ws.send(JSON.stringify({ type: 'terminal-error', sessionId, error: err.message }));
+          if (ws._terminalProcs) ws._terminalProcs.delete(sessionId);
+        });
+      }
+
+      // Kill a running terminal session
+      if (data.type === 'terminal-kill' && ws._terminalProcs) {
+        const proc = ws._terminalProcs.get(data.sessionId);
+        if (proc) {
+          try { proc.kill('SIGTERM'); } catch {}
+          ws._terminalProcs.delete(data.sessionId);
+        }
+      }
     } catch (e) {
       console.error('WS message error:', e.message);
     }
   });
   ws.on('close', () => {
+    // Kill any running terminal processes when client disconnects
+    if (ws._terminalProcs) {
+      ws._terminalProcs.forEach(p => { try { p.kill(); } catch {} });
+      ws._terminalProcs.clear();
+    }
     clients.delete(ws);
   });
   ws.send(JSON.stringify({ type: 'connected', message: 'SupportHubLAN WebSocket connected', serverTime: new Date().toISOString() }));
@@ -3236,15 +2392,6 @@ function broadcastUpdate(data) {
 // ==========================================================================
 // START SERVER
 // ==========================================================================
-// Prevent crash from unhandled rejections/exceptions
-process.on('uncaughtException', (err) => {
-  console.error('[FATAL] Uncaught exception:', err.message);
-  console.error(err.stack);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('[FATAL] Unhandled rejection:', reason);
-});
-
 server.listen(PORT, BIND_ADDRESS, () => {
   const displayIp = BIND_ADDRESS === '0.0.0.0' ? 'localhost' : BIND_ADDRESS;
   console.log(`
@@ -3263,12 +2410,12 @@ server.listen(PORT, BIND_ADDRESS, () => {
 ║                                                                  ║
 ║  This server performs REAL Windows administration:                ║
 ║  • PsTools (PsExec/PsInfo/PsList/PsKill/PsService/PsLoggedOn)    ║
-║  • Windows Updates (PSWindowsUpdate via PsExec on targets)      ║
-║  • Active Directory (.NET DirectorySearcher + LAPS)            ║
+║  • Windows Updates (PSWindowsUpdate)                             ║
+║  • Active Directory (Get-ADComputer + LAPS ms-Mcs-AdmPwd)        ║
 ║  • VNC/RDP launch (vncviewer.exe / mstsc.exe)                    ║
-║  • Software deployment (SMB copy + PsExec execution)             ║
-║  • Power management (PsShutdown + WoL UDP)                         ║
-║  • Network scanner (parallel ping.exe)                           ║
+║  • Software deployment (Copy-Item + Invoke-Command)              ║
+║  • Power management (Restart/Stop-Computer + WoL UDP)            ║
+║  • Network scanner (parallel Test-Connection runspace pool)      ║
 ║  • Job Queue execution with live WebSocket progress              ║
 ║                                                                  ║
 ║  PREREQUISITES:                                                  ║

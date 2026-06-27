@@ -1,0 +1,191 @@
+==============================================================================
+BatchPatch — Extracted Command Reference
+==============================================================================
+All commands extracted from BatchPatch.exe via strings analysis.
+These are the actual commands BatchPatch uses for remote administration.
+
+CREDENTIAL HANDLING:
+  - BatchPatch uses PsExec with -u DOMAIN\user -p password for alternate credentials
+  - Or Integrated Security (runs as the logged-in user who must be admin on targets)
+  - Credentials are passed via command line (may appear in logs — security note)
+  - PsExec syntax: psexec \\HOST -u DOMAIN\user -p password -accepteula -s COMMAND
+
+==============================================================================
+HARDWARE INVENTORY (via WMIC + PsExec)
+==============================================================================
+
+# CPU info
+WMIC CPU get name, caption, maxclockspeed, systemname
+
+# OS info
+WMIC OS GET caption,servicepackmajorversion,version
+
+# BIOS info
+WMIC PATH Win32_BIOS GET caption
+
+# Computer system (model)
+WMIC PATH Win32_ComputerSystem GET model
+
+# Computer system (type)
+WMIC PATH Win32_ComputerSystem GET systemtype
+
+# Disk drive info (all)
+WMIC PATH Win32_LogicalDisk where "drivetype=3" GET deviceid, volumename, freespace, size
+
+# Disk drive info (specific model)
+WMIC PATH Win32_DiskDrive where "model like '%OCZ%'" GET deviceID, model
+
+# Disk drive info (exclude specific model)
+WMIC PATH Win32_DiskDrive where "not model like '%OCZ%'" GET deviceID, model
+
+# File version check
+WMIC PATH CIM_Datafile WHERE "name = 'C:\\Some Folder\\SomeFile.exe'" GET version
+
+==============================================================================
+HOTFIX / WINDOWS UPDATE CHECKS (via WMIC + PsExec)
+==============================================================================
+
+# Check if specific KB is installed (via QFE)
+WMIC QFE WHERE HotFixID='KB3150513' GET HotFixID
+
+# Check if specific KB is installed (via QuickFixEngineering)
+WMIC PATH Win32_QuickFixEngineering WHERE HotFixID='KB3150513' GET HotFixID
+
+==============================================================================
+SERVICES MANAGEMENT (via WMIC + PsExec)
+==============================================================================
+
+# List all services
+WMIC SERVICE list brief
+
+# List running services with details
+WMIC SERVICE where state='running' GET name, displayname, pathname, processID
+
+# List stopped auto-start services
+WMIC SERVICE where (state='stopped' and startmode='auto') GET displayname, name
+
+# Start stopped auto services
+WMIC SERVICE where (state='stopped' and startmode='auto') CALL startservice
+
+# Start specific service by caption
+WMIC SERVICE where caption='DNS Client' CALL startservice
+
+# Stop specific service by caption
+WMIC SERVICE where caption='DNS Client' CALL stopservice
+
+# Change service start mode
+WMIC SERVICE where (DisplayName='DNS Client') CALL ChangeStartMode Manual
+
+==============================================================================
+PROCESS MANAGEMENT (via WMIC + PsExec)
+==============================================================================
+
+# List all processes
+WMIC PROCESS list brief
+
+# Terminate a process by name
+WMIC PROCESS where name='hungProcess.exe' call terminate
+
+# Kill a process (alternative)
+WMIC PROCESS where name='hungProcess.exe' delete
+
+# Taskkill command
+TASKKILL /F /IM "hungProcess.exe"
+
+# Tasklist command
+TASKLIST
+
+==============================================================================
+USER ACCOUNTS (via WMIC + PsExec)
+==============================================================================
+
+# List user accounts
+WMIC USERACCOUNT list brief
+
+==============================================================================
+REGISTRY (via REG + PsExec)
+==============================================================================
+
+# Query registry key
+REG QUERY "HKLM\Software\Microsoft"
+
+# Query registry value
+REG QUERY "HKLM\Software\Microsoft\.NETFramework" /v InstallRoot
+
+==============================================================================
+POWERSHELL COMMANDS (via cmd.exe + PsExec)
+==============================================================================
+
+# Execute PowerShell command
+cmd.exe /c echo . | powershell.exe -ExecutionPolicy Bypass -command "get-help"
+
+# Get stopped auto-start services via CIM
+powershell.exe -ExecutionPolicy Bypass -command "Get-CimInstance Win32_Service | where{$_.State -eq 'Stopped' -and $_.StartMode -eq 'Auto'}"
+
+==============================================================================
+SOFTWARE DEPLOYMENT
+==============================================================================
+
+# Supported file types for deployment:
+# .msi .msp .msu .exe .reg .vbs .bat .cmd .ps1 .js .wsh .wsf
+
+# Multiple update files deployment:
+# Only .msu, .msi, and .msp are allowed for batch update deployment
+
+==============================================================================
+REMOTE EXECUTION MODES
+==============================================================================
+
+# Remote Process 1 & 2 (no output — just success/error code):
+#   psexec \\HOST -accepteula -s COMMAND
+#   Supports all PsExec switches
+#   Waits for remote process to terminate, returns only exit code
+
+# Remote Process 3 & 4 (with console output):
+#   Used for: ipconfig, tasklist, wmic, etc.
+#   PsExec switches NOT supported
+#   Returns console output of the command
+
+==============================================================================
+WINDOWS UPDATES
+==============================================================================
+
+# Online mode: target computers search for updates against Microsoft servers
+# Cached mode: BatchPatch downloads updates to its cache, distributes to targets
+# Offline mode: uses wsusscn2.cab for offline scanning (no internet needed on targets)
+
+# Update download happens on the BatchPatch computer (not targets)
+# Saves bandwidth — each update downloaded once, distributed to all targets
+
+==============================================================================
+CREDENTIAL SECURITY NOTES (from BatchPatch docs)
+==============================================================================
+
+1. Most secure: Integrated Security (no alternate credentials)
+   - Run batchpatch.exe as a user who is admin on target computers
+   - No passwords stored or transmitted
+
+2. Alternate credentials:
+   - Passed via command line (may appear in process logs)
+   - Stored encrypted in .bps/.bpt grid files (AES encryption by default)
+   - Can be obfuscated (weaker — treat as plaintext)
+
+3. Auto-logon registry entries:
+   - WARNING: stores password in PLAIN TEXT in target registry
+   - AutoLogonCount decrements on each reboot
+   - Should be removed after use for security
+
+==============================================================================
+EXECUTION PATTERN (how BatchPatch runs remote commands)
+==============================================================================
+
+All remote WMIC commands are executed via PsExec:
+  psexec -accepteula \\HOST [-u DOMAIN\user -p password] -s wmic.exe COMMAND
+
+This runs WMIC LOCALLY on the target machine via SMB (port 445).
+No DCOM, no WinRM, no ADWS, no RPC endpoint mapper needed.
+Only requires: PsTools + Admin$ share accessible + admin credentials.
+
+The output is plain text (Key=Value pairs or table format).
+WMIC /format:list produces parseable Key=Value output.
+WMIC /format:csv produces CSV output.

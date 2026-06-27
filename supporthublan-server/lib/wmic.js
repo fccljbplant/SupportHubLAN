@@ -43,7 +43,6 @@
 
 const { spawn } = require('child_process');
 const { logCommand, analyzeError } = require('./logger');
-const { toFqdn, stripPsExecBanner } = require('./utils');
 
 // ==========================================================================
 // runLocal — execute wmic.exe locally on the server machine
@@ -91,19 +90,12 @@ function runLocal(wmiClass, fields, timeoutMs = 15000) {
 // This uses DCOM/RPC (port 135 + dynamic ports) to query WMI remotely.
 // Does NOT require PsTools, WinRM, or SMB.
 // Requires: WMI service running on target, Windows Firewall WMI exception.
-//
-// credential = { username, password, domain } — forwarded as /user /password
 // ==========================================================================
-function runRemote(hostname, wmiClass, fields, timeoutMs = 20000, credential) {
+function runRemote(hostname, wmiClass, fields, timeoutMs = 20000) {
   return new Promise((resolve) => {
     const startTime = Date.now();
     const safeHost = String(hostname).replace(/[^a-zA-Z0-9._\-:]/g, '');
-    const args = ['/node:' + safeHost];
-    if (credential && credential.username && credential.password) {
-      const fullUser = credential.domain ? `${credential.domain}\\${credential.username}` : credential.username;
-      args.push('/user:' + fullUser, '/password:' + credential.password);
-    }
-    args.push(...wmiClass.split(' '), 'get', fields, '/format:list');
+    const args = ['/node:' + safeHost, wmiClass, 'get', fields, '/format:list'];
     const proc = spawn('wmic.exe', args, { windowsHide: true, timeout: timeoutMs });
 
     let stdout = '', stderr = '';
@@ -143,14 +135,13 @@ function runRemote(hostname, wmiClass, fields, timeoutMs = 20000, credential) {
 //
 // The resulting command: psexec -accepteula \\HOST -s wmic <class> get <fields> /format:list
 // ==========================================================================
-function runRemoteViaPsExec(hostname, wmiClass, fields, pstoolsPath, timeoutMs = 25000, credential) {
+function runRemoteViaPsExec(hostname, wmiClass, fields, pstoolsPath, timeoutMs = 25000) {
   return new Promise((resolve) => {
     const startTime = Date.now();
-    const safeHost = toFqdn(hostname, credential).replace(/[^a-zA-Z0-9._\-:]/g, '');
+    const safeHost = String(hostname).replace(/[^a-zA-Z0-9._\-:]/g, '');
     const path = require('path');
     const exe = path.join(pstoolsPath, 'psexec.exe');
-    const credArgs = credential ? ['-u', credential.domain ? credential.domain + '\\' + credential.username : credential.username, '-p', credential.password] : [];
-    const args = ['-accepteula', '\\\\' + safeHost, ...credArgs, '-s', 'wmic.exe', ...wmiClass.split(' '), 'get', fields, '/format:list'];
+    const args = ['-accepteula', '\\\\' + safeHost, '-s', 'wmic.exe', wmiClass, 'get', fields, '/format:list'];
     const proc = spawn(exe, args, { windowsHide: true, timeout: timeoutMs });
 
     let stdout = '', stderr = '';
@@ -218,77 +209,42 @@ function parseListOutput(raw) {
 }
 
 // ==========================================================================
-// runRemoteCim — query WMI via PowerShell CIM cmdlets over DCOM (no WinRM)
+// stripPsExecBanner — remove PsExec's copyright/connection banner from stdout
 // ==========================================================================
-// Uses New-CimSession with -Protocol Dcom to query Win32_Product or any
-// WMI class without requiring WinRM/PSRP. The session is created with the
-// provided domain credentials, queried, and immediately removed.
+// PsExec outputs a banner like:
+//   PsExec v2.43 - Execute processes remotely
+//   Copyright (C) 2001-2023 Mark Russinovich
+//   Sysinternals - www.sysinternals.com
 //
-// Resulting command:
-//   powershell -NoProfile -Command "$sec = ...; $cred = ...; $o = New-CimSessionOption -Protocol Dcom; $s = New-CimSession -ComputerName HOST -Credential $cred -SessionOption $o; Get-CimInstance -CimSession $s -ClassName CLASS | Select FIELDS | ConvertTo-Json -Compress; Remove-CimSession $s"
+//   Connecting to HOST...
+//   Starting PSEXESVC service on HOST...
+//
+// We strip everything before the first line that looks like wmic output
+// (a line containing '=').
 // ==========================================================================
-function runRemoteCim(hostname, wmiClass, fields, timeoutMs = 60000, credential) {
-  return new Promise((resolve) => {
-    const startTime = Date.now();
-    const safeHost = String(hostname).replace(/[^a-zA-Z0-9._\-:]/g, '');
-    if (!credential || !credential.username || !credential.password) {
-      resolve({ success: false, records: [], raw: '', error: 'Credentials required for CIM DCOM', reason: 'no_credentials' });
-      return;
+function stripPsExecBanner(raw) {
+  const out = (raw || '').replace(/\r/g, '');
+  const lines = out.split('\n');
+  let foundData = false;
+  const result = [];
+
+  for (const line of lines) {
+    // Skip banner lines
+    if (/^PsExec v/i.test(line)) continue;
+    if (/^Copyright/i.test(line)) continue;
+    if (/^Sysinternals/i.test(line)) continue;
+    if (/^Connecting to/i.test(line)) continue;
+    if (/^Starting PSEXESVC/i.test(line)) continue;
+    if (/^Process exited/i.test(line)) continue;
+    if (/^\s*$/.test(line) && !foundData) continue;
+
+    // Once we find a line with '=' or any real data, keep everything
+    if (line.includes('=') || foundData) {
+      foundData = true;
+      result.push(line);
     }
-
-    const fullUser = credential.domain ? `${credential.domain}\\${credential.username}` : credential.username;
-    const escapedPass = credential.password.replace(/'/g, "''");
-    const escapedHost = safeHost.replace(/'/g, "''");
-    const fieldList = String(fields).replace(/,/g, ', ');
-    const psCommand = [
-      `$sec = ConvertTo-SecureString '${escapedPass}' -AsPlainText -Force`,
-      `$cred = New-Object PSCredential('${fullUser}', $sec)`,
-      `$o = New-CimSessionOption -Protocol Dcom`,
-      `$s = New-CimSession -ComputerName '${escapedHost}' -Credential $cred -SessionOption $o`,
-      `Get-CimInstance -CimSession $s -ClassName ${wmiClass} -ErrorAction Stop | Select ${fieldList} | ConvertTo-Json -Compress`,
-      `Remove-CimSession $s`,
-    ].join('; ');
-
-    const args = ['-NoProfile', '-Command', psCommand];
-    const proc = spawn('powershell.exe', args, { windowsHide: true, timeout: timeoutMs });
-
-    let stdout = '', stderr = '';
-    proc.stdout.on('data', (d) => { stdout += d.toString(); });
-    proc.stderr.on('data', (d) => { stderr += d.toString(); });
-
-    proc.on('error', (err) => {
-      logCommand({ tool: 'cim-dcom', target: safeHost, command: `powershell Get-CimInstance ${wmiClass} on ${safeHost}`, success: false, error: err.message, duration: Date.now() - startTime });
-      resolve({ success: false, records: [], raw: '', error: err.message, reason: err.message });
-    });
-
-    proc.on('close', (code) => {
-      const duration = Date.now() - startTime;
-      if (code === 0 && stdout.trim()) {
-        try {
-          let parsed = JSON.parse(stdout.trim());
-          if (!Array.isArray(parsed)) parsed = [parsed];
-          const records = parsed.filter(r => r && typeof r === 'object').map(r => {
-            const cleaned = {};
-            for (const [k, v] of Object.entries(r)) {
-              cleaned[k] = v != null ? String(v).trim() : '';
-            }
-            return cleaned;
-          });
-          logCommand({ tool: 'cim-dcom', target: safeHost, command: `powershell Get-CimInstance ${wmiClass} on ${safeHost}`, success: true, duration });
-          resolve({ success: true, records, raw: stdout, error: '', reason: null });
-        } catch (parseErr) {
-          logCommand({ tool: 'cim-dcom', target: safeHost, command: `powershell Get-CimInstance ${wmiClass} on ${safeHost}`, success: false, error: `JSON parse: ${parseErr.message}`, duration });
-          resolve({ success: false, records: [], raw: stdout, error: `JSON parse error: ${parseErr.message}`, reason: 'parse_error' });
-        }
-      } else {
-        const errMsg = stderr || `PowerShell exited code ${code}`;
-        logCommand({ tool: 'cim-dcom', target: safeHost, command: `powershell Get-CimInstance ${wmiClass} on ${safeHost}`, success: false, error: errMsg, duration });
-        resolve({ success: false, records: [], raw: stdout, error: errMsg, reason: 'cim_failed' });
-      }
-    });
-
-    setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs + 5000);
-  });
+  }
+  return result.join('\n');
 }
 
-module.exports = { runLocal, runRemote, runRemoteViaPsExec, runRemoteCim, parseListOutput };
+module.exports = { runLocal, runRemote, runRemoteViaPsExec, parseListOutput };

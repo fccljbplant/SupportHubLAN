@@ -1453,7 +1453,6 @@
                     onClick={() => onRowClick && onRowClick(row)}
                     className={`border-b border-border/50 hover:bg-surface-raised transition-colors ${isSelected ? 'bg-primary/5' : ''} ${onRowClick ? 'cursor-pointer' : ''}`}
                     style={isSelected ? { boxShadow: 'inset 2px 0 0 #4f83ff' } : (row._rowColor ? { boxShadow: `inset 3px 0 0 ${row._rowColor}`, background: row._rowColor + '10' } : undefined)}
-                    style={isSelected ? { boxShadow: 'inset 2px 0 0 #4f83ff' } : undefined}
                   >
                     {selectable && (
                       <td className={cellPad} onClick={(e) => e.stopPropagation()}>
@@ -2063,6 +2062,7 @@
         requiredService: params.required_service || '',
         fixSuggestion: params.fix_suggestion || '',
         outputSummary: entry.output || params.output_summary || '',
+        fullOutput: entry.full_output || params.full_output || params.output || '',
         targetHost: params.target_host || host.hostname,
       };
     };
@@ -2137,6 +2137,14 @@
                     <div className="text-[10px] text-text-dim mt-0.5">
                       <span className="text-text-dim">Result:</span> <span className="text-text">{p.outputSummary}</span>
                     </div>
+                  )}
+
+                  {/* Full output — expandable */}
+                  {p.fullOutput && p.fullOutput.length > 0 && (
+                    <details className="mt-1">
+                      <summary className="text-[10px] text-text-dim cursor-pointer hover:text-text">Full Output ({p.fullOutput.length} chars)</summary>
+                      <pre className="mt-1 p-1.5 bg-surface-raised border border-border rounded text-[9px] font-mono text-text whitespace-pre-wrap break-all max-h-40 overflow-y-auto">{p.fullOutput}</pre>
+                    </details>
                   )}
 
                   {/* Error reason (if failed) */}
@@ -4254,7 +4262,7 @@
   };
 
   const InventoryScreen = () => {
-    const { route, openHost, openDrawer, hosts, setHosts, addHosts, addJob, appendAudit, refreshHostsFromBackend } = useApp();
+    const { route, openHost, openDrawer, hosts, setHosts, addHosts, addJob, appendAudit, refreshHostsFromBackend, sites, departments, hostTypes } = useApp();
     const toast = useToast();
     const [activeTab, setActiveTab] = useState('all');
     const [gridVersion, setGridVersion] = useState(0);
@@ -4268,7 +4276,7 @@
     const [showCommandModal, setShowCommandModal] = useState(false);
     const [logHost, setLogHost] = useState(null); // host object for PC Log modal
     const [showColumnChooser, setShowColumnChooser] = useState(false);
-    const [hiddenCols, setHiddenCols] = useState(new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials','uptime','lastSeen','pendingReboot']));
+    const [hiddenCols, setHiddenCols] = useState(new Set(['fqdn','macAddress','osBuild','cpuModel','ramGb','disk','diskFreeGb','osInstallDate','uptime','lastBootTime','patchState','pendingReboot','tags','credentials','notes']));
     const DEFAULT_HIDDEN = new Set(['fqdn','macAddress','cpuModel','lastBootTime','department','owner','notes','diskFreeGb','osInstallDate','credentials','uptime','lastSeen','pendingReboot']);
     const [confirmReboot, setConfirmReboot] = useState(false);
     const [editingHost, setEditingHost] = useState(null);
@@ -4316,9 +4324,11 @@
     // Filter hosts by tab + search + filters
     const filteredHosts = useMemo(() => {
       let list = [...hosts];
-      if (activeTab === 'servers') list = list.filter(h => h.tags.includes('server'));
-      else if (activeTab === 'workstations') list = list.filter(h => h.tags.includes('workstation'));
-      else if (activeTab === 'offline') list = list.filter(h => h.onlineStatus === 'offline');
+      // Dynamic host type filtering based on hostTypes settings
+      const typeTab = hostTypes.find(ht => ht.toLowerCase().replace(/\s+/g, '-') === activeTab);
+      if (typeTab) {
+        list = list.filter(h => h.tags.some(t => t.toLowerCase() === typeTab.toLowerCase()));
+      } else if (activeTab === 'offline') list = list.filter(h => h.onlineStatus === 'offline');
 
       if (search) {
         const q = search.toLowerCase();
@@ -4333,13 +4343,13 @@
 
     const allColumns = [
       { key: 'led', label: 'LED', sortable: false, headerRender: () => (
-        <span className="inline-flex items-center gap-1 cursor-help" title="🟢 Online   🔴 Offline">
+        <span className="inline-flex items-center gap-1 cursor-help" title="🟢 Online   🔴 Offline   ⚪ Unknown">
           <Icon name="Activity" size={11} className="text-success" /> Status
         </span>
       ), render: (h) => {
-        const online = h.onlineStatus === 'online';
-        const ledColor = online ? '#22c55e' : '#ef4444';
-        const ledLabel = online ? 'Online' : 'Offline';
+        const status = h.onlineStatus;
+        const ledColor = status === 'online' ? '#22c55e' : status === 'offline' ? '#ef4444' : '#6b7280';
+        const ledLabel = status === 'online' ? 'Online' : status === 'offline' ? 'Offline' : 'Unknown';
         return <span className="inline-block w-3 h-3 rounded-full border border-border flex-shrink-0" style={{ background: ledColor, boxShadow: `0 0 4px ${ledColor}` }} title={ledLabel} />;
       } },
       { key: 'hostname', label: 'Hostname', mono: true, render: (h) => <span className="font-mono text-text">{h.hostname}</span> },
@@ -4498,8 +4508,12 @@
         <TabGroup
           tabs={[
             { id: 'all', label: 'All Hosts', icon: 'Server', badge: hosts.length },
-            { id: 'servers', label: 'Servers', icon: 'HardDrive', badge: hosts.filter(h => h.tags.includes('server')).length },
-            { id: 'workstations', label: 'Workstations', icon: 'Monitor', badge: hosts.filter(h => h.tags.includes('workstation')).length },
+            ...hostTypes.slice(0, 4).map(ht => ({
+              id: ht.toLowerCase().replace(/\s+/g, '-'),
+              label: ht + 's',
+              icon: 'Monitor',
+              badge: hosts.filter(h => h.tags.some(t => t.toLowerCase() === ht.toLowerCase())).length,
+            })),
             { id: 'offline', label: 'Offline', icon: 'CircleOff', badge: hosts.filter(h => h.onlineStatus === 'offline').length },
             { id: 'tags', label: 'Tags' },
             { id: 'groups', label: 'Groups' },
@@ -4740,15 +4754,16 @@
                 <FormField label="FQDN"><Input defaultValue={editingHost.fqdn} onChange={e => setEditingHost({...editingHost, fqdn: e.target.value})} className="font-mono" /></FormField>
                 <FormField label="MAC Address"><Input defaultValue={editingHost.macAddress} onChange={e => setEditingHost({...editingHost, macAddress: e.target.value})} className="font-mono" /></FormField>
                 <FormField label="OS"><Input defaultValue={editingHost.osName} onChange={e => setEditingHost({...editingHost, osName: e.target.value})} /></FormField>
-                <FormField label="Site"><Select value={editingHost.site || ''} onChange={e => setEditingHost({...editingHost, site: e.target.value})}>{SITES.map(s => <option key={s}>{s}</option>)}</Select></FormField>
-                <FormField label="Department"><Select value={editingHost.department || ''} onChange={e => setEditingHost({...editingHost, department: e.target.value})}>{DEPARTMENTS.map(d => <option key={d}>{d}</option>)}</Select></FormField>
+        <FormField label="Site"><Select value={editingHost.site || ''} onChange={e => setEditingHost({...editingHost, site: e.target.value})}><option value="">—</option>{sites.map(s => <option key={s}>{s}</option>)}</Select></FormField>
+        <FormField label="Department"><Select value={editingHost.department || ''} onChange={e => setEditingHost({...editingHost, department: e.target.value})}><option value="">—</option>{departments.map(d => <option key={d}>{d}</option>)}</Select></FormField>
                 <FormField label="Owner"><Input defaultValue={editingHost.owner || ''} onChange={e => setEditingHost({...editingHost, owner: e.target.value})} /></FormField>
               </div>
+              <FormField label="Tags"><TagInput value={editingHost.tags || []} onChange={tags => setEditingHost({...editingHost, tags})} suggestions={hostTypes} /></FormField>
               <FormField label="Notes"><Textarea rows={2} defaultValue={editingHost.notes || ''} onChange={e => setEditingHost({...editingHost, notes: e.target.value})} /></FormField>
               <div className="flex justify-end gap-2 pt-2">
                 <ActionButton variant="secondary" onClick={() => setEditingHost(null)}>Cancel</ActionButton>
                 <ActionButton variant="primary" icon="Check" onClick={async () => {
-                  const updates = { hostname: editingHost.hostname, ipAddress: editingHost.ipAddress, fqdn: editingHost.fqdn, macAddress: editingHost.macAddress, osName: editingHost.osName, site: editingHost.site, department: editingHost.department, owner: editingHost.owner, notes: editingHost.notes };
+                  const updates = { hostname: editingHost.hostname, ipAddress: editingHost.ipAddress, fqdn: editingHost.fqdn, macAddress: editingHost.macAddress, osName: editingHost.osName, site: editingHost.site, department: editingHost.department, owner: editingHost.owner, notes: editingHost.notes, tags: editingHost.tags };
                   updateHosts(prev => prev.map(h => h.id === editingHost.id ? { ...h, ...updates } : h));
                   if (window.SupportHubLANAPI && editingHost._fromBackend) {
                     try { await fetch(window.SUPPORTHUBLAN_API_URL + '/api/hosts/' + editingHost.id.replace('db-', ''), { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(updates) }); } catch (e) {}
@@ -5173,9 +5188,78 @@
     );
   };
 
+  const TagInput = ({ value, onChange, suggestions = [] }) => {
+    const [input, setInput] = useState('');
+    const [showSuggestions, setShowSuggestions] = useState(false);
+    const tags = Array.isArray(value) ? value : (value ? value.split(',').map(t => t.trim()).filter(Boolean) : []);
+    const containerRef = useRef(null);
+
+    useEffect(() => {
+      const handler = (e) => { if (containerRef.current && !containerRef.current.contains(e.target)) setShowSuggestions(false); };
+      document.addEventListener('mousedown', handler);
+      return () => document.removeEventListener('mousedown', handler);
+    }, []);
+
+    const filtered = input ? suggestions.filter(s => s.toLowerCase().includes(input.toLowerCase()) && !tags.includes(s)) : [];
+
+    const addTag = (tag) => {
+      const trimmed = tag.trim();
+      if (!trimmed || tags.includes(trimmed)) { setInput(''); setShowSuggestions(false); return; }
+      const newTags = [...tags, trimmed];
+      onChange(typeof value === 'string' ? newTags.join(', ') : newTags);
+      setInput('');
+      setShowSuggestions(false);
+    };
+
+    const removeTag = (idx) => {
+      const newTags = tags.filter((_, i) => i !== idx);
+      onChange(typeof value === 'string' ? newTags.join(', ') : newTags);
+    };
+
+    const handleKeyDown = (e) => {
+      if (e.key === 'Enter' || e.key === ',') {
+        e.preventDefault();
+        addTag(input);
+      } else if (e.key === 'Backspace' && !input && tags.length > 0) {
+        removeTag(tags.length - 1);
+      } else if (e.key === 'Escape') {
+        setShowSuggestions(false);
+      }
+    };
+
+    return (
+      <div ref={containerRef} className="relative">
+        <div className="flex flex-wrap gap-1 p-1.5 bg-surface-raised border border-border rounded min-h-[36px] cursor-text" onClick={() => containerRef.current?.querySelector('input')?.focus()}>
+          {tags.map((t, i) => (
+            <span key={i} className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-primary/10 border border-primary/20 rounded text-xs text-primary">
+              {t}
+              <button onClick={(e) => { e.stopPropagation(); removeTag(i); }} className="text-primary/60 hover:text-danger">&times;</button>
+            </span>
+          ))}
+          <input
+            value={input}
+            onChange={e => { setInput(e.target.value); setShowSuggestions(true); }}
+            onKeyDown={handleKeyDown}
+            onFocus={() => setShowSuggestions(true)}
+            placeholder={tags.length === 0 ? 'Type tag and press Enter or comma…' : ''}
+            className="flex-1 min-w-[80px] bg-transparent border-none outline-none text-xs text-text placeholder:text-text-dim"
+          />
+        </div>
+        {showSuggestions && filtered.length > 0 && (
+          <div className="absolute z-50 mt-1 w-full bg-surface border border-border rounded shadow-lg max-h-32 overflow-y-auto">
+            {filtered.map(s => (
+              <div key={s} className="px-2 py-1 text-xs text-text hover:bg-primary/10 cursor-pointer" onMouseDown={(e) => { e.preventDefault(); addTag(s); }}>{s}</div>
+            ))}
+          </div>
+        )}
+        <div className="text-[9px] text-text-dim mt-0.5">Type and press Enter or comma to add. Backspace to remove last.</div>
+      </div>
+    );
+  };
+
   const AddHostsModal = ({ open, onClose, initialMethod }) => {
     const toast = useToast();
-    const { addHosts, hosts, appendAudit } = useApp();
+    const { addHosts, hosts, appendAudit, sites, departments, hostTypes } = useApp();
     const [step, setStep] = useState(0);
     const [method, setMethod] = useState(initialMethod || 'single');
 
@@ -5188,7 +5272,7 @@
     }, [open, initialMethod]);
     const [entries, setEntries] = useState([{ hostname: '', ipAddress: '', macAddress: '' }]);
     const [pasteText, setPasteText] = useState('');
-    const [tag, setTag] = useState('');
+    const [tag, setTag] = useState([]);
     const [site, setSite] = useState('HQ-DC');
     const [dept, setDept] = useState('IT');
     const [owner, setOwner] = useState('');
@@ -5217,7 +5301,7 @@
     const [selectedADHosts, setSelectedADHosts] = useState(new Set());
     const [scanSearch, setScanSearch] = useState('');
 
-    useEffect(() => { if (open) { setStep(0); setMethod('single'); setEntries([{ hostname: '', ipAddress: '', macAddress: '' }]); setPasteText(''); setTag(''); setOwner(''); setNotes(''); setScanResults([]); setSelectedScanIPs(new Set()); setScanSearch(''); setCsvData(null); setCsvResolveDns(true); setAdResults([]); setSelectedADHosts(new Set()); } }, [open]);
+    useEffect(() => { if (open) { setStep(0); setMethod('single'); setEntries([{ hostname: '', ipAddress: '', macAddress: '' }]); setPasteText(''); setTag([]); setOwner(''); setNotes(''); setScanResults([]); setSelectedScanIPs(new Set()); setScanSearch(''); setCsvData(null); setCsvResolveDns(true); setAdResults([]); setSelectedADHosts(new Set()); } }, [open]);
 
     const steps = [{ label: 'Input Method' }, { label: 'Host Details' }, { label: 'Assignment' }];
 
@@ -5328,9 +5412,7 @@
 
     // ---- Build host objects from any method ----
     const buildHosts = () => {
-      const tags = ['workstation'];
-      if (tag) tags.push(tag);
-      if (dept.toLowerCase() === 'it' || dept.toLowerCase() === 'engineering') tags.push(dept.toLowerCase());
+      const tagsArr = Array.isArray(tag) ? [...tag] : [];
       const baseHost = (hostname, ip, mac) => ({
         id: 'h' + (Date.now() + Math.floor(Math.random() * 10000)),
         hostname, fqdn: `${hostname.toLowerCase()}.corp.local`, ipAddress: ip,
@@ -5341,7 +5423,7 @@
         onlineStatus: 'online', pingStatus: 'up', pendingReboot: false,
         patchState: 'unknown', lastSeen: new Date().toISOString(),
         loggedOnUsers: [], loggedOnUser: '', site, location: site, department: dept, owner: owner || 'unassigned',
-        notes, tags, groupId: 'g-workstations', credentialProfileId: 'c-local-admin',
+        notes, tags: tagsArr, groupId: 'g-workstations', credentialProfileId: 'c-local-admin',
       });
 
       if (method === 'single') {
@@ -5374,6 +5456,7 @@
       if (method === 'ad') {
         return adResults.filter(r => selectedADHosts.has(r.name)).map(r => {
           const h = baseHost(r.name, r.ip || '', '');
+          if (r.managedBy) h.owner = r.managedBy;
           if (r.os) {
             h.osName = r.os;
             // Guess version/build from OS name
@@ -5745,7 +5828,7 @@
                     });
                     const data = await result.json();
                     if (data.success && data.hosts) {
-                      const hosts = data.hosts.map(h => ({ name: h.name || '', fqdn: h.fqdn || '', ip: h.ip || '', os: h.os || '' }));
+                      const hosts = data.hosts.map(h => ({ name: h.name || '', fqdn: h.fqdn || '', ip: h.ip || '', os: h.os || '', managedBy: h.managedBy || '' }));
                       setAdResults(hosts);
                       setSelectedADHosts(new Set(hosts.map(h => h.name).filter(Boolean)));
                       toast.success(`Found ${data.hosts.length} computers in AD.`);
@@ -5775,6 +5858,7 @@
                       <th className="px-2 py-1 text-left text-meta text-text-dim uppercase">Hostname</th>
                       <th className="px-2 py-1 text-left text-meta text-text-dim uppercase">IP Address</th>
                       <th className="px-2 py-1 text-left text-meta text-text-dim uppercase">OS</th>
+                      <th className="px-2 py-1 text-left text-meta text-text-dim uppercase">Managed By</th>
                     </tr></thead>
                     <tbody>
                       {adResults.map((r, i) => (
@@ -5783,6 +5867,7 @@
                           <td className="px-2 py-1 font-mono text-text">{r.name}{r.fqdn && r.fqdn !== r.name ? <span className="text-text-dim text-[10px] block">{r.fqdn}</span> : null}</td>
                           <td className="px-2 py-1 font-mono text-text-dim">{r.ip || '—'}</td>
                           <td className="px-2 py-1 text-text-dim">{r.os || '—'}</td>
+                          <td className="px-2 py-1 font-mono text-text-dim text-[10px]">{r.managedBy || '—'}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -5802,9 +5887,9 @@
         {/* Step 2: Assignment */}
         {step === 2 && (
           <div className="grid grid-cols-2 gap-3">
-            <FormField label="Tag (optional)"><Input value={tag} onChange={e => setTag(e.target.value)} placeholder="engineering" /></FormField>
-            <FormField label="Site"><Select value={site} onChange={e => setSite(e.target.value)}>{SITES.map(s => <option key={s}>{s}</option>)}</Select></FormField>
-            <FormField label="Department"><Select value={dept} onChange={e => setDept(e.target.value)}>{DEPARTMENTS.map(d => <option key={d}>{d}</option>)}</Select></FormField>
+            <FormField label="Tags"><TagInput value={tag} onChange={setTag} suggestions={[...new Set([...hostTypes, ...hosts.flatMap(h => h.tags || [])])]} /></FormField>
+            <FormField label="Site"><Select value={site} onChange={e => setSite(e.target.value)}><option value="">—</option>{sites.map(s => <option key={s}>{s}</option>)}</Select></FormField>
+            <FormField label="Department"><Select value={dept} onChange={e => setDept(e.target.value)}><option value="">—</option>{departments.map(d => <option key={d}>{d}</option>)}</Select></FormField>
             <FormField label="Owner"><Input value={owner} onChange={e => setOwner(e.target.value)} placeholder="j.martin" /></FormField>
             <FormField label="Notes" className="col-span-2"><Textarea rows={2} value={notes} onChange={e => setNotes(e.target.value)} placeholder="Optional notes about these hosts…" /></FormField>
             <div className="col-span-2 p-2 bg-info/10 border border-info/30 rounded text-xs text-info">
@@ -7626,6 +7711,9 @@
       steps: [
         { type: 'psexec-run', label: 'PsExec — Run Command', desc: 'Execute a command on remote host via PsExec' },
         { type: 'psexec-shell', label: 'PsExec — System Shell', desc: 'Open interactive shell as SYSTEM (-s -i)' },
+        { type: 'hardware-scan', label: 'Hardware Scan (Full Audit)', desc: 'Multi-method: WinAudit + PsExec + PowerShell. CPU, RAM, disks, BIOS, GPU, network' },
+        { type: 'apps-list', label: 'Installed Apps Scan', desc: 'PsInfo + registry + WMIC + CIM. Full software inventory' },
+        { type: 'services-list', label: 'Services Scan', desc: 'CIM + WMIC + PsService. All services with status' },
         { type: 'psinfo', label: 'PsInfo — System Info', desc: 'Get detailed system information' },
         { type: 'pslist', label: 'PsList — Process List', desc: 'List all running processes' },
         { type: 'pskill', label: 'PsKill — Kill Process', desc: 'Kill a process by PID or name' },
@@ -9256,9 +9344,78 @@
     );
   };
 
+  const HostMetadataManager = ({ sites, setSites, departments, setDepartments, hostTypes, setHostTypes }) => {
+    const toast = useToast();
+    const [newSite, setNewSite] = useState('');
+    const [newDept, setNewDept] = useState('');
+    const [newType, setNewType] = useState('');
+
+    const addItem = (list, setList, value, clearFn) => {
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      if (list.includes(trimmed)) { toast.warning(`"${trimmed}" already exists.`); return; }
+      setList([...list, trimmed]);
+      clearFn('');
+      toast.success(`Added "${trimmed}"`);
+    };
+    const removeItem = (list, setList, item) => {
+      setList(list.filter(x => x !== item));
+      toast.info(`Removed "${item}"`);
+    };
+
+    return (
+      <div className="space-y-4">
+        <SectionCard title="Sites" description="Manage site/location names used when adding hosts">
+          <div className="flex gap-2 mb-2">
+            <input value={newSite} onChange={e => setNewSite(e.target.value)} onKeyDown={e => e.key === 'Enter' && addItem(sites, setSites, newSite, setNewSite)} placeholder="Add site…" className="flex-1 px-2 py-1 text-xs bg-surface-raised border border-border rounded text-text" />
+            <ActionButton variant="primary" size="xs" icon="Plus" onClick={() => addItem(sites, setSites, newSite, setNewSite)}>Add</ActionButton>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {sites.map(s => (
+              <span key={s} className="inline-flex items-center gap-1 px-2 py-0.5 bg-surface-raised border border-border rounded text-xs text-text">
+                {s}
+                <button onClick={() => removeItem(sites, setSites, s)} className="text-text-dim hover:text-danger">&times;</button>
+              </span>
+            ))}
+          </div>
+        </SectionCard>
+
+        <SectionCard title="Departments" description="Manage department names used when adding hosts">
+          <div className="flex gap-2 mb-2">
+            <input value={newDept} onChange={e => setNewDept(e.target.value)} onKeyDown={e => e.key === 'Enter' && addItem(departments, setDepartments, newDept, setNewDept)} placeholder="Add department…" className="flex-1 px-2 py-1 text-xs bg-surface-raised border border-border rounded text-text" />
+            <ActionButton variant="primary" size="xs" icon="Plus" onClick={() => addItem(departments, setDepartments, newDept, setNewDept)}>Add</ActionButton>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {departments.map(d => (
+              <span key={d} className="inline-flex items-center gap-1 px-2 py-0.5 bg-surface-raised border border-border rounded text-xs text-text">
+                {d}
+                <button onClick={() => removeItem(departments, setDepartments, d)} className="text-text-dim hover:text-danger">&times;</button>
+              </span>
+            ))}
+          </div>
+        </SectionCard>
+
+        <SectionCard title="Host Types" description="Manage host type tags (Server, Workstation, Laptop, etc.)">
+          <div className="flex gap-2 mb-2">
+            <input value={newType} onChange={e => setNewType(e.target.value)} onKeyDown={e => e.key === 'Enter' && addItem(hostTypes, setHostTypes, newType, setNewType)} placeholder="Add host type…" className="flex-1 px-2 py-1 text-xs bg-surface-raised border border-border rounded text-text" />
+            <ActionButton variant="primary" size="xs" icon="Plus" onClick={() => addItem(hostTypes, setHostTypes, newType, setNewType)}>Add</ActionButton>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {hostTypes.map(t => (
+              <span key={t} className="inline-flex items-center gap-1 px-2 py-0.5 bg-surface-raised border border-border rounded text-xs text-text">
+                {t}
+                <button onClick={() => removeItem(hostTypes, setHostTypes, t)} className="text-text-dim hover:text-danger">&times;</button>
+              </span>
+            ))}
+          </div>
+        </SectionCard>
+      </div>
+    );
+  };
+
   const SettingsScreen = () => {
     const toast = useToast();
-    const { users, addUser, updateUser, removeUser, appendAudit, theme, setTheme, applyTheme, apiKeys, addApiKey, removeApiKey, maintenanceWindows, addMaintenanceWindow, removeMaintenanceWindow, notificationRules, updateNotificationRule, autoStatusMinutes, setAutoStatusMinutes } = useApp();
+    const { users, addUser, updateUser, removeUser, appendAudit, theme, setTheme, applyTheme, apiKeys, addApiKey, removeApiKey, maintenanceWindows, addMaintenanceWindow, removeMaintenanceWindow, notificationRules, updateNotificationRule, autoStatusMinutes, setAutoStatusMinutes, sites, setSites, departments, setDepartments, hostTypes, setHostTypes } = useApp();
     const [remoteDesktopProtocol, setRemoteDesktopProtocol] = useState(() => { try { return localStorage.getItem('supporthublan:rdp-protocol') || 'VNC'; } catch(e) { return 'VNC'; } });
     const [activeTab, setActiveTab] = useState('general');
     const [showInvite, setShowInvite] = useState(false);
@@ -9313,6 +9470,7 @@
             { id: 'credentials', label: 'Credentials', icon: 'KeyRound' },
             { id: 'laps', label: 'LAPS', icon: 'ShieldCheck' },
             { id: 'inventories', label: 'Inventories', icon: 'Server' },
+            { id: 'host-meta', label: 'Host Metadata', icon: 'Tags' },
             { id: 'notifications', label: 'Notifications', icon: 'Bell' },
             { id: 'email', label: 'Email', icon: 'Mail' },
             { id: 'users', label: 'Users & Roles', icon: 'Users' },
@@ -9512,6 +9670,10 @@
 
         {activeTab === 'inventories' && (
           <InventoriesManager />
+        )}
+
+        {activeTab === 'host-meta' && (
+          <HostMetadataManager sites={sites} setSites={setSites} departments={departments} setDepartments={setDepartments} hostTypes={hostTypes} setHostTypes={setHostTypes} />
         )}
 
         {activeTab === 'adapters' && (
@@ -10113,8 +10275,11 @@
       { id: 'nr9', event: 'Host status email (online)', frequency: 'Immediate', recipients: 'All admins', enabled: false },
       { id: 'nr10', event: 'Host status email (offline)', frequency: 'Immediate', recipients: 'All admins', enabled: true },
     ]));
+    const [sites, setSites] = useState(() => loadPersisted('sites', ['HQ-DC', 'NYC-Office', 'London-DC', 'Tokyo-Branch', 'Remote']));
+    const [departments, setDepartments] = useState(() => loadPersisted('departments', ['IT', 'Engineering', 'Finance', 'Sales', 'Operations', 'HR']));
+    const [hostTypes, setHostTypes] = useState(() => loadPersisted('hostTypes', ['Server', 'Workstation', 'Laptop', 'VM', 'Printer', 'Network Device']));
     const [queueDraft, setQueueDraft] = useState(() => loadPersisted('queueDraft', {
-      name: 'New Queue',
+      name: '',
       description: '',
       mode: 'standard',
       errorHandling: 'stop',
@@ -10155,7 +10320,7 @@
           osBuild: h.build || '',
           cpuModel: h.cpu || '',
           ramGb: h.ram ? Math.round(parseInt(h.ram) / 1024) : 0,
-          onlineStatus: h.online_status || 'unknown',
+          onlineStatus: h.online_status === 'online' ? 'online' : 'offline',
           pingStatus: h.online_status === 'online' ? 'up' : h.online_status === 'offline' ? 'down' : 'unknown',
           patchState: h.patch_state || 'unknown',
           pendingReboot: h.pending_reboot === 1,
@@ -10190,28 +10355,41 @@
 
         if (pingForStatus && backendHosts.length > 0) {
             try {
-              const hostnames = [...new Set(backendHosts.map(h => h.hostname).filter(Boolean))];
+              // Build hostname→IP mapping, ping IPs for reliable detection
+              const hostToIp = {};
+              const pings = [];
+              backendHosts.forEach(h => {
+                const ip = h.ipAddress || '';
+                const hn = h.hostname || '';
+                if (hn) {
+                  hostToIp[hn] = ip;
+                  pings.push(ip || hn); // use IP if available, else hostname
+                }
+              });
+              const uniquePings = [...new Set(pings.filter(Boolean))];
               // 1. Ping for online/offline
-              const statusResult = await window.SupportHubLANAPI.checkHostStatus(hostnames);
+              const statusResult = await window.SupportHubLANAPI.checkHostStatus(uniquePings);
               if (statusResult && statusResult.success && !statusResult.demo) {
                 let parsed;
                 try { parsed = JSON.parse(statusResult.data); } catch { parsed = []; }
                 const arr = Array.isArray(parsed) ? parsed : [parsed];
-                const statusMap = {};
-                arr.forEach(r => { if (r.hostname) statusMap[r.hostname] = r.online ? 'online' : 'offline'; });
+                // Build lookup: ping result IP → online/offline
+                const pingMap = {};
+                arr.forEach(r => { if (r.hostname) pingMap[r.hostname] = r.online ? 'online' : 'offline'; });
                 setHosts(prev => prev.map(h => {
-                  const newStatus = statusMap[h.hostname];
+                  // Match by IP first, then by hostname
+                  const newStatus = (h.ipAddress && pingMap[h.ipAddress]) || pingMap[h.hostname];
                   if (newStatus) {
                     return { ...h, onlineStatus: newStatus, pingStatus: newStatus === 'online' ? 'up' : 'down', lastSeen: newStatus === 'online' ? new Date().toISOString() : h.lastSeen };
                   }
                   return h;
                 }));
               }
-              // 2. Pull live data (OS, build, disk, logged-in user) via PsTools for online hosts
-              const onlineHostnames = hostnames.filter(name => {
-                const s = statusMap[name];
+              // 2. Pull live data for online hosts (use hostnames, not IPs)
+              const onlineHostnames = backendHosts.filter(h => {
+                const s = pingMap[h.ipAddress] || pingMap[h.hostname];
                 return s === 'online';
-              });
+              }).map(h => h.hostname).filter(Boolean);
               if (onlineHostnames.length > 0) {
                 const infoResult = await window.SupportHubLANAPI.batchHostInfo(onlineHostnames);
                 if (infoResult && infoResult.success && infoResult.data && !infoResult.demo) {
@@ -10652,15 +10830,22 @@
       return () => clearInterval(i);
     }, []);
 
-    // Auto status check — ping all hosts every N minutes to update online/offline
-    const [autoStatusMinutes, setAutoStatusMinutes] = useState(() => loadPersisted('autoStatusMinutes', 10));
+    // Auto status check — run once on page load, then on-demand via Refresh button
+    const [autoStatusMinutes, setAutoStatusMinutes] = useState(() => loadPersisted('autoStatusMinutes', 0));
     useEffect(() => {
-      if (autoStatusMinutes <= 0) return; // 0 = disabled
-      // Do an initial check after 3s (wait for hosts to load from backend)
-      const initial = setTimeout(() => { refreshHostsFromBackend(true); }, 3000);
-      const interval = setInterval(() => { refreshHostsFromBackend(true); }, autoStatusMinutes * 60000);
-      return () => { clearTimeout(initial); clearInterval(interval); };
-    }, [autoStatusMinutes, refreshHostsFromBackend]);
+      if (autoStatusMinutes < 0) return;
+      // Run once on startup after 5s
+      const initial = setTimeout(() => {
+        const jobId = 'auto-status-' + Date.now();
+        addJob({ id: jobId, name: 'Fleet Status Check', targets: hosts.map(h => h.id), step: 'Pinging all hosts…', progress: 5, startedAt: new Date().toISOString(), status: 'running', _isRealJob: true, hostnames: hosts.map(h => h.hostname).filter(Boolean), totalHosts: hosts.length });
+        refreshHostsFromBackend(true).then(() => {
+          updateJob(jobId, { status: 'completed', progress: 100, step: `Status updated — ${hosts.filter(h => h.onlineStatus === 'online').length} online, ${hosts.filter(h => h.onlineStatus === 'offline').length} offline`, completedAt: new Date().toISOString(), completedHosts: hosts.length });
+        }).catch(() => {
+          updateJob(jobId, { status: 'failed', progress: 100, step: 'Status check failed', completedAt: new Date().toISOString() });
+        });
+      }, 5000);
+      return () => clearTimeout(initial);
+    }, []); // run once on mount
 
     // Persist auto status minutes
     useEffect(() => {
@@ -10669,19 +10854,18 @@
 
     // ---- Sync hosts from backend when LIVE ----
     // Polls every 30s to pick up changes made from other tabs or via the API.
-    // On the first successful load, also pings all hosts for real online/offline.
     useEffect(() => {
       let cancelled = false;
-      let firstLoad = !liveHostsLoaded;
+      let firstLoadDone = false;
       const load = async () => {
         if (cancelled || !window.SupportHubLANAPI) return;
-        await refreshHostsFromBackend(firstLoad && liveHostsLoaded === false);
-        firstLoad = false;
+        await refreshHostsFromBackend(!firstLoadDone);
+        firstLoadDone = true;
       };
       load();
       const interval = setInterval(load, 30000);
       return () => { cancelled = true; clearInterval(interval); };
-    }, [refreshHostsFromBackend, liveHostsLoaded]);
+    }, [refreshHostsFromBackend]);
 
     // ---- Apply theme class to <html> + persist ----
     useEffect(() => {
@@ -10813,6 +10997,15 @@
       try { localStorage.setItem('supporthublan:auditEvents', JSON.stringify(auditEvents)); } catch (e) {}
     }, [auditEvents]);
     useEffect(() => {
+      try { localStorage.setItem('supporthublan:sites', JSON.stringify(sites)); } catch (e) {}
+    }, [sites]);
+    useEffect(() => {
+      try { localStorage.setItem('supporthublan:departments', JSON.stringify(departments)); } catch (e) {}
+    }, [departments]);
+    useEffect(() => {
+      try { localStorage.setItem('supporthublan:hostTypes', JSON.stringify(hostTypes)); } catch (e) {}
+    }, [hostTypes]);
+    useEffect(() => {
       try { localStorage.setItem('supporthublan:queueDraft', JSON.stringify(queueDraft)); } catch (e) {}
     }, [queueDraft]);
     useEffect(() => {
@@ -10851,6 +11044,7 @@
       // stateful data
       hosts, activeJobs, savedQueues, queueDraft, auditEvents,
       users, patchHistory, deploymentHistory, jobLogs,
+      sites, setSites, departments, setDepartments, hostTypes, setHostTypes,
       // mutators
       setHosts, addHosts, updateHost, updateHosts, addJob, updateJob, removeJob, addSavedQueue, setQueueDraft,
       refreshHostsFromBackend,

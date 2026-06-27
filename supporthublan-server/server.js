@@ -783,6 +783,7 @@ app.post('/api/hosts/discover-ad', async (req, res) => {
           $searcher.PropertiesToLoad.Add('dNSHostName') | Out-Null
           $searcher.PropertiesToLoad.Add('operatingSystem') | Out-Null
           $searcher.PropertiesToLoad.Add('lastLogonTimestamp') | Out-Null
+          $searcher.PropertiesToLoad.Add('managedBy') | Out-Null
 
           $searchResult = $searcher.FindAll()
           foreach ($sr in $searchResult) {
@@ -797,7 +798,14 @@ app.post('/api/hosts/discover-ad', async (req, res) => {
             $os = ''
             if ($sr.Properties['operatingsystem']) { $os = $sr.Properties['operatingsystem'][0] }
 
-            $results += @{ name = $name; fqdn = $fqdn; ip = ''; os = $os }
+            $managedBy = ''
+            if ($sr.Properties['managedby']) {
+              $rawDn = $sr.Properties['managedby'][0]
+              if ($rawDn -match '^CN=([^,]+)') { $managedBy = $matches[1] }
+              else { $managedBy = $rawDn }
+            }
+
+            $results += @{ name = $name; fqdn = $fqdn; ip = ''; os = $os; managedBy = $managedBy }
           }
           $searchResult.Dispose()
           $searcher.Dispose()
@@ -1027,12 +1035,27 @@ app.post('/api/hosts/status-check', async (req, res) => {
     return res.json({ success: true, data: JSON.stringify([]) });
   }
   const hostList = [...new Set(hostnames.map(sanitizeHost).filter(Boolean))].slice(0, 500);
-  const results = await pstools.pingParallel(hostList, 10, 4000);
+  const results = await pstools.pingParallel(hostList, 32, 3000);
   const formatted = results.map(r => ({
-    hostname: r.ip, // r.ip is actually the hostname here
+    hostname: r.ip,
     online: r.online,
     status: r.online ? 'online' : 'offline',
   }));
+  // Persist online_status to DB so status survives refreshes
+  try {
+    if (db && db.hosts) {
+      const allHosts = db.hosts._getAll ? db.hosts._getAll() : [];
+      for (const r of formatted) {
+        const host = allHosts.find(h => h.ip_address === r.hostname || h.hostname === r.hostname);
+        if (host) {
+          db.hosts.update(host.id, {
+            online_status: r.online ? 'online' : 'offline',
+            last_seen: r.online ? new Date().toISOString() : host.last_seen,
+          });
+        }
+      }
+    }
+  } catch (_) {}
   res.json({ success: true, data: JSON.stringify(formatted), results: formatted });
 });
 
@@ -2032,18 +2055,19 @@ app.post('/api/queues/execute', async (req, res) => {
             });
           } } catch (_) {}
 
-          // Standard audit log — includes full output
+          // Standard audit log — includes full command + output
           audit.add(db, {
             actionType: `queue.step.${step.type}`,
             targetHost: hostname, targetType: 'Queue',
             tool: step.type, command: commandExecuted || step.label || step.type,
             success: stepResult.success, durationMs,
             outputSummary: stepResult.success
-              ? (stepResult.output ? `OK — ${stepResult.output.slice(0, 500)}` : 'OK')
-              : (stepResult.error?.slice(0, 80) || 'Failed'),
-            errorReason: stepResult.error?.slice(0, 200),
+              ? `OK — ${stepResult.output?.slice(0, 200) || ''}`
+              : (stepResult.error?.slice(0, 200) || 'Failed'),
+            fullOutput: stepResult.output || stepResult.error || '',
+            errorReason: stepResult.error?.slice(0, 300),
             initiatedBy: 'admin', initiatedFrom: req.ip || 'unknown',
-            parameters: { jobId, queueName: queueName || '', stepNumber: si + 1, stepType: step.type, output: stepResult.output?.slice(0, 2000) || '', exitCode: stepResult.success ? 0 : -1 },
+            parameters: { jobId, queueName: queueName || '', stepNumber: si + 1, stepType: step.type },
           });
 
           // Track host completion

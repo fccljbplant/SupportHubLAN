@@ -232,6 +232,7 @@ const inventories = {
 // ==========================================================================
 const hosts = {
   list: (inventoryId) => loadStore().hosts.filter(h => h.inventory_id === inventoryId).sort((a, b) => a.hostname.localeCompare(b.hostname)),
+  _getAll: () => loadStore().hosts,
   get: (id) => loadStore().hosts.find(h => h.id === id),
   getByHostname: (inventoryId, hostname) => loadStore().hosts.find(h => h.inventory_id === inventoryId && h.hostname === hostname),
   getIdByHostname: (hostname) => {

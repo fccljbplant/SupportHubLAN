@@ -1,0 +1,458 @@
+==============================================================================
+SupportHubLAN — Complete Command Reference
+==============================================================================
+Every command, script, and execution pattern used by SupportHubLAN.
+Extracted from server.js + lib/*.js via automated analysis.
+
+==============================================================================
+CREDENTIAL MODEL
+==============================================================================
+1. Global domain credentials: Settings → General → Default Domain Credentials
+   - Stored in db.settings (AES-256-GCM encrypted)
+   - Retrieved by getGlobalCredentials() → { username, password, domain, fullUsername }
+   - Used by: hardware scan, services, processes, power, updates scan, info
+
+2. Per-request credentials: optional `credential` body parameter
+   - Falls back to global if not provided (on most endpoints)
+   - Used by: all endpoints that accept `credential` in req.body
+
+3. Credential block (PowerShell):
+   $secPassword = ConvertTo-SecureString '<password>' -AsPlainText -Force
+   $cred = New-Object System.Management.Automation.PSCredential('<DOMAIN\user>', $secPassword)
+
+4. PsExec credentials: -u DOMAIN\user -p password flags
+   psexec -accepteula \\HOST -u DOMAIN\user -p password -s COMMAND
+
+==============================================================================
+1. PsTools COMMANDS
+==============================================================================
+All PsTools binaries in C:\PSTools\ (configurable via PSTOOLS_PATH in .env)
+
+------------------------------------------------------------------------
+1.1 PsInfo — System Information
+------------------------------------------------------------------------
+# Hardware scan (Priority 1) — runs via lib/pstools.js runPsInfo()
+psinfo.exe -d -h -s -c \\HOST -accepteula
+  Flags: -d (disks) -h (hotfixes) -s (software) -c (CSV format)
+  Output: single comma-delimited line
+  Creds: none (uses caller's SMB token)
+  Endpoint: POST /api/hosts/:hostname/hardware
+
+# Direct PsInfo (via /api/pstools/psinfo)
+"${PSTOOLS_PATH}psinfo.exe" \\HOST -accepteula
+  Output: plain text (human-readable)
+  Creds: none
+  Endpoint: POST /api/pstools/psinfo
+
+------------------------------------------------------------------------
+1.2 PsLoggedOn — Logged-on Users
+------------------------------------------------------------------------
+# Hardware scan (Priority 1) — runs via lib/pstools.js runPsLoggedOn()
+psloggedon.exe \\HOST -accepteula
+  Output: plain text (parsed for DOMAIN\user pattern)
+  Creds: none
+  Endpoint: POST /api/hosts/:hostname/hardware
+
+# Direct PsLoggedOn (via /api/pstools/psloggedon)
+"${PSTOOLS_PATH}psloggedon.exe" \\HOST -accepteula
+  Endpoint: POST /api/pstools/psloggedon
+
+------------------------------------------------------------------------
+1.3 PsExec — Remote Command Execution
+------------------------------------------------------------------------
+# Generic PsExec (lib/pstools.js runPsExec)
+# Without credentials:
+psexec.exe -accepteula \\HOST -s COMMAND [args]
+# With global credentials:
+psexec.exe -accepteula \\HOST -u DOMAIN\user -p password -s COMMAND [args]
+  Creds: global or per-request
+  Output: raw stdout (PsExec banner stripped)
+  Endpoints: hardware scan WMIC, apps reg query, WinRM enable
+
+# Hardware scan WMIC via PsExec (Priority 2) — 8 parallel commands:
+psexec.exe -accepteula \\HOST -u DOMAIN\user -p pass -s wmic.exe PATH Win32_ComputerSystem GET Manufacturer,Model,SerialNumber,SystemType,Domain,TotalPhysicalMemory /format:list
+psexec.exe -accepteula \\HOST -u DOMAIN\user -p pass -s wmic.exe PATH Win32_BaseBoard GET Manufacturer,Product,Version,SerialNumber /format:list
+psexec.exe -accepteula \\HOST -u DOMAIN\user -p pass -s wmic.exe PATH Win32_BIOS GET Manufacturer,SMBIOSBIOSVersion,SerialNumber,ReleaseDate /format:list
+psexec.exe -accepteula \\HOST -u DOMAIN\user -p pass -s wmic.exe CPU GET Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,SocketDesignation /format:list
+psexec.exe -accepteula \\HOST -u DOMAIN\user -p pass -s wmic.exe PATH Win32_PhysicalMemory GET Capacity,Manufacturer,PartNumber,Speed,DeviceLocator /format:list
+psexec.exe -accepteula \\HOST -u DOMAIN\user -p pass -s wmic.exe PATH Win32_DiskDrive GET Model,Size,InterfaceType,SerialNumber,Partitions /format:list
+psexec.exe -accepteula \\HOST -u DOMAIN\user -p pass -s wmic.exe PATH Win32_VideoController GET Name,AdapterCompatibility,AdapterRAM,DriverVersion /format:list
+psexec.exe -accepteula \\HOST -u DOMAIN\user -p pass -s wmic.exe OS GET Caption,OSArchitecture,InstallDate,LastBootUpTime,SerialNumber /format:list
+  Output: Key=Value list (/format:list)
+  Creds: global domain credentials
+  Endpoint: POST /api/hosts/:hostname/hardware (Priority 2)
+
+# Network adapter fallback (Priority 4):
+psexec.exe -accepteula \\HOST -s wmic.exe nicconfig GET Description,IPAddress,MACAddress,DHCPEnabled,DefaultIPGateway,DNSServerSearchOrder /format:list
+  Creds: none
+  Endpoint: POST /api/hosts/:hostname/hardware (Priority 4)
+
+# Installed Apps via PsExec + reg query (3 parallel):
+psexec.exe -accepteula \\HOST -s reg.exe query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" /s
+psexec.exe -accepteula \\HOST -s reg.exe query "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" /s
+psexec.exe -accepteula \\HOST -s reg.exe query "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" /s
+  Output: reg query /s text (parsed by parseRegUninstall)
+  Creds: none
+  Endpoint: POST /api/hosts/:hostname/apps
+
+# WinRM enable via PsExec:
+psexec.exe -accepteula \\HOST -s -h powershell.exe -NoProfile -NonInteractive -EncodedCommand <base64>
+  Script: winrm quickconfig -quiet; Enable-PSRemoting -Force; Write-Output 'DONE'
+  Creds: none
+  Endpoint: POST /api/winrm/enable
+
+# PowerShell via PsExec (script execution fallback):
+psexec.exe -accepteula \\HOST -s -h powershell.exe -NoProfile -NonInteractive -EncodedCommand <base64-UTF16LE>
+  Script: user-provided PowerShell script (base64-encoded)
+  Creds: none
+  Endpoint: POST /api/scripts/execute (fallback when WinRM fails)
+
+# Job Queue psexec-run step:
+& "${PSTOOLS_PATH}psexec.exe" \\HOST -accepteula COMMAND
+  Endpoint: POST /api/queues/execute (step.type=psexec-run)
+
+------------------------------------------------------------------------
+1.4 Other PsTools (via /api/pstools/*)
+------------------------------------------------------------------------
+PsList:    "${PSTOOLS_PATH}pslist.exe" \\HOST -accepteula
+PsKill:    "${PSTOOLS_PATH}pskill.exe" \\HOST TARGET -accepteula
+PsService: "${PSTOOLS_PATH}psservice.exe" \\HOST ACTION "SERVICE" -accepteula
+PsShutdown: "${PSTOOLS_PATH}psshutdown.exe" \\HOST -s|-a|-r -t TIMEOUT -c -accepteula [-m "MESSAGE"]
+PsFile:    "${PSTOOLS_PATH}psfile.exe" \\HOST -accepteula
+PsGetSid:  "${PSTOOLS_PATH}psgetsid.exe" \\HOST -accepteula
+PsSuspend: "${PSTOOLS_PATH}pssuspend.exe" [-r] \\HOST TARGET -accepteula
+  All run via runPowerShell() wrapper
+  Creds: none
+  Output: plain text
+
+------------------------------------------------------------------------
+1.5 WebSocket Terminal (generic dispatcher)
+------------------------------------------------------------------------
+User types command in terminal panel → parsed → dispatched:
+- PsTools command (psexec, psinfo, etc.): spawn(PSTOOLS_PATH\exe, args + ['-accepteula'])
+- ping: spawn('ping.exe', args)
+- powershell/ps: spawn('powershell.exe', ['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-Command', script])
+- Other: spawn(cmd, args) — generic, no shell
+  Creds: none
+
+==============================================================================
+2. WMIC COMMANDS
+==============================================================================
+All WMIC commands run via PsExec (psexec \\HOST -s wmic.exe ...) or locally.
+
+# Local WMIC (lib/wmic.js runLocal):
+wmic.exe <class> get <fields> /format:list
+  Not directly invoked in current server.js
+
+# Remote WMIC via DCOM/RPC (lib/wmic.js runRemote):
+wmic.exe /node:HOST <class> get <fields> /format:list
+  Transport: DCOM/RPC (port 135 + dynamic)
+  Not directly invoked in current server.js
+
+# Remote WMIC via PsExec (lib/wmic.js runRemoteViaPsExec):
+psexec.exe -accepteula \\HOST -s wmic.exe <class> get <fields> /format:list
+  Used for: hardware scan (8 classes, see §1.3) + network adapter fallback
+
+WMIC classes used:
+  Win32_ComputerSystem → Manufacturer,Model,SerialNumber,SystemType,Domain,TotalPhysicalMemory
+  Win32_BaseBoard → Manufacturer,Product,Version,SerialNumber
+  Win32_BIOS → Manufacturer,SMBIOSBIOSVersion,SerialNumber,ReleaseDate
+  CPU → Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,SocketDesignation
+  Win32_PhysicalMemory → Capacity,Manufacturer,PartNumber,Speed,DeviceLocator
+  Win32_DiskDrive → Model,Size,InterfaceType,SerialNumber,Partitions
+  Win32_VideoController → Name,AdapterCompatibility,AdapterRAM,DriverVersion
+  OS → Caption,OSArchitecture,InstallDate,LastBootUpTime,SerialNumber
+  nicconfig → Description,IPAddress,MACAddress,DHCPEnabled,DefaultIPGateway,DNSServerSearchOrder
+
+==============================================================================
+3. POWERSHELL COMMANDS
+==============================================================================
+All local PowerShell runs use:
+  powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command <script>
+
+------------------------------------------------------------------------
+3.1 Startup
+------------------------------------------------------------------------
+# Check PSWindowsUpdate module availability
+Get-Module -ListAvailable PSWindowsUpdate | Select-Object -First 1 | Measure-Object | Select-Object -ExpandProperty Count
+
+------------------------------------------------------------------------
+3.2 Domain Detection & AD Import
+------------------------------------------------------------------------
+# Detect domain (POST /api/hosts/detect-domain):
+$cs = Get-CimInstance Win32_ComputerSystem
+$domain = $cs.Domain; $partOfDomain = $cs.PartOfDomain
+# Uses .NET DirectoryEntry LDAP://RootDSE for defaultNamingContext
+# Fallback: builds DC= parts from domain name
+
+# AD Computer Discovery (POST /api/hosts/discover-ad):
+# Uses .NET DirectorySearcher (NOT Get-ADComputer — no ADWS needed)
+$entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath, 'DOMAIN\user', 'password')
+$searcher = New-Object System.DirectoryServices.DirectorySearcher($entry)
+$searcher.Filter = '(&(objectCategory=computer))'
+$searcher.PropertiesToLoad.Add('cn') | Out-Null
+$searcher.PropertiesToLoad.Add('name') | Out-Null
+$searcher.PropertiesToLoad.Add('dNSHostName') | Out-Null
+$searcher.PropertiesToLoad.Add('operatingSystem') | Out-Null
+$searchResult = $searcher.FindAll()
+# Returns: name, fqdn, ip, os
+  Creds: global domain credentials
+
+------------------------------------------------------------------------
+3.3 Credential Test (POST /api/settings/domain-credentials/test)
+------------------------------------------------------------------------
+# Uses .NET LDAP bind (no WinRM needed)
+$entry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://RootDSE", 'DOMAIN\user', 'password')
+$nc = $entry.Properties["defaultNamingContext"][0]
+# If bind succeeds → credentials valid
+  Creds: the credentials being tested
+
+------------------------------------------------------------------------
+3.4 Host Info (POST /api/hosts/:hostname/info)
+------------------------------------------------------------------------
+Get-CimInstance Win32_OperatingSystem -ComputerName HOST [-Credential $cred]
+Get-CimInstance Win32_ComputerSystem -ComputerName HOST [-Credential $cred]
+Get-CimInstance Win32_Processor -ComputerName HOST | Select-Object -First 1
+Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" -ComputerName HOST
+# Returns: hostname, osName, osVersion, osBuild, cpuModel, ramGb, diskUsedGb, diskFreeGb, uptime, lastBootTime
+  Creds: per-request or global
+
+------------------------------------------------------------------------
+3.5 Ping (POST /api/hosts/:hostname/ping)
+------------------------------------------------------------------------
+Test-Connection -ComputerName 'HOST' -Count 1 -Quiet
+  Creds: none
+
+------------------------------------------------------------------------
+3.6 Windows Updates (POST /api/updates/*)
+------------------------------------------------------------------------
+# All require PSWindowsUpdate module on target
+
+# Scan (POST /api/updates/scan):
+Import-Module PSWindowsUpdate
+Get-WindowsUpdate -ComputerName $h [-Credential $cred]
+# Returns: KB, Title, Size, MsrcSeverity, Category
+
+# Download (POST /api/updates/download):
+Get-WindowsUpdate -ComputerName $h [-Credential $cred] -Download -AcceptAll
+# Or with KB filter: -KBArticleID 'KB123456' -Download
+
+# Install (POST /api/updates/install):
+Install-WindowsUpdate -ComputerName $h -AcceptAll [-AutoReboot] [-KBArticleID='...'] [-Category='...']
+# rebootBehavior: 'always'/'if-required' → -AutoReboot; 'never' → no reboot flag
+
+# History (POST /api/updates/history):
+Get-WUHistory -ComputerName $h [-Credential $cred]
+# Returns: KB, Title, Date, Result
+  Creds: scan/history use per-request or global; download/install use per-request only
+
+------------------------------------------------------------------------
+3.7 Scripts (POST /api/scripts/execute)
+------------------------------------------------------------------------
+# Method 1 (primary): WinRM via Invoke-Command
+Invoke-Command -ComputerName 'HOST' -ScriptBlock { <userScript> }
+  Wrapped in <<<JSON>>>...<<<END>>> markers
+
+# Method 2 (fallback): PsExec + PowerShell (no WinRM needed)
+psexec -accepteula \\HOST -s -h powershell.exe -EncodedCommand <base64>
+  Creds: none explicit (WinRM uses caller token; PsExec uses SMB)
+
+------------------------------------------------------------------------
+3.8 Services (POST /api/services/:hostname/*)
+------------------------------------------------------------------------
+# List services:
+Get-CimInstance Win32_Service -ComputerName HOST [-Credential $cred]
+  | Select Name, DisplayName, State, StartMode, StartName
+
+# Action (start/stop/restart):
+Start-Service -ComputerName 'HOST' -Name 'SERVICE' [-Credential $cred]
+Stop-Service -ComputerName 'HOST' -Name 'SERVICE' -Force [-Credential $cred]
+Restart-Service -ComputerName 'HOST' -Name 'SERVICE' -Force [-Credential $cred]
+  Creds: per-request or global
+
+------------------------------------------------------------------------
+3.9 Processes (POST /api/processes/:hostname/*)
+------------------------------------------------------------------------
+# List processes:
+Get-CimInstance Win32_Process -ComputerName HOST [-Credential $cred]
+  | Select ProcessId, Name, @{N='MemMB';E={[math]::Round($_.WorkingSetSize/1MB,1)}}, @{N='CPU';E={$_.UserModeTime/1e7}}
+
+# Kill process:
+Invoke-Command -ComputerName 'HOST' [-Credential $cred] -ScriptBlock { Stop-Process -Id PID -Force }
+  Creds: per-request or global
+
+------------------------------------------------------------------------
+3.10 Power Management (POST /api/power/action)
+------------------------------------------------------------------------
+# Reboot:
+Restart-Computer -ComputerName 'HOST' [-Credential $cred] -Force [-Comment "message"]
+
+# Shutdown:
+Stop-Computer -ComputerName 'HOST' [-Credential $cred] -Force
+  Creds: per-request or global
+
+------------------------------------------------------------------------
+3.11 Wake-on-LAN (POST /api/power/wol)
+------------------------------------------------------------------------
+# No shell command — Node.js dgram UDP4 socket
+# Sends 102-byte magic packet (6×0xFF + 16×MAC) to 255.255.255.255:9
+
+------------------------------------------------------------------------
+3.12 LAPS (POST /api/laps/*)
+------------------------------------------------------------------------
+# Retrieve (POST /api/laps/retrieve):
+Import-Module ActiveDirectory
+Get-ADComputer -Identity HOST -Properties ms-Mcs-AdmPwd, ms-Mcs-AdmPwdExpirationTime, DNSHostName
+
+# Rotate (POST /api/laps/rotate):
+# Modern (Win11 22H2+):
+Invoke-Command -ComputerName HOST -ScriptBlock { Reset-LapsPassword }
+# Legacy fallback:
+Set-ADComputer -Identity HOST -Replace @{'ms-Mcs-AdmPwdExpirationTime'='0'}
+  Creds: per-request only (no global fallback)
+
+------------------------------------------------------------------------
+3.13 Software Deployment (POST /api/deploy/package)
+------------------------------------------------------------------------
+# Copy package to target:
+Copy-Item 'PACKAGE_PATH' \\HOST\C$\Temp\PACKAGE -Force
+
+# Execute on target:
+Invoke-Command -ComputerName HOST [-Credential $cred] -ScriptBlock { Invoke-Expression $cmd }
+
+# Optional reboot:
+Restart-Computer -ComputerName HOST [-Credential $cred] -Force
+  Creds: per-request only (no global fallback)
+
+------------------------------------------------------------------------
+3.14 Event Log (POST /api/hosts/:hostname/eventlog)
+------------------------------------------------------------------------
+Get-WinEvent -FilterHashtable @{ LogName='System'; StartTime=(Get-Date).AddDays(-7) } [-Level 2|3|4] -MaxEvents 50
+  | Select TimeCreated, Id, LevelDisplayName, ProviderName, Message
+  Creds: per-request only
+
+------------------------------------------------------------------------
+3.15 Job Queue Steps (POST /api/queues/execute)
+------------------------------------------------------------------------
+check-updates:      Get-WindowsUpdate -ComputerName HOST [-Credential $cred] | ConvertTo-Json
+download-updates:   Get-WindowsUpdate -ComputerName HOST [-Credential $cred] -Download -AcceptAll
+install-all:        Install-WindowsUpdate -ComputerName HOST -AcceptAll [-AutoReboot]
+install-updates:    Install-WindowsUpdate -ComputerName HOST -AcceptAll [-AutoReboot]
+reboot:             Restart-Computer -ComputerName HOST [-Credential $cred] -Force
+shutdown:           Stop-Computer -ComputerName HOST [-Credential $cred] -Force
+wait-for-online:    for ($i=0; $i -lt 60; $i++) { if (Test-Connection HOST -Count 1 -Quiet) { break }; Start-Sleep -Seconds 5 }
+run-command:        Invoke-Command -ComputerName HOST -ScriptBlock { <code> }
+start-service:      Start-Service -ComputerName HOST -Name 'SERVICE' [-Credential $cred]
+stop-service:       Stop-Service -ComputerName HOST -Name 'SERVICE' -Force [-Credential $cred]
+restart-service:    Restart-Service -ComputerName HOST -Name 'SERVICE' -Force [-Credential $cred]
+psexec-run:         & "${PSTOOLS_PATH}psexec.exe" \\HOST -accepteula COMMAND
+wait-minutes:       (no command — pure JS setTimeout)
+
+==============================================================================
+4. WinRM COMMANDS
+==============================================================================
+WinRM is used exclusively through PowerShell Invoke-Command.
+
+# Test WinRM (POST /api/winrm/test):
+Test-WSMan -ComputerName 'HOST'
+# Returns WINRM_OK or WINRM_FAIL
+
+# Enable WinRM (POST /api/winrm/enable):
+# Via PsExec (no WinRM needed to enable it):
+psexec -accepteula \\HOST -s -h powershell -EncodedCommand <base64>
+  Script: winrm quickconfig -quiet; Enable-PSRemoting -Force
+
+# WinRM remote execution (lib/winrm.js runRemote / lib/powershell.js runRemoteViaWinRM):
+Invoke-Command -ComputerName 'HOST' -ScriptBlock { $ErrorActionPreference='Stop'; <script> }
+# Output wrapped in: <<<JSON>>>...<<<END>>> markers
+# Error handling: <<<JSON>>>{"error":"message"}<<<END>>>
+
+==============================================================================
+5. PING COMMANDS
+==============================================================================
+# Parallel ping sweep (lib/pstools.js pingParallel):
+ping.exe -n 1 -w 3000 IP    (for /api/scan)
+ping.exe -n 1 -w 2000 HOST  (for /api/hosts/status-check)
+# Up to 64 concurrent ping.exe processes
+# Online detection: /\bReply from\b/i && !/Destination host unreachable/i
+  Creds: none (ICMP)
+
+# PowerShell Test-Connection:
+Test-Connection -ComputerName 'HOST' -Count 1 -Quiet
+# Used in: /api/hosts/:hostname/ping, job queue wait-for-online step
+
+==============================================================================
+6. REGISTRY COMMANDS
+==============================================================================
+# Installed Apps (POST /api/hosts/:hostname/apps) — 3 parallel via PsExec:
+reg.exe query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" /s
+reg.exe query "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" /s
+reg.exe query "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" /s
+# Parsed by parseRegUninstall() — extracts DisplayName, DisplayVersion, Publisher, InstallDate
+  Creds: none
+
+==============================================================================
+7. OTHER COMMANDS
+==============================================================================
+# VNC viewer launch (POST /api/remote/connect):
+# Searches 5 candidate paths:
+#   C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe
+#   C:\Program Files\TightVNC\tvnviewer.exe
+#   C:\Program Files\TigerVNC\vncviewer.exe
+#   C:\Program Files\uvnc bvba\UltraVNC\vncviewer.exe
+#   C:\Program Files (x86)\RealVNC\VNC Viewer\vncviewer.exe
+# Launch: vncviewer.exe IP::PORT (detached)
+
+# RDP launch (POST /api/remote/connect):
+mstsc.exe /v:IP:PORT (detached)
+
+# Wake-on-LAN (POST /api/power/wol):
+# Node.js dgram UDP4 — 102-byte magic packet to 255.255.255.255:9
+
+# Browser auto-open (startup, Windows only):
+exec('start http://localhost:PORT')
+
+==============================================================================
+8. VARIABLE SUBSTITUTION PATTERNS
+==============================================================================
+$safeHost        — sanitizeHost(hostname) — strips [^a-zA-Z0-9._\-:]
+$cred            — PSCredential object (from buildCredentialBlock)
+$credParam       — "-Credential $cred" (or empty string)
+$hostList        — hostnames.map(sanitizeHost).join("','")
+$encodedScript   — Buffer.from(script, 'utf16le').toString('base64')
+$fullUser        — DOMAIN\username (from global credentials)
+$safePass        — password (single-quote escaped)
+$PSTOOLS_PATH    — process.env.PSTOOLS_PATH || 'C:\PSTools\'
+
+==============================================================================
+9. OUTPUT FORMAT CONVENTIONS
+==============================================================================
+1. WMIC /format:list  → Key=Value pairs (parsed by parseListOutput)
+2. JSON markers       → <<<JSON>>>...<<<END>>> (for WinRM/AD output)
+3. CSV                → psinfo -c (single comma-delimited line)
+4. Plain text         → PsTools direct output (pslist, psfile, etc.)
+5. JSON               → PowerShell ConvertTo-Json -Compress
+6. OK:/FAIL: prefix   → Credential test result
+
+==============================================================================
+10. REMOTE EXECUTION TRANSPORTS
+==============================================================================
+1. PsExec + SMB (port 445)     — Primary. No WinRM/DCOM needed.
+2. WMI/DCOM + RPC (port 135)   — Available via lib/wmic.js runRemote (not actively used)
+3. WinRM (port 5985 HTTP)      — Available via lib/winrm.js. Used for scripts + network adapters.
+4. ICMP (ping)                 — Parallel ping sweep, no credentials needed.
+5. UDP (port 9)                — Wake-on-LAN magic packet.
+
+==============================================================================
+11. ENDPOINTS NOT USING GLOBAL CREDENTIALS (potential bug)
+==============================================================================
+These endpoints use per-request `credential` only — do NOT fall back to global:
+- POST /api/updates/download
+- POST /api/updates/install
+- POST /api/laps/retrieve
+- POST /api/laps/rotate
+- POST /api/deploy/package
+- POST /api/hosts/:hostname/eventlog
+
+All other remote command endpoints fall back to getGlobalCredentials() when
+no per-request credential is provided.
